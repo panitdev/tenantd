@@ -12,6 +12,7 @@ clap.workspace = true
 futures.workspace = true
 libc.workspace = true
 prometheus-client.workspace = true
+serde_json.workspace = true
 tenantd-client.workspace = true
 tenantd-core.workspace = true
 tenantd-image.workspace = true

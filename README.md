@@ -25,8 +25,9 @@ crates/tenantd-net               netns lifecycle, CNI bridge + firewall
 crates/tenantd-state             SQLite schema + migrations
 crates/tenantd-client            generated gRPC client + Unix socket connector
 crates/tenantd-testkit           fake backends; service-level tests in tests/service.rs
-bins/tenantd                     daemon: config, gRPC on UDS, SO_PEERCRED, metrics, SIGHUP
-bins/tenantctl                   operator CLI over the same socket
+bins/tenantd                     the one binary: `serve` (daemon: config, gRPC on UDS,
+                                 SO_PEERCRED, metrics, SIGHUP), operator subcommands
+                                 over the same socket, `service install|uninstall`
 examples/tenantd.toml            the reference config
 deploy/tenantd.service           systemd unit
 ```
@@ -34,9 +35,29 @@ deploy/tenantd.service           systemd unit
 ## Build and run
 
 ```sh
-cargo build --release                      # target/release/{tenantd,tenantctl}
-tenantd --check-config -c examples/tenantd.toml
-sudo tenantd -c /etc/tenantd/tenantd.toml  # or install deploy/tenantd.service
+cargo build --release                        # target/release/tenantd
+tenantd config check -c examples/tenantd.toml
+sudo tenantd serve -c /etc/tenantd/tenantd.toml
+sudo tenantd service install -c /etc/tenantd/tenantd.toml  # or: sudo tenantd service uninstall
+```
+
+One binary, cloudflared-style. `tenantd serve` is the daemon and the only
+subcommand that opens the state DB, touches the host or needs root; with no
+subcommand tenantd prints help. `service install` writes
+`deploy/tenantd.service` to `/etc/systemd/system`, pointed at the running
+binary and the given config, and enables and starts it.
+
+The operator subcommands talk to a running daemon over its socket
+(`--socket`, `TENANTD_SOCKET`, default `/run/tenantd/api.sock`) and work as
+any caller UID listed in the config:
+
+```sh
+tenantd tenant create acme --storage 10g --memory 8g --cpus 4
+tenantd sandbox create acme box1 --profile default --image ghcr.io/example/app:1
+tenantd sandbox stop acme box1      # host-overlay layer is kept
+tenantd sandbox start acme box1
+tenantd events                      # JSON lines: exits, OOM, quota, reconcile
+tenantd health
 ```
 
 For a single-file install, build with `--target x86_64-unknown-linux-musl`
@@ -51,15 +72,6 @@ Host requirements: the storage root on XFS mounted with `prjquota`; Linux
 tenantd fails closed: it exits non-zero at startup if project quota isn't
 enforced on the storage root or `runsc` is missing or out of range, and
 refuses creates while either check fails at runtime (`Health` reports it).
-
-```sh
-tenantctl tenant create acme --storage 10g --memory 8g --cpus 4
-tenantctl sandbox create acme box1 --profile default --image ghcr.io/example/app:1
-tenantctl sandbox stop acme box1      # host-overlay layer is kept
-tenantctl sandbox start acme box1
-tenantctl events                      # JSON lines: exits, OOM, quota, reconcile
-tenantctl health
-```
 
 Policy denials come back as `PERMISSION_DENIED` naming the rule (also in the
 `x-tenantd-rule` response header), e.g. `profiles.default.images` or
@@ -102,7 +114,7 @@ the operation.
 | Phase | State |
 | --- | --- |
 | M0 spike (runsc `--overlay2=none` on host overlay in an XFS project) | Not run here: needs a host with runsc and an XFS `prjquota` volume. Do this first; it gates the design. |
-| M1 storage, tenant API and state, tenantctl | Implemented. XFS ioctl/quotactl struct layouts checked against kernel headers; the live quota test needs an XFS host. |
+| M1 storage, tenant API and state, operator CLI | Implemented. XFS ioctl/quotactl struct layouts checked against kernel headers; the live quota test needs an XFS host. |
 | M2 runsc-direct, image cache, CNI, profiles and policy | Implemented. Image pull/unpack tested against Docker Hub; overlay and netns tested in a user namespace; runsc invocation and CNI egress not yet run against real binaries. |
 | M3 reconcile, events, metrics, crash-injection tests | Implemented and tested with fakes. |
 

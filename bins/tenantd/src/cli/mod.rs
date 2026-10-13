@@ -1,51 +1,66 @@
-//! Operator CLI over tenantd's API socket.
+//! Operator commands over a running daemon's API socket. These never read
+//! the daemon config, open the state DB or need root; only socket access.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Subcommand};
 use tenantd_client::pb;
 use tenantd_client::{SandboxesClient, SystemClient, TenantsClient};
 
-#[derive(Parser)]
-#[command(version, about)]
-struct Cli {
+#[derive(Args)]
+pub struct Conn {
+    /// The daemon's API socket.
     #[arg(
         short,
         long,
+        global = true,
         env = "TENANTD_SOCKET",
         default_value = "/run/tenantd/api.sock"
     )]
     socket: PathBuf,
-    #[command(subcommand)]
-    cmd: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Cmd {
+pub enum ClientCmd {
     /// Manage tenants.
-    #[command(subcommand)]
-    Tenant(TenantCmd),
+    Tenant {
+        #[command(flatten)]
+        conn: Conn,
+        #[command(subcommand)]
+        cmd: TenantCmd,
+    },
     /// Manage sandboxes.
-    #[command(subcommand)]
-    Sandbox(SandboxCmd),
+    Sandbox {
+        #[command(flatten)]
+        conn: Conn,
+        #[command(subcommand)]
+        cmd: SandboxCmd,
+    },
     /// Backend checks and quota enforcement status.
-    Health,
+    Health {
+        #[command(flatten)]
+        conn: Conn,
+    },
     /// Stream events (exits, OOM, quota, reconcile actions) as JSON lines.
-    Events,
+    Events {
+        #[command(flatten)]
+        conn: Conn,
+    },
 }
 
 #[derive(Args)]
-struct LimitArgs {
+pub struct LimitArgs {
     /// Storage quota, e.g. 10g.
     #[arg(long, value_parser = size)]
-    storage: u64,
+    pub storage: u64,
     /// CPU ceiling across running sandboxes.
     #[arg(long)]
     cpus: Option<f64>,
     /// Memory ceiling across running sandboxes, e.g. 8g.
     #[arg(long, value_parser = size)]
-    memory: Option<u64>,
+    pub memory: Option<u64>,
 }
 
 impl LimitArgs {
@@ -59,7 +74,7 @@ impl LimitArgs {
 }
 
 #[derive(Subcommand)]
-enum TenantCmd {
+pub enum TenantCmd {
     Create {
         id: String,
         #[command(flatten)]
@@ -83,7 +98,7 @@ enum TenantCmd {
 }
 
 #[derive(Subcommand)]
-enum SandboxCmd {
+pub enum SandboxCmd {
     Create {
         tenant: String,
         id: String,
@@ -202,12 +217,18 @@ fn event_json(e: pb::Event) -> serde_json::Value {
     v
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    let ch = tenantd_client::connect(&cli.socket)
+pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
+    let socket = match &cmd {
+        ClientCmd::Tenant { conn, .. }
+        | ClientCmd::Sandbox { conn, .. }
+        | ClientCmd::Health { conn }
+        | ClientCmd::Events { conn } => &conn.socket,
+    };
+    let ch = tenantd_client::connect(socket)
         .await
-        .with_context(|| format!("connecting to {}", cli.socket.display()))?;
-    match cli.cmd {
-        Cmd::Tenant(c) => {
+        .with_context(|| format!("connecting to {}", socket.display()))?;
+    match cmd {
+        ClientCmd::Tenant { cmd: c, .. } => {
             let mut t = TenantsClient::new(ch);
             match c {
                 TenantCmd::Create { id, limits } => print_tenant(
@@ -248,7 +269,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Sandbox(c) => {
+        ClientCmd::Sandbox { cmd: c, .. } => {
             let mut s = SandboxesClient::new(ch);
             let r = |tenant, id| pb::SandboxRef { tenant, id };
             match c {
@@ -299,7 +320,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Health => {
+        ClientCmd::Health { .. } => {
             let h = SystemClient::new(ch)
                 .health(pb::HealthRequest {})
                 .await?
@@ -321,7 +342,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         }
-        Cmd::Events => {
+        ClientCmd::Events { .. } => {
             let mut stream = SystemClient::new(ch)
                 .watch_events(pb::WatchEventsRequest {})
                 .await?
@@ -334,19 +355,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run(Cli::parse()).await {
-        match e.downcast_ref::<tonic::Status>() {
-            Some(s) => eprintln!(
-                "error: {}: {}",
-                format!("{:?}", s.code()).to_lowercase(),
-                s.message()
-            ),
-            None => eprintln!("error: {e:#}"),
-        }
-        std::process::exit(1);
+/// Print a command error, gRPC statuses as `error: <code>: <message>`.
+pub fn report(e: anyhow::Error) -> ExitCode {
+    match e.downcast_ref::<tonic::Status>() {
+        Some(s) => eprintln!(
+            "error: {}: {}",
+            format!("{:?}", s.code()).to_lowercase(),
+            s.message()
+        ),
+        None => eprintln!("error: {e:#}"),
     }
+    ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -354,25 +373,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_parses() {
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
-        let c = Cli::parse_from([
-            "tenantctl",
-            "tenant",
-            "create",
-            "acme",
-            "--storage",
-            "10g",
-            "--memory",
-            "8g",
-        ]);
-        match c.cmd {
-            Cmd::Tenant(TenantCmd::Create { limits, .. }) => {
-                assert_eq!((limits.storage, limits.memory), (10 << 30, Some(8 << 30)));
-            }
-            _ => panic!(),
-        }
+    fn human_sizes() {
         assert_eq!(human(1536), "1.5 KiB");
+        assert_eq!(human(512), "512 B");
     }
 }

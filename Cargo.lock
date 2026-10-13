@@ -2225,19 +2225,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tenantctl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde_json",
- "tenantd-client",
- "tenantd-core",
- "tokio",
- "tonic",
-]
-
-[[package]]
 name = "tenantd"
 version = "0.1.0"
 dependencies = [
@@ -2246,6 +2233,7 @@ dependencies = [
  "futures",
  "libc",
  "prometheus-client",
+ "serde_json",
  "tempfile",
  "tenantd-client",
  "tenantd-core",
