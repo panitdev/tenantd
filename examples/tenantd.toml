@@ -1,0 +1,40 @@
+[server]
+socket = "/run/tenantd/api.sock"
+metrics = "127.0.0.1:9464"
+state = "/var/lib/tenantd/state.db"
+
+[[server.callers]]
+uid = 1000                    # checked with SO_PEERCRED
+
+[storage]
+backend = "xfs-project"       # xfs-project | ext4-project | zfs (later)
+root = "/data"
+project_id_range = [100000, 199999]
+
+[runtime]
+backend = "runsc-direct"      # runsc-direct | containerd (later)
+runsc = "/usr/local/bin/runsc"
+root = "/run/tenantd/runsc"   # runsc --root: state of tenantd's containers only
+
+[images]
+cache = "/data/images"        # outside every tenant project
+
+[network]
+cni_bin = "/opt/cni/bin"
+egress_subnet = "10.88.0.0/16"
+
+[profiles.default]
+images = ["ghcr.io/example/*"]
+memory = "4g"
+cpus = 2.0
+pids = 1024
+rootfs = "host-overlay"       # host-overlay | memory | read-only
+network = "egress"            # none | egress
+
+[profiles.scratch]
+images = ["ghcr.io/example/*"]
+memory = "2g"
+cpus = 1.0
+pids = 512
+rootfs = "memory"             # writes count against memory, nothing on disk
+network = "none"

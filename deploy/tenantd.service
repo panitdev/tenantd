@@ -1,0 +1,26 @@
+[Unit]
+Description=tenantd: per-host tenant quota and gVisor sandbox daemon
+After=local-fs.target network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/tenantd --check-config --config /etc/tenantd/tenantd.toml
+ExecStart=/usr/local/bin/tenantd --config /etc/tenantd/tenantd.toml
+ExecReload=/bin/kill -HUP $MAINPID
+# Sandboxes are separate runsc processes; they keep running across restarts
+# and are re-attached by reconcile.
+KillMode=process
+Restart=on-failure
+RestartSec=2
+Delegate=yes
+RuntimeDirectory=tenantd
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=tenantd
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

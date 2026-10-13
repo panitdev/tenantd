@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+tenantd-core = { path = "crates/tenantd-core" }
+tenantd-storage-xfs = { path = "crates/tenantd-storage-xfs" }
+tenantd-layer = { path = "crates/tenantd-layer" }
+tenantd-runtime-runsc = { path = "crates/tenantd-runtime-runsc" }
+tenantd-image = { path = "crates/tenantd-image" }
+tenantd-net = { path = "crates/tenantd-net" }
+tenantd-state = { path = "crates/tenantd-state" }
+tenantd-client = { path = "crates/tenantd-client" }
+tenantd-testkit = { path = "crates/tenantd-testkit" }
+
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4.6", features = ["derive", "env"] }
+flate2 = "1.1"
+futures = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+oci-spec = { version = "0.10", default-features = false, features = ["runtime"] }
+prometheus-client = "0.25"
+prost = "0.14"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tar = "0.4"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "process", "fs", "net", "io-util", "signal"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+toml = "0.9"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

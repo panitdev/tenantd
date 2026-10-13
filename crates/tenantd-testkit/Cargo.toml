@@ -1,0 +1,16 @@
+[package]
+name = "tenantd-testkit"
+description = "Fake storage, layer, runtime, image and network backends for tenantd tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+tenantd-core.workspace = true
+tenantd-state.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,183 @@
+// tenantd API, served over a Unix socket. Every mutating call is idempotent
+// on the caller-supplied ID: repeating a create with the same spec returns
+// the existing object; a different spec returns ALREADY_EXISTS. Policy
+// denials return PERMISSION_DENIED naming the rule that refused.
+syntax = "proto3";
+
+package tenantd.v1;
+
+service Tenants {
+  rpc CreateTenant(CreateTenantRequest) returns (Tenant);
+  // Takes effect immediately. Lowering below current usage is allowed and
+  // blocks new writes.
+  rpc UpdateTenant(UpdateTenantRequest) returns (Tenant);
+  rpc GetTenant(GetTenantRequest) returns (Tenant);
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+  // Fails while sandboxes exist unless force.
+  rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
+}
+
+service Sandboxes {
+  // Overrides may only tighten the profile.
+  rpc CreateSandbox(CreateSandboxRequest) returns (Sandbox);
+  rpc GetSandbox(SandboxRef) returns (Sandbox);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  // The writable layer is kept while stopped if the profile's layer
+  // survives stop (host-overlay does).
+  rpc StopSandbox(SandboxRef) returns (Sandbox);
+  rpc StartSandbox(SandboxRef) returns (Sandbox);
+  // Removes the runsc container, overlay mount and upper directory.
+  rpc DestroySandbox(SandboxRef) returns (DestroySandboxResponse);
+}
+
+service System {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+}
+
+message TenantLimits {
+  uint64 storage_bytes = 1;
+  // Ceilings across the tenant's running sandboxes.
+  optional double cpus = 2;
+  optional uint64 memory_bytes = 3;
+}
+
+message Tenant {
+  string id = 1;
+  TenantLimits limits = 2;
+  uint32 project_id = 3;
+  string state = 4;
+  uint64 used_bytes = 5;
+  uint32 sandbox_count = 6;
+  int64 created_at = 7;
+  int64 updated_at = 8;
+}
+
+message CreateTenantRequest {
+  string id = 1;
+  TenantLimits limits = 2;
+}
+
+message UpdateTenantRequest {
+  string id = 1;
+  TenantLimits limits = 2;
+}
+
+message GetTenantRequest {
+  string id = 1;
+}
+
+message ListTenantsRequest {}
+
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+}
+
+message DeleteTenantRequest {
+  string id = 1;
+  bool force = 2;
+}
+
+message DeleteTenantResponse {}
+
+message Overrides {
+  optional uint64 memory_bytes = 1;
+  optional double cpus = 2;
+  optional uint32 pids = 3;
+  optional uint64 size_bytes = 4;
+}
+
+message CreateSandboxRequest {
+  string tenant = 1;
+  string id = 2;
+  string profile = 3;
+  string image = 4;
+  Overrides overrides = 5;
+}
+
+message SandboxRef {
+  string tenant = 1;
+  string id = 2;
+}
+
+message ListSandboxesRequest {
+  string tenant = 1;
+}
+
+message ListSandboxesResponse {
+  repeated Sandbox sandboxes = 1;
+}
+
+message DestroySandboxResponse {}
+
+message Resources {
+  uint64 memory_bytes = 1;
+  double cpus = 2;
+  uint32 pids = 3;
+  optional uint64 size_bytes = 4;
+}
+
+message Sandbox {
+  string tenant = 1;
+  string id = 2;
+  string profile = 3;
+  string image = 4;
+  string image_digest = 5;
+  string state = 6;
+  Resources resources = 7;
+  optional int32 exit_code = 8;
+  string rootfs = 9;
+  string network = 10;
+  bool layer_survives_stop = 11;
+  int64 created_at = 12;
+  int64 updated_at = 13;
+}
+
+message HealthRequest {}
+
+message ComponentHealth {
+  string name = 1;
+  bool ok = 2;
+  string message = 3;
+}
+
+message HealthResponse {
+  // False when quota or runtime enforcement is failing; creates are refused.
+  bool enforcing = 1;
+  repeated ComponentHealth components = 2;
+}
+
+message WatchEventsRequest {}
+
+message Event {
+  int64 time = 1;
+  oneof kind {
+    SandboxExited sandbox_exited = 2;
+    SandboxOom sandbox_oom = 3;
+    QuotaExceeded quota_exceeded = 4;
+    ReconcileAction reconcile = 5;
+  }
+}
+
+message SandboxExited {
+  string tenant = 1;
+  string id = 2;
+  optional int32 exit_code = 3;
+}
+
+message SandboxOom {
+  string tenant = 1;
+  string id = 2;
+}
+
+message QuotaExceeded {
+  string tenant = 1;
+  uint64 used_bytes = 2;
+  uint64 limit_bytes = 3;
+}
+
+message ReconcileAction {
+  string action = 1;
+  string target = 2;
+  string detail = 3;
+}

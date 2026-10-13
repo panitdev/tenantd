@@ -1,0 +1,31 @@
+[package]
+name = "tenantd"
+description = "Holds a host's root-level sandbox powers and exposes a fixed set of operations over a Unix socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+libc.workspace = true
+prometheus-client.workspace = true
+tenantd-client.workspace = true
+tenantd-core.workspace = true
+tenantd-image.workspace = true
+tenantd-layer.workspace = true
+tenantd-net.workspace = true
+tenantd-runtime-runsc.workspace = true
+tenantd-state.workspace = true
+tenantd-storage-xfs.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tenantd-testkit.workspace = true

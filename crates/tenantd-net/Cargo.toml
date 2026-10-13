@@ -1,0 +1,19 @@
+[package]
+name = "tenantd-net"
+description = "Network namespace lifecycle and CNI plugin invocation for tenantd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+tenantd-core.workspace = true
+tokio = { workspace = true, features = ["rt", "process", "io-util", "fs"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
