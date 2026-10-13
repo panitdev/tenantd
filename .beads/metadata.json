@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "tenantd",
+  "project_id": "b5dc1ef8-bf44-4ae2-8b21-848175ec647e"
+}
