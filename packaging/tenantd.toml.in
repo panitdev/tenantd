@@ -1,0 +1,37 @@
+# Default operator config shipped by the package (conffile: upgrades never
+# overwrite local edits). The runtime points at the version of runsc this
+# package vendored under /usr/lib/tenantd/runsc.
+
+[server]
+socket = "/run/tenantd/api.sock"
+metrics = "127.0.0.1:9464"
+state = "/var/lib/tenantd/state.db"
+
+[storage]
+backend = "xfs-project"
+root = "/data"
+project_id_range = [100000, 199999]
+
+[runtime]
+backend = "runsc-direct"
+runsc = "/usr/lib/tenantd/runsc/${RUNSC_VERSION}/runsc"
+root = "/run/tenantd/runsc"
+min_version = "${RUNSC_VERSION}"
+max_version = "${RUNSC_VERSION}"
+
+[images]
+cache = "/data/images"
+
+[network]
+cni_bin = "/usr/lib/tenantd/cni"
+egress_subnet = "10.88.0.0/16"
+
+# tenantd refuses sandbox creation until at least one profile allows an
+# image; this default is deliberately conservative (no network).
+[profiles.default]
+images = ["docker.io/library/*"]
+memory = "512m"
+cpus = 1.0
+pids = 256
+rootfs = "host-overlay"
+network = "none"

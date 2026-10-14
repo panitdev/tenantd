@@ -1,5 +1,11 @@
 /target
 
+# Release pipeline scratch (rendered from *.in by release.yml)
+/nfpm.yaml
+/packaging/tenantd.toml
+/vendor/
+/dist/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

@@ -1,0 +1,2 @@
+# Needed for the "egress" network mode (CNI bridge + firewall).
+net.ipv4.ip_forward = 1

@@ -1,0 +1,53 @@
+# One package definition for .deb, .rpm and Arch. nfpm does not expand env
+# vars in `contents`, so release.yml renders this with envsubst first:
+#   envsubst < packaging/nfpm.yaml.in > nfpm.yaml
+#   nfpm package -f nfpm.yaml -p <deb|rpm|archlinux>
+name: tenantd
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+section: admin
+priority: optional
+maintainer: Geon Choi <interiormut@panit.dev>
+description: |
+  Per-host sandbox daemon: per-tenant storage quota and gVisor sandboxes
+  behind a fixed gRPC API on a Unix socket.
+license: Apache-2.0
+
+depends:
+  - xfsprogs
+  - iptables
+overrides:
+  rpm:
+    depends:
+      - xfsprogs
+      - iptables-nft
+
+contents:
+  # Paths match deploy/tenantd.service, which uses /usr/local/bin/tenantd and
+  # /etc/tenantd/tenantd.toml.
+  - src: ${BIN_DIR}/tenantd
+    dst: /usr/local/bin/tenantd
+    file_info: { mode: 0755 }
+
+  # Vendored runtime, versioned side by side so running sandboxes keep the
+  # runsc that created them (the config pins this version).
+  - src: ${VENDOR_DIR}/gvisor/
+    dst: /usr/lib/tenantd/runsc/${RUNSC_VERSION}/
+    type: tree
+  - src: ${VENDOR_DIR}/cni/
+    dst: /usr/lib/tenantd/cni/
+    type: tree
+
+  - src: deploy/tenantd.service
+    dst: /usr/lib/systemd/system/tenantd.service
+  - src: packaging/99-tenantd.sysctl
+    dst: /usr/lib/sysctl.d/99-tenantd.conf
+  - src: packaging/tenantd.toml
+    dst: /etc/tenantd/tenantd.toml
+    type: config|noreplace
+    file_info: { mode: 0640 }
+
+scripts:
+  postinstall: packaging/postinstall.sh
+  preremove: packaging/preremove.sh
