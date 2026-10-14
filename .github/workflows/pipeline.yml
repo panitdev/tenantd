@@ -1,0 +1,254 @@
+name: pipeline
+
+# Shared build/package/verify/publish pipeline. Callers decide the release
+# identity: a stable tag (release.yml) or the rolling `edge` prerelease
+# (main.yml).
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Package version (a leading "v" is stripped), e.g. 0.1.0.
+        required: true
+        type: string
+      release_tag:
+        description: Git tag of the GitHub release to create or refresh.
+        required: true
+        type: string
+      release_name:
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        required: false
+        type: boolean
+        default: false
+      rolling:
+        description: Delete and recreate the release so the tag follows this commit.
+        required: false
+        type: boolean
+        default: false
+      publish_repos:
+        required: false
+        type: boolean
+        default: false
+      distros:
+        description: JSON array of distro ids for the KVM install test.
+        required: false
+        type: string
+        default: '["ubuntu-24.04","debian-12","rocky-9"]'
+    secrets:
+      REPO_ACCESS_KEY_ID:
+        required: false
+      REPO_SECRET_ACCESS_KEY:
+        required: false
+      REPO_GPG_PRIVATE_KEY:
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            nfpm_arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            nfpm_arch: arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+          pip install ziglang
+          cargo install --locked cargo-zigbuild
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+      - name: Load pinned versions
+        run: |
+          cat ci/versions.env >> "$GITHUB_ENV"
+          v="${{ inputs.version }}"
+          echo "VERSION=${v#v}" >> "$GITHUB_ENV"
+
+      # aws-lc-rs (via rustls) builds C for the musl target; zig supplies the
+      # cross toolchain, cmake builds the C bits.
+      - name: Build static binary
+        run: |
+          cargo zigbuild --release --locked --target ${{ matrix.target }} -p tenantd
+          bin=target/${{ matrix.target }}/release
+          file "$bin/tenantd" | grep -q 'statically linked'
+          echo "BIN_DIR=$bin" >> "$GITHUB_ENV"
+
+      - name: Fetch vendored runtime
+        run: |
+          ci/fetch-vendor.sh ${{ matrix.arch }} vendor
+          echo "VENDOR_DIR=vendor" >> "$GITHUB_ENV"
+
+      - name: Packages and tarball
+        env:
+          NFPM_ARCH: ${{ matrix.nfpm_arch }}
+        run: |
+          mkdir -p dist
+          envsubst < packaging/nfpm.yaml.in > nfpm.yaml
+          envsubst < packaging/tenantd.toml.in > packaging/tenantd.toml
+          for fmt in deb rpm archlinux; do
+            nfpm package -f nfpm.yaml -p "$fmt" -t dist/
+          done
+          # Tier 3 tarball for the unmanaged install path (`tenantd service
+          # install` writes the unit itself).
+          stage=tenantd-${VERSION}-linux-${{ matrix.arch }}
+          mkdir -p "$stage/runsc/$RUNSC_VERSION" "$stage/cni"
+          cp "$BIN_DIR"/tenantd "$stage/"
+          cp -a vendor/gvisor/. "$stage/runsc/$RUNSC_VERSION/"
+          cp vendor/cni/* "$stage/cni/"
+          cp deploy/tenantd.service examples/tenantd.toml "$stage/"
+          tar -czf "dist/$stage.tar.gz" "$stage"
+
+      # Hand-off only; publish copies what matters onto the release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          retention-days: 1
+
+  # Install the real package on real distros, in KVM, with SELinux
+  # enforcing on Rocky. x86_64 only: arm64 runners don't expose /dev/kvm.
+  vm-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ${{ fromJSON(inputs.distros) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-x86_64
+          path: dist/
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+      - name: Previous release (for the upgrade test)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p prev
+          prev=$(gh release list --exclude-drafts --exclude-pre-releases \
+                   --json tagName -q '.[0].tagName' || true)
+          if [ -n "$prev" ]; then
+            gh release download "$prev" -D prev -p '*amd64.deb' -p '*x86_64.rpm' || true
+          fi
+      - name: Install, start, sandbox, reboot, upgrade
+        run: ci/vm-test.sh ${{ matrix.distro }} dist prev
+
+  publish:
+    needs: vm-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - uses: sigstore/cosign-installer@v3
+      - name: Checksums and signatures
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cosign sign-blob --yes SHA256SUMS \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          NAME: ${{ inputs.release_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          ROLLING: ${{ inputs.rolling }}
+        run: |
+          [ -n "$NAME" ] || NAME="$TAG"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$ROLLING" = "true" ]; then
+              gh release delete "$TAG" --yes --cleanup-tag
+            else
+              gh release upload "$TAG" dist/* --clobber
+              exit 0
+            fi
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "$NAME" --prerelease \
+              --notes "Rolling edge build of \`${GITHUB_SHA}\` (\`${GITHUB_REF_NAME}\`). Not a stable release."
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "$NAME" --generate-notes
+          fi
+
+  # apt + dnf repos as static files on object storage (R2/S3).
+  # Skipped until the signing key and bucket secrets exist.
+  publish-repos:
+    needs: publish
+    if: ${{ inputs.publish_repos && vars.REPO_BUCKET != '' }}
+    runs-on: ubuntu-24.04
+    env:
+      BUCKET: ${{ vars.REPO_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.REPO_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.REPO_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ vars.REPO_ENDPOINT_URL }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - name: Import signing key
+        run: |
+          echo "${{ secrets.REPO_GPG_PRIVATE_KEY }}" | gpg --batch --import
+          sudo apt-get update && sudo apt-get install -y createrepo-c rpm
+      - name: Pull existing repo
+        run: aws s3 sync "s3://$BUCKET/" repo/ --only-show-errors
+      - name: apt (single "any" suite)
+        run: |
+          mkdir -p repo/apt/pool/main repo/apt/dists/any/main/binary-{amd64,arm64}
+          cp dist/*.deb repo/apt/pool/main/
+          cd repo/apt
+          for a in amd64 arm64; do
+            apt-ftparchive --arch "$a" packages pool \
+              > "dists/any/main/binary-$a/Packages"
+            gzip -kf "dists/any/main/binary-$a/Packages"
+          done
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Suite=any \
+            -o APT::FTPArchive::Release::Codename=any \
+            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+            release dists/any > dists/any/Release
+          gpg --batch --yes --clearsign -o dists/any/InRelease dists/any/Release
+          gpg --batch --yes -abs -o dists/any/Release.gpg dists/any/Release
+      - name: rpm
+        run: |
+          mkdir -p repo/rpm/packages
+          cp dist/*.rpm repo/rpm/packages/
+          echo "%_gpg_name ${{ vars.REPO_GPG_KEY_ID }}" > ~/.rpmmacros
+          for f in repo/rpm/packages/*.rpm; do rpm --addsign "$f"; done
+          createrepo_c --update repo/rpm
+          gpg --batch --yes --detach-sign --armor repo/rpm/repodata/repomd.xml
+      - name: Push
+        run: aws s3 sync repo/ "s3://$BUCKET/" --only-show-errors

@@ -1,0 +1,49 @@
+name: edge
+
+# Bleeding-edge packages from main: the same artifacts as a release, published
+# as a rolling `edge` prerelease. Stable releases stay on v* tags (release.yml).
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - ".beads/**"
+      - ".agents/**"
+      - ".claude/**"
+      - ".codex/**"
+      - ".cursor/**"
+  workflow_dispatch:
+
+concurrency:
+  group: edge-main
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # (re)create the edge release
+  id-token: write   # keyless cosign signing
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        run: |
+          # Arch pkgver forbids `~`, so pre-release ordering is not encoded;
+          # edge packages only live on the release page, not in a repo.
+          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=${base}.edge.${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+  pipeline:
+    needs: version
+    uses: ./.github/workflows/pipeline.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      release_tag: edge
+      release_name: edge
+      prerelease: true
+      rolling: true
+      distros: '["ubuntu-24.04"]'
+    secrets: inherit
