@@ -1,8 +1,8 @@
 name: pipeline
 
 # Shared build/package/verify/publish pipeline. Callers decide the release
-# identity: a stable tag (release.yml) or the rolling `edge` prerelease
-# (main.yml).
+# identity: a stable tag (release.yml) or the rolling `edge` prerelease plus
+# a pinned `edge-<sha>` prerelease per build (main.yml).
 on:
   workflow_call:
     inputs:
@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      pin_tag:
+        description: Also publish the same assets as a never-moving prerelease under this tag.
+        required: false
+        type: string
+        default: ""
       publish_repos:
         required: false
         type: boolean
@@ -179,28 +184,36 @@ jobs:
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.release_tag }}
           NAME: ${{ inputs.release_name }}
           PRERELEASE: ${{ inputs.prerelease }}
           ROLLING: ${{ inputs.rolling }}
+          PIN: ${{ inputs.pin_tag }}
         run: |
           [ -n "$NAME" ] || NAME="$TAG"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if [ "$ROLLING" = "true" ]; then
-              gh release delete "$TAG" --yes --cleanup-tag
-            else
-              gh release upload "$TAG" dist/* --clobber
-              exit 0
+          notes="Edge build of \`${GITHUB_SHA}\` (\`${GITHUB_REF_NAME}\`). Not a stable release."
+          # Create a release on this exact commit, or add the assets to an
+          # existing one (a re-run of the same build).
+          release() { # tag title rolling
+            if gh release view "$1" >/dev/null 2>&1; then
+              if [ "$3" = "true" ]; then
+                gh release delete "$1" --yes --cleanup-tag
+              else
+                gh release upload "$1" dist/* --clobber
+                return
+              fi
             fi
-          fi
-          if [ "$PRERELEASE" = "true" ]; then
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-              --title "$NAME" --prerelease \
-              --notes "Rolling edge build of \`${GITHUB_SHA}\` (\`${GITHUB_REF_NAME}\`). Not a stable release."
-          else
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-              --title "$NAME" --generate-notes
-          fi
+            if [ "$PRERELEASE" = "true" ]; then
+              gh release create "$1" dist/* --target "$GITHUB_SHA" \
+                --title "$2" --prerelease --notes "$notes"
+            else
+              gh release create "$1" dist/* --target "$GITHUB_SHA" \
+                --title "$2" --generate-notes
+            fi
+          }
+          if [ -n "$PIN" ]; then release "$PIN" "$PIN" false; fi
+          release "$TAG" "$NAME" "$ROLLING"
 
   # apt + dnf repos as static files on object storage (R2/S3).
   # Skipped until the signing key and bucket secrets exist.
