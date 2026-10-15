@@ -76,7 +76,8 @@ jobs:
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - name: Load pinned versions
         run: |
-          cat ci/versions.env >> "$GITHUB_ENV"
+          # $GITHUB_ENV takes only KEY=VALUE lines: strip comments and blanks.
+          grep -vE '^[[:space:]]*(#|$)' ci/versions.env >> "$GITHUB_ENV"
           v="${{ inputs.version }}"
           echo "VERSION=${v#v}" >> "$GITHUB_ENV"
 
