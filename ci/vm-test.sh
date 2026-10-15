@@ -56,6 +56,19 @@ wait_ssh() {
   done
   cat console.log; exit 1
 }
+# The unit is Type=simple: is-active goes green as soon as the process starts,
+# but the API socket only appears after storage/runtime verification and the
+# startup reconcile. Wait for it, and dump the journal if it never shows up.
+wait_api() {
+  vm 'for _ in $(seq 60); do
+        if [ -S /run/tenantd/api.sock ]; then exit 0; fi
+        sleep 1
+      done
+      echo "api socket never appeared" >&2
+      systemctl --no-pager status tenantd || true
+      journalctl --no-pager -u tenantd -n 200 || true
+      exit 1'
+}
 trap 'kill "$(cat qemu.pid)" 2>/dev/null || true' EXIT
 wait_ssh
 vm cloud-init status --wait >/dev/null || true
@@ -95,6 +108,7 @@ EOT'
 vm tenantd config check
 vm systemctl enable --now tenantd
 vm systemctl is-active tenantd
+wait_api
 
 vm tenantd tenant create t1 --storage 256Mi
 vm tenantd sandbox create t1 s1 --profile ci --image docker.io/library/redis:7-alpine
@@ -102,12 +116,14 @@ vm 'tenantd sandbox get t1 s1 | grep -q running'
 
 # --- Restart must not kill sandboxes ---------------------------------------
 vm systemctl restart tenantd
+wait_api
 vm 'tenantd sandbox get t1 s1 | grep -q running'
 
 # --- Upgrade ---------------------------------------------------------------
 if [ -n "$old_pkg" ]; then
   put "$new_pkg"; vm "$install /tmp/$(basename "$new_pkg")"
   vm systemctl is-active tenantd
+  wait_api
   vm 'tenantd sandbox get t1 s1 | grep -q running'
 fi
 
@@ -115,6 +131,7 @@ fi
 vm 'systemctl reboot' || true
 sleep 5; wait_ssh
 vm systemctl is-active tenantd
+wait_api
 vm 'tenantd sandbox get t1 s1 | grep -q exited'
 vm tenantd sandbox start t1 s1
 vm 'tenantd sandbox get t1 s1 | grep -q running'
