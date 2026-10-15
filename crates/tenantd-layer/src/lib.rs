@@ -14,6 +14,7 @@ mod mount;
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -190,6 +191,10 @@ impl WritableLayer for HostOverlay {
             for d in [&upper, &work, &rootfs] {
                 fs::create_dir_all(d).context(format!("creating {}", d.display()))?;
             }
+            // The overlay root takes the upperdir's mode. tenantd's umask
+            // would make it 0700, locking non-root image users out of `/`.
+            fs::set_permissions(&upper, fs::Permissions::from_mode(0o755))
+                .context(format!("chmod {}", upper.display()))?;
             if !is_mountpoint(&rootfs)? {
                 let data = format!(
                     "lowerdir={},upperdir={},workdir={}",
@@ -386,6 +391,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn overlay_writes_land_in_upper_and_teardown_cleans_up() {
+        // SAFETY: umask has no preconditions. tenantd runs with UMask=0077.
+        unsafe { libc::umask(0o077) };
         let d = tempfile::tempdir().unwrap();
         let cache = d.path().join("images");
         let (l1, l2) = (cache.join("layers/1"), cache.join("layers/2"));
@@ -401,6 +408,8 @@ mod tests {
             panic!()
         };
         layer.prepare(&s, &tenant).await.unwrap(); // idempotent
+        let root_mode = fs::metadata(&root).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(root_mode, 0o755, "overlay root must not inherit the umask");
         assert_eq!(fs::read_to_string(root.join("base")).unwrap(), "1");
         fs::write(root.join("new"), "x").unwrap();
         fs::remove_file(root.join("base")).unwrap();

@@ -69,6 +69,16 @@ wait_api() {
       journalctl --no-pager -u tenantd -n 200 || true
       exit 1'
 }
+# Assert the sandbox state; on mismatch show what the sandbox itself said.
+expect_state() {
+  vm "out=\$(tenantd sandbox get t1 s1)
+      echo \"\$out\"
+      if ! grep -q $1 <<<\"\$out\"; then
+        tail -n 50 /var/lib/tenantd/runtime/logs/t1.s1.* || true
+        journalctl --no-pager -u tenantd -n 100 || true
+        exit 1
+      fi"
+}
 trap 'kill "$(cat qemu.pid)" 2>/dev/null || true' EXIT
 wait_ssh
 vm cloud-init status --wait >/dev/null || true
@@ -93,7 +103,8 @@ fi
 vm '! systemctl is-enabled tenantd'
 
 # Add a runtime profile whose image stays in the foreground so the sandbox
-# keeps running for the restart/reboot checks.
+# keeps running for the restart/reboot checks. The redis entrypoint drops to
+# the redis user with setpriv, which needs SETUID/SETGID.
 vm 'cat >> /etc/tenantd/tenantd.toml <<EOT
 
 [profiles.ci]
@@ -103,6 +114,7 @@ cpus = 0.5
 pids = 128
 rootfs = "host-overlay"
 network = "none"
+capabilities = ["CAP_SETUID", "CAP_SETGID"]
 EOT'
 
 vm tenantd config check
@@ -112,19 +124,19 @@ wait_api
 
 vm tenantd tenant create t1 --storage 256Mi
 vm tenantd sandbox create t1 s1 --profile ci --image docker.io/library/redis:7-alpine
-vm 'tenantd sandbox get t1 s1 | grep -q running'
+expect_state running
 
 # --- Restart must not kill sandboxes ---------------------------------------
 vm systemctl restart tenantd
 wait_api
-vm 'tenantd sandbox get t1 s1 | grep -q running'
+expect_state running
 
 # --- Upgrade ---------------------------------------------------------------
 if [ -n "$old_pkg" ]; then
   put "$new_pkg"; vm "$install /tmp/$(basename "$new_pkg")"
   vm systemctl is-active tenantd
   wait_api
-  vm 'tenantd sandbox get t1 s1 | grep -q running'
+  expect_state running
 fi
 
 # --- Reboot: /run is gone, reconcile must mark exited, start must remount --
@@ -132,9 +144,9 @@ vm 'systemctl reboot' || true
 sleep 5; wait_ssh
 vm systemctl is-active tenantd
 wait_api
-vm 'tenantd sandbox get t1 s1 | grep -q exited'
+expect_state exited
 vm tenantd sandbox start t1 s1
-vm 'tenantd sandbox get t1 s1 | grep -q running'
+expect_state running
 
 # --- Quota enforced end to end ---------------------------------------------
 vm 'tenantd tenant get t1'
