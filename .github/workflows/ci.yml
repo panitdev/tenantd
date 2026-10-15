@@ -62,8 +62,13 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
         run: cargo test -p tenantd-storage-xfs -p tenantd-image --locked -- --ignored
+      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+      # (kernel.apparmor_restrict_unprivileged_userns=1), which makes
+      # `unshare -r` fail to write /proc/self/uid_map. Lift it for this job.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # Overlay mounts and netns only need CAP_SYS_ADMIN inside a user+mount
-      # namespace, which unprivileged runners can create.
+      # namespace.
       - name: Real overlay mounts and netns (user namespace)
         run: unshare -rmn cargo test -p tenantd-layer -p tenantd-net --locked -- --ignored
       - name: Dump quota state on failure
