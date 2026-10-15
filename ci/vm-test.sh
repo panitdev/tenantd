@@ -39,7 +39,7 @@ users:
 EOF
 cloud-localds seed.img user-data
 
-qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 4096 -nographic \
+qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 4096 -display none \
   -drive file=root.qcow2,if=virtio -drive file=data.qcow2,if=virtio \
   -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n0,hostfwd=tcp::2222-:22 -device virtio-net,netdev=n0 \
