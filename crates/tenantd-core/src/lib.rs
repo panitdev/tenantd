@@ -13,13 +13,14 @@ pub mod fsutil;
 pub mod id;
 pub mod model;
 pub mod policy;
+pub mod process;
 pub mod reconcile;
 pub mod service;
 pub mod size;
 pub mod state;
 
 pub use error::{Error, Result};
-pub use id::{ProjectId, SandboxId, SandboxKey, TenantId};
+pub use id::{ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey, TenantId};
 pub use service::{Backends, Tenantd};
 
 /// Byte counts. Plain `u64` keeps arithmetic and serialisation simple.

@@ -18,10 +18,11 @@ tenantd-core.workspace = true
 tenantd-image.workspace = true
 tenantd-layer.workspace = true
 tenantd-net.workspace = true
+tenantd-output.workspace = true
 tenantd-runtime-runsc.workspace = true
 tenantd-state.workspace = true
 tenantd-storage-xfs.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
 tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true

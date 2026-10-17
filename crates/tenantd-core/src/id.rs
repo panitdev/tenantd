@@ -80,6 +80,7 @@ macro_rules! id_type {
 
 id_type!(TenantId, "tenant");
 id_type!(SandboxId, "sandbox");
+id_type!(ProcessId, "process");
 
 /// A sandbox is scoped to its tenant. The key renders as `<tenant>.<sandbox>`;
 /// `.` is outside the ID alphabet, so the split is unambiguous.
@@ -111,6 +112,34 @@ impl FromStr for SandboxKey {
             tenant: t.parse()?,
             sandbox: sb.parse()?,
         })
+    }
+}
+
+/// A process is scoped to its sandbox. Renders as `<tenant>.<sandbox>.<id>`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ProcessKey {
+    pub tenant: TenantId,
+    pub sandbox: SandboxId,
+    pub id: ProcessId,
+}
+
+impl ProcessKey {
+    pub fn new(sandbox: SandboxKey, id: ProcessId) -> Self {
+        Self {
+            tenant: sandbox.tenant,
+            sandbox: sandbox.sandbox,
+            id,
+        }
+    }
+
+    pub fn sandbox_key(&self) -> SandboxKey {
+        SandboxKey::new(self.tenant.clone(), self.sandbox.clone())
+    }
+}
+
+impl fmt::Display for ProcessKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.tenant, self.sandbox, self.id)
     }
 }
 

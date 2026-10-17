@@ -1,5 +1,5 @@
 //! Prometheus text on a second socket or a localhost port: per-tenant bytes
-//! used and limit, sandbox counts by state, operation latency.
+//! used and limit, sandbox and process counts by state, operation latency.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use tenantd_core::Tenantd;
-use tenantd_core::model::{SandboxState, TenantState};
+use tenantd_core::model::{ProcessState, SandboxState, TenantState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
@@ -40,6 +40,7 @@ pub struct Metrics {
     used: Family<TenantLabel, Gauge>,
     limit: Family<TenantLabel, Gauge>,
     sandboxes: Family<StateLabel, Gauge>,
+    processes: Family<StateLabel, Gauge>,
     ops: Family<OpLabel, Histogram, fn() -> Histogram>,
 }
 
@@ -49,6 +50,7 @@ impl Metrics {
         let used = Family::<TenantLabel, Gauge>::default();
         let limit = Family::<TenantLabel, Gauge>::default();
         let sandboxes = Family::<StateLabel, Gauge>::default();
+        let processes = Family::<StateLabel, Gauge>::default();
         let ops = Family::<OpLabel, Histogram, fn() -> Histogram>::new_with_constructor(
             latency_histogram,
         );
@@ -64,6 +66,11 @@ impl Metrics {
         );
         registry.register("sandboxes", "Sandboxes by state", sandboxes.clone());
         registry.register(
+            "processes",
+            "Processes tenantd started, by state",
+            processes.clone(),
+        );
+        registry.register(
             "operation_duration_seconds",
             "API operation latency",
             ops.clone(),
@@ -73,6 +80,7 @@ impl Metrics {
             used,
             limit,
             sandboxes,
+            processes,
             ops,
         }
     }
@@ -109,6 +117,16 @@ impl Metrics {
             for s in SandboxState::ALL {
                 let n = all.iter().filter(|r| r.state == s).count();
                 self.sandboxes
+                    .get_or_create(&StateLabel {
+                        state: s.as_str().into(),
+                    })
+                    .set(n as i64);
+            }
+        }
+        if let Ok(all) = t.list_all_processes().await {
+            for s in ProcessState::ALL {
+                let n = all.iter().filter(|r| r.state == s).count();
+                self.processes
                     .get_or_create(&StateLabel {
                         state: s.as_str().into(),
                     })

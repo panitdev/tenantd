@@ -1,4 +1,5 @@
-//! The thin unsafe layer: project ID attributes and XFS quota commands.
+//! The thin unsafe layer: project ID attributes, XFS quota commands and the
+//! punch-hole probe.
 //!
 //! Quota commands go through `quotactl_fd(2)` (Linux 5.14+) on an open
 //! directory of the filesystem, so no block device path is needed.
@@ -225,5 +226,23 @@ pub fn fs_magic(f: &File) -> io::Result<i64> {
         Err(io::Error::last_os_error())
     } else {
         Ok(s.f_type as i64)
+    }
+}
+
+/// Free `[offset, offset + len)` of `f` without changing its size.
+pub fn punch_hole(f: &File, offset: u64, len: u64) -> io::Result<()> {
+    // SAFETY: plain syscall on an fd we own.
+    let r = unsafe {
+        libc::fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if r != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }

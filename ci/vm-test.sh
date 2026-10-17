@@ -139,6 +139,52 @@ if [ -n "$old_pkg" ]; then
   expect_state running
 fi
 
+# --- Processes: exec policy via SIGHUP, output limit, exit codes, restart --
+# Added only now: an older release rejects the unknown exec table.
+pcheck() {
+  vm "$1" && return
+  vm 'tenantd process ps t1 s1 || true
+      for f in /data/tenants/t1/sandboxes/s1/processes/*/runsc.log; do
+        echo "== $f"; tail -n 30 "$f" || true
+      done
+      journalctl --no-pager -u tenantd -n 100 || true' || true
+  exit 1
+}
+vm 'cat >> /etc/tenantd/tenantd.toml <<EOT
+
+[profiles.ci.exec]
+enabled = true
+output_limit = "4k"
+EOT'
+vm tenantd config check
+vm systemctl reload tenantd
+# The reload is asynchronous: starts are refused until it lands.
+pcheck 'for _ in $(seq 10); do
+          if out=$(tenantd exec --id hello t1 s1 -- echo hello); then break; fi
+          sleep 1
+        done
+        test "$out" = hello'
+pcheck 'rc=0
+        tenantd exec t1 s1 -- sh -c "echo out; echo err >&2; exit 3" >/tmp/o 2>/tmp/e || rc=$?
+        test $rc = 3 && grep -qx out /tmp/o && grep -qx err /tmp/e'
+# 1 MB of output against a 4 KiB limit: the head is kept, the rest is
+# punched out of the file (logical size stays, blocks are freed).
+pcheck 'tenantd exec --id flood t1 s1 -- sh -c "yes x | head -c 1000000" >/tmp/flood
+        grep -q "truncated: 995904 bytes dropped" /tmp/flood
+        f=/data/tenants/t1/sandboxes/s1/processes/flood/stdout
+        test "$(stat -c %s $f)" = 1000000
+        test "$(du --block-size=1 $f | cut -f1)" -le 65536'
+# A detached process survives a daemon restart and is re-watched.
+pcheck 'tenantd exec -d --id sleeper t1 s1 -- sleep 600'
+vm systemctl restart tenantd
+wait_api
+pcheck 'tenantd process get t1 s1 sleeper | grep -q running
+        tenantd process kill t1 s1 sleeper --signal SIGTERM
+        rc=0; tenantd process wait t1 s1 sleeper --timeout 30 || rc=$?
+        test $rc = 143'
+pcheck 'tenantd process rm t1 s1 hello
+        ! tenantd exec --id hello t1 s1 -- echo again'
+
 # --- Reboot: /run is gone, reconcile must mark exited, start must remount --
 vm 'systemctl reboot' || true
 sleep 5; wait_ssh

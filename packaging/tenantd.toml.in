@@ -35,3 +35,9 @@ cpus = 1.0
 pids = 256
 rootfs = "host-overlay"
 network = "none"
+
+# Processes (`tenantd exec`) in this profile's running sandboxes are off
+# until enabled; the other exec settings are in the repository's
+# examples/tenantd.toml.
+# [profiles.default.exec]
+# enabled = true

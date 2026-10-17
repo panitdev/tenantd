@@ -1,6 +1,10 @@
 //! runsc-direct: tenantd writes an OCI bundle per sandbox and drives
 //! `runsc create/start/state/kill/wait/delete` itself, so flags are set per
 //! sandbox and no shim is needed. `--root` holds tenantd's containers only.
+//!
+//! Processes: `runsc exec --detach --process <json>` with stdout and stderr
+//! handed over as files (like create's), `kill --pid`, `wait --pid` and
+//! `ps --format=json`.
 
 mod spec;
 
@@ -17,20 +21,24 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use tenantd_core::backend::{
-    NetAttachment, RootfsSpec, RuntimeBackend, RuntimeEvent, RuntimeHandle, RuntimeState,
+    NetAttachment, ProcInfo, RootfsSpec, RuntimeBackend, RuntimeEvent, RuntimeHandle, RuntimeState,
 };
 use tenantd_core::config::{RuntimeConfig, RuntimeKind};
 use tenantd_core::error::Context;
-use tenantd_core::model::{NetworkMode, ResolvedSandbox};
+use tenantd_core::model::{NetworkMode, ProcessIo, ResolvedProcess, ResolvedSandbox, Signal};
 use tenantd_core::{Error, Result};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-pub use spec::{build as build_spec, resolve_user};
+pub use spec::{build as build_spec, exec_process, resolve_user, resolve_user_in_layers};
+
+/// How long `runsc exec --detach` may take to start a process.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct RunscRuntime {
     cfg: RuntimeConfig,
     watched: Arc<Mutex<HashSet<String>>>,
+    watched_processes: Arc<Mutex<HashSet<(String, u32)>>>,
     tx: mpsc::UnboundedSender<RuntimeEvent>,
     rx: Mutex<Option<mpsc::UnboundedReceiver<RuntimeEvent>>>,
 }
@@ -49,6 +57,36 @@ struct WaitOut {
 #[derive(Deserialize)]
 struct ListItem {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct PsItem {
+    #[serde(rename = "PID")]
+    pid: u32,
+    #[serde(rename = "Cmd", default)]
+    cmd: String,
+}
+
+/// `wait --pid` status: negative is a signal number (runsc's encoding for
+/// a signalled process), otherwise the exit code.
+fn process_status(exit_status: i32) -> (Option<i32>, Option<i32>) {
+    if exit_status < 0 {
+        (None, Some(-exit_status))
+    } else {
+        (Some(exit_status), None)
+    }
+}
+
+fn log_tail(path: &Path) -> String {
+    let all = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = all.lines().rev().take(5).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+fn flag_path(flag: &str, p: &Path) -> OsString {
+    let mut f = OsString::from(flag);
+    f.push(p);
+    f
 }
 
 fn not_found(stderr: &str) -> bool {
@@ -77,6 +115,7 @@ impl RunscRuntime {
         Self {
             cfg,
             watched: Arc::default(),
+            watched_processes: Arc::default(),
             tx,
             rx: Mutex::new(Some(rx)),
         }
@@ -182,6 +221,7 @@ impl RunscRuntime {
         Ok(spec::BundleFiles { resolv_conf, hosts })
     }
 
+    /// Create or append; the daemon's umask keeps it private.
     fn open_log(&self, path: &Path) -> Result<std::fs::File> {
         std::fs::OpenOptions::new()
             .create(true)
@@ -280,11 +320,7 @@ impl RuntimeBackend for RunscRuntime {
         let flags: Vec<OsString> = vec![
             format!("--overlay2={}", spec::overlay_flag(root)).into(),
             "--network=sandbox".into(),
-            {
-                let mut f = OsString::from("--log=");
-                f.push(&runsc_log);
-                f
-            },
+            flag_path("--log=", &runsc_log),
         ];
         let status = self
             .command(
@@ -297,20 +333,9 @@ impl RuntimeBackend for RunscRuntime {
             .await
             .context("running runsc create")?;
         if !status.success() {
-            let tail = tokio::fs::read_to_string(&runsc_log)
-                .await
-                .unwrap_or_default();
-            let tail: String = tail
-                .lines()
-                .rev()
-                .take(5)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
             return Err(Error::Internal(format!(
-                "runsc create {id} failed ({status}): {tail}"
+                "runsc create {id} failed ({status}): {}",
+                log_tail(&runsc_log)
             )));
         }
         info!(sandbox = id, "runsc container created");
@@ -425,6 +450,139 @@ impl RuntimeBackend for RunscRuntime {
             None => futures::stream::empty().boxed(),
         }
     }
+
+    async fn exec(&self, h: &RuntimeHandle, p: &ResolvedProcess, io: &ProcessIo) -> Result<u32> {
+        let id = h.0.as_str();
+        let process = spec::exec_process(p)?;
+        let json = serde_json::to_vec_pretty(&process).context("encoding process.json")?;
+        let process_json = io.dir.join("process.json");
+        tokio::fs::write(&process_json, json).await?;
+        match tokio::fs::remove_file(&io.pid_file).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        // The process keeps these as its stdout and stderr after runsc
+        // exec returns; its own log goes next to them, inside the quota.
+        let stdout = self.open_log(&io.stdout)?;
+        let stderr = self.open_log(&io.stderr)?;
+        let runsc_log = io.dir.join("runsc.log");
+        let flags = [flag_path("--log=", &runsc_log)];
+        let (json_arg, pid_arg) = (
+            process_json.to_string_lossy(),
+            io.pid_file.to_string_lossy(),
+        );
+        let run = self
+            .command(
+                &flags,
+                &[
+                    "exec",
+                    "--detach",
+                    "--process",
+                    &json_arg,
+                    "--internal-pid-file",
+                    &pid_arg,
+                    id,
+                ],
+            )
+            .stdout(stdout)
+            .stderr(stderr)
+            .status();
+        let status = tokio::time::timeout(EXEC_TIMEOUT, run)
+            .await
+            .map_err(|_| Error::Internal(format!("runsc exec {id} timed out")))?
+            .context("running runsc exec")?;
+        if !status.success() {
+            return Err(Error::Internal(format!(
+                "runsc exec {id} failed ({status}): {}",
+                log_tail(&runsc_log)
+            )));
+        }
+        let pid = self.recorded_pid(io).await?.ok_or_else(|| {
+            Error::Internal(format!(
+                "runsc exec {id} left no pid in {}",
+                io.pid_file.display()
+            ))
+        })?;
+        info!(sandbox = id, pid, process = %p.key.id, "process started");
+        Ok(pid)
+    }
+
+    async fn recorded_pid(&self, io: &ProcessIo) -> Result<Option<u32>> {
+        match tokio::fs::read_to_string(&io.pid_file).await {
+            Ok(s) => s
+                .trim()
+                .parse()
+                .map(Some)
+                .map_err(|e| Error::internal(format!("parsing {}", io.pid_file.display()), e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn signal(&self, h: &RuntimeHandle, pid: u32, sig: Signal) -> Result<()> {
+        let pid = pid.to_string();
+        match self.run(&["kill", "--pid", &pid, &h.0, sig.name()]).await {
+            Ok(_) => Ok(()),
+            Err(e) if not_found(&e) => Ok(()),
+            Err(e) => Err(Error::Internal(format!(
+                "runsc kill --pid {pid} {}: {e}",
+                h.0
+            ))),
+        }
+    }
+
+    async fn watch_process(&self, h: &RuntimeHandle, pid: u32) -> Result<()> {
+        let key = (h.0.clone(), pid);
+        if !self.watched_processes.lock().unwrap().insert(key.clone()) {
+            return Ok(());
+        }
+        let cmd = self
+            .command(&[], &["wait", "--pid", &pid.to_string(), &h.0])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        let (watched, tx, handle) = (self.watched_processes.clone(), self.tx.clone(), h.clone());
+        tokio::spawn(async move {
+            let (exit_code, signal) = match cmd.await {
+                Ok(out) if out.status.success() => serde_json::from_slice::<WaitOut>(&out.stdout)
+                    .map(|w| process_status(w.exit_status))
+                    .unwrap_or((None, None)),
+                Ok(out) => {
+                    debug!(sandbox = handle.0, pid, stderr = %String::from_utf8_lossy(&out.stderr), "runsc wait --pid failed");
+                    (None, None)
+                }
+                Err(e) => {
+                    warn!(sandbox = handle.0, pid, error = %e, "runsc wait --pid could not run");
+                    (None, None)
+                }
+            };
+            watched.lock().unwrap().remove(&key);
+            let _ = tx.send(RuntimeEvent::ProcessExited {
+                handle,
+                pid,
+                exit_code,
+                signal,
+            });
+        });
+        Ok(())
+    }
+
+    async fn list_processes(&self, h: &RuntimeHandle) -> Result<Vec<ProcInfo>> {
+        let out = self
+            .run(&["ps", "--format=json", &h.0])
+            .await
+            .map_err(|e| Error::Internal(format!("runsc ps {}: {e}", h.0)))?;
+        let items: Option<Vec<PsItem>> =
+            serde_json::from_str(out.trim()).context("parsing runsc ps")?;
+        Ok(items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| ProcInfo {
+                pid: i.pid,
+                cmd: i.cmd,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +602,25 @@ mod tests {
     #[test]
     fn errors() {
         assert!(not_found("loading container: file does not exist"));
+        assert!(not_found("sending signal: no such process"));
         assert!(!not_found("permission denied"));
+    }
+
+    #[test]
+    fn process_output_shapes() {
+        assert_eq!(process_status(3), (Some(3), None));
+        assert_eq!(process_status(-9), (None, Some(9)));
+        let ps: Option<Vec<PsItem>> = serde_json::from_str(
+            r#"[{"UID":0,"PID":1,"PPID":0,"C":0,"STime":"12:00","Time":"0s","Cmd":"sleep"},
+                {"UID":0,"PID":7,"PPID":0,"C":0,"STime":"12:01","Time":"0s","Cmd":"make"}]"#,
+        )
+        .unwrap();
+        let ps = ps.unwrap();
+        assert_eq!((ps[1].pid, ps[1].cmd.as_str()), (7, "make"));
+        assert!(
+            serde_json::from_str::<Option<Vec<PsItem>>>("null")
+                .unwrap()
+                .is_none()
+        );
     }
 }

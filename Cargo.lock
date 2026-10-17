@@ -2240,6 +2240,7 @@ dependencies = [
  "tenantd-image",
  "tenantd-layer",
  "tenantd-net",
+ "tenantd-output",
  "tenantd-runtime-runsc",
  "tenantd-state",
  "tenantd-storage-xfs",
@@ -2317,6 +2318,18 @@ dependencies = [
  "async-trait",
  "libc",
  "serde_json",
+ "tempfile",
+ "tenantd-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "tenantd-output"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
  "tempfile",
  "tenantd-core",
  "tokio",

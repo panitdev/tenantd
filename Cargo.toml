@@ -12,6 +12,7 @@ publish = false
 tenantd-core = { path = "crates/tenantd-core" }
 tenantd-storage-xfs = { path = "crates/tenantd-storage-xfs" }
 tenantd-layer = { path = "crates/tenantd-layer" }
+tenantd-output = { path = "crates/tenantd-output" }
 tenantd-runtime-runsc = { path = "crates/tenantd-runtime-runsc" }
 tenantd-image = { path = "crates/tenantd-image" }
 tenantd-net = { path = "crates/tenantd-net" }

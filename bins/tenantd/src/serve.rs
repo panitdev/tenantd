@@ -12,7 +12,8 @@ use anyhow::{Context, bail};
 use clap::Args;
 use futures::Stream;
 use tenantd_client::pb::{
-    sandboxes_server::SandboxesServer, system_server::SystemServer, tenants_server::TenantsServer,
+    processes_server::ProcessesServer, sandboxes_server::SandboxesServer,
+    system_server::SystemServer, tenants_server::TenantsServer,
 };
 use tenantd_core::config::{Config, RuntimeKind, StorageKind};
 use tenantd_core::state::StateStore;
@@ -91,6 +92,7 @@ fn build_backends(cfg: &Config, state: Arc<dyn StateStore>) -> anyhow::Result<Ba
             cfg.images.insecure_registries.clone(),
         )),
         network: Arc::new(tenantd_net::CniNetwork::new(cfg.network.clone())),
+        output: Arc::new(tenantd_output::FileOutput::new()),
         state,
     })
 }
@@ -147,6 +149,7 @@ async fn serve_api(
     tonic::transport::Server::builder()
         .add_service(TenantsServer::new(api.clone()))
         .add_service(SandboxesServer::new(api.clone()))
+        .add_service(ProcessesServer::new(api.clone()))
         .add_service(SystemServer::new(api))
         .serve_with_incoming_shutdown(authorized(l, Arc::new(allowed)), shutdown)
         .await?;
@@ -402,6 +405,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn processes_over_unix_socket() {
+        let (_d, sock, host, tenantd) = start(HashSet::from([me()])).await;
+        tenantd.spawn_event_pump();
+        let ch = tenantd_client::connect(&sock).await.unwrap();
+        let mut events = tenantd_client::SystemClient::new(ch.clone())
+            .watch_events(pb::WatchEventsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        tenantd_client::TenantsClient::new(ch.clone())
+            .create_tenant(pb::CreateTenantRequest {
+                id: "acme".into(),
+                limits: Some(pb::TenantLimits {
+                    storage_bytes: 1 << 30,
+                    cpus: None,
+                    memory_bytes: None,
+                }),
+            })
+            .await
+            .unwrap();
+        tenantd_client::SandboxesClient::new(ch.clone())
+            .create_sandbox(pb::CreateSandboxRequest {
+                tenant: "acme".into(),
+                id: "box".into(),
+                profile: "default".into(),
+                image: "alpine".into(),
+                overrides: None,
+            })
+            .await
+            .unwrap();
+        let mut procs = tenantd_client::ProcessesClient::new(ch);
+        let start = |user: &str| pb::StartProcessRequest {
+            tenant: "acme".into(),
+            sandbox: "box".into(),
+            id: "build".into(),
+            args: vec!["make".into()],
+            user: user.into(),
+            ..Default::default()
+        };
+        let denied = procs.start_process(start("0")).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            denied.metadata().get(api::RULE_METADATA).unwrap(),
+            "profiles.default.exec.users"
+        );
+        let p = procs.start_process(start("")).await.unwrap().into_inner();
+        assert_eq!((p.state.as_str(), p.output_limit), ("running", 16));
+        let r = pb::ProcessRef {
+            tenant: "acme".into(),
+            sandbox: "box".into(),
+            id: "build".into(),
+        };
+        let rec = tenantd
+            .get_process(
+                &"acme.box"
+                    .parse::<tenantd_core::SandboxKey>()
+                    .map(|k| tenantd_core::ProcessKey::new(k, "build".parse().unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        host.output
+            .write(&rec.io, tenantd_core::model::Stream::Stdout, &[b'x'; 20]);
+
+        let mut chunks = procs
+            .read_output(pb::ReadOutputRequest {
+                process: Some(r.clone()),
+                stream: pb::Stream::Stdout as i32,
+                offset: 0,
+                follow: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        use pb::output_chunk::Kind;
+        let mut got = Vec::new();
+        while let Some(c) = chunks.message().await.unwrap() {
+            got.push(c.kind.unwrap());
+        }
+        assert!(matches!(&got[0], Kind::Data(d) if d.bytes == [b'x'; 16]));
+        assert!(matches!(&got[1], Kind::Truncated(t) if t.offset == 16 && t.dropped_bytes == 4));
+        let bad = procs
+            .read_output(pb::ReadOutputRequest {
+                process: Some(r.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+
+        let sig = |s: pb::Signal| pb::SignalProcessRequest {
+            process: Some(r.clone()),
+            signal: s as i32,
+        };
+        assert_eq!(
+            procs
+                .signal_process(sig(pb::Signal::Unspecified))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        procs
+            .signal_process(sig(pb::Signal::Sigkill))
+            .await
+            .unwrap();
+        let done = procs
+            .wait_process(pb::WaitProcessRequest {
+                process: Some(r.clone()),
+                timeout_ms: 5000,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(done.state, "exited");
+        assert_eq!(done.signal, Some(pb::Signal::Sigkill as i32));
+        assert_eq!(done.stdout_dropped, 4);
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), events.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Some(pb::event::Kind::ProcessExited(x)) = ev.kind {
+                assert_eq!(
+                    (x.id.as_str(), x.signal),
+                    ("build", Some(pb::Signal::Sigkill as i32))
+                );
+                break;
+            }
+        }
+        let list = procs
+            .list_processes(pb::ListProcessesRequest {
+                tenant: "acme".into(),
+                sandbox: "box".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list.processes.len(), 1);
+        procs
+            .delete_process(pb::DeleteProcessRequest {
+                process: Some(r.clone()),
+                force: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            procs.get_process(r).await.unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            procs.start_process(start("")).await.unwrap_err().code(),
+            tonic::Code::AlreadyExists
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_follow_marks_truncation_and_ends_at_exit() {
+        let (_d, sock, host, tenantd) = start(HashSet::from([me()])).await;
+        tenantd.spawn_event_pump();
+        let limits = tenantd_core::model::TenantLimits {
+            storage: 1 << 30,
+            cpus: None,
+            memory: None,
+        };
+        tenantd
+            .create_tenant("t".parse().unwrap(), limits)
+            .await
+            .unwrap();
+        tenantd
+            .create_sandbox(
+                "t".parse().unwrap(),
+                "box".parse().unwrap(),
+                "default".into(),
+                "alpine".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let key: tenantd_core::ProcessKey =
+            tenantd_core::ProcessKey::new("t.box".parse().unwrap(), "p".parse().unwrap());
+        let p = tenantd
+            .start_process(
+                key.clone(),
+                tenantd_core::model::ProcessSpec {
+                    args: vec!["yes".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ch = tenantd_client::connect(&sock).await.unwrap();
+        let r = pb::ProcessRef {
+            tenant: "t".into(),
+            sandbox: "box".into(),
+            id: "p".into(),
+        };
+        let mut out = Vec::new();
+        let follow = crate::cli::copy_output(
+            tenantd_client::ProcessesClient::new(ch),
+            r,
+            pb::Stream::Stdout,
+            0,
+            true,
+            &mut out,
+        );
+        let writer = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            host.output.write(
+                &p.io,
+                tenantd_core::model::Stream::Stdout,
+                b"0123456789abcdefXYZ",
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            host.runtime
+                .exit_process(&key.sandbox_key(), p.pid.unwrap(), 0);
+        };
+        let (res, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(follow, writer)
+        })
+        .await
+        .unwrap();
+        res.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "0123456789abcdef\n[truncated: 3 bytes dropped]\n"
+        );
+    }
+
+    #[tokio::test]
     async fn events_stream() {
         let (_d, sock, host, tenantd) = start(HashSet::from([me()])).await;
         let ch = tenantd_client::connect(&sock).await.unwrap();
@@ -467,6 +701,10 @@ mod tests {
         );
         assert!(
             text.contains("tenantd_sandboxes{state=\"running\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tenantd_processes{state=\"running\"} 0"),
             "{text}"
         );
         assert!(

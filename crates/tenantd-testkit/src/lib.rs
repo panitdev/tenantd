@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,9 +14,12 @@ use futures::channel::mpsc;
 use futures::stream::BoxStream;
 use tenantd_core::backend::*;
 use tenantd_core::config::{Config, RuntimeKind};
-use tenantd_core::model::{ImageConfig, LayerKind, NetworkMode, ResolvedImage, ResolvedSandbox};
+use tenantd_core::model::{
+    ImageConfig, LayerKind, NetworkMode, ProcessIo, ResolvedImage, ResolvedProcess,
+    ResolvedSandbox, Signal, Stream,
+};
 use tenantd_core::{
-    Backends, Bytes, Error, ProjectId, Result, SandboxId, SandboxKey, TenantId, Tenantd,
+    Backends, Bytes, Error, ProcessId, ProjectId, Result, SandboxId, SandboxKey, TenantId, Tenantd,
 };
 use tenantd_state::SqliteState;
 
@@ -220,6 +223,15 @@ pub struct FakeRuntime {
     pub created_specs: Mutex<Vec<(ResolvedSandbox, RootfsSpec, NetAttachment)>>,
     pub verified: AtomicBool,
     pub faults: Arc<Faults>,
+    /// Exec'd processes still alive, by container.
+    pub processes: Mutex<HashSet<(RuntimeHandle, u32)>>,
+    pub watched_processes: Mutex<HashSet<(RuntimeHandle, u32)>>,
+    /// What each exec was asked to run.
+    pub execs: Mutex<Vec<ResolvedProcess>>,
+    pub signals: Mutex<Vec<(RuntimeHandle, u32, Signal)>>,
+    /// PID files written by exec, as runsc's `--internal-pid-file` would.
+    pub pid_files: Mutex<HashMap<PathBuf, u32>>,
+    next_pid: AtomicU32,
     tx: mpsc::UnboundedSender<RuntimeEvent>,
     rx: Mutex<Option<mpsc::UnboundedReceiver<RuntimeEvent>>>,
 }
@@ -233,9 +245,56 @@ impl FakeRuntime {
             created_specs: Mutex::default(),
             verified: AtomicBool::new(true),
             faults,
+            processes: Mutex::default(),
+            watched_processes: Mutex::default(),
+            execs: Mutex::default(),
+            signals: Mutex::default(),
+            pid_files: Mutex::default(),
+            next_pid: AtomicU32::new(100),
             tx,
             rx: Mutex::new(Some(rx)),
         }
+    }
+
+    /// An exec'd process exits on its own; reported if it is watched.
+    pub fn exit_process(&self, k: &SandboxKey, pid: u32, code: i32) {
+        self.end_process(&RuntimeHandle::for_key(k), pid, Some(code), None);
+    }
+
+    fn end_process(
+        &self,
+        h: &RuntimeHandle,
+        pid: u32,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    ) {
+        let key = (h.clone(), pid);
+        let alive = self.processes.lock().unwrap().remove(&key);
+        if alive && self.watched_processes.lock().unwrap().remove(&key) {
+            let _ = self.tx.unbounded_send(RuntimeEvent::ProcessExited {
+                handle: h.clone(),
+                pid,
+                exit_code,
+                signal,
+            });
+        }
+    }
+
+    /// The container's processes die with it, unreported (a real `runsc
+    /// wait --pid` would fail).
+    fn kill_processes(&self, h: &RuntimeHandle) {
+        self.processes.lock().unwrap().retain(|(c, _)| c != h);
+        self.watched_processes
+            .lock()
+            .unwrap()
+            .retain(|(c, _)| c != h);
+    }
+
+    pub fn alive(&self, k: &SandboxKey, pid: u32) -> bool {
+        self.processes
+            .lock()
+            .unwrap()
+            .contains(&(RuntimeHandle::for_key(k), pid))
     }
 
     /// The workload exits on its own.
@@ -315,6 +374,7 @@ impl RuntimeBackend for FakeRuntime {
         if let Some(s) = self.containers.lock().unwrap().get_mut(h) {
             *s = RuntimeState::Stopped;
         }
+        self.kill_processes(h);
         Ok(())
     }
 
@@ -322,6 +382,7 @@ impl RuntimeBackend for FakeRuntime {
         self.faults.check("runtime.destroy")?;
         self.containers.lock().unwrap().remove(h);
         self.watched.lock().unwrap().remove(h);
+        self.kill_processes(h);
         Ok(())
     }
 
@@ -349,6 +410,174 @@ impl RuntimeBackend for FakeRuntime {
             Some(rx) => rx.boxed(),
             None => futures::stream::empty().boxed(),
         }
+    }
+
+    /// Fault points: `runtime.exec` fails before anything runs;
+    /// `runtime.exec.after_start` fails after the process started and its
+    /// PID file was written.
+    async fn exec(&self, h: &RuntimeHandle, p: &ResolvedProcess, io: &ProcessIo) -> Result<u32> {
+        self.faults.check("runtime.exec")?;
+        if self.containers.lock().unwrap().get(h) != Some(&RuntimeState::Running) {
+            return Err(Error::FailedPrecondition(format!("{} is not running", h.0)));
+        }
+        let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+        self.processes.lock().unwrap().insert((h.clone(), pid));
+        self.pid_files
+            .lock()
+            .unwrap()
+            .insert(io.pid_file.clone(), pid);
+        self.execs.lock().unwrap().push(p.clone());
+        self.faults.check("runtime.exec.after_start")?;
+        Ok(pid)
+    }
+
+    async fn recorded_pid(&self, io: &ProcessIo) -> Result<Option<u32>> {
+        Ok(self.pid_files.lock().unwrap().get(&io.pid_file).copied())
+    }
+
+    /// Terminating signals end the process (reported like a real exit);
+    /// SIGUSR1/2 are only recorded.
+    async fn signal(&self, h: &RuntimeHandle, pid: u32, sig: Signal) -> Result<()> {
+        self.faults.check("runtime.signal")?;
+        self.signals.lock().unwrap().push((h.clone(), pid, sig));
+        if !matches!(sig, Signal::Usr1 | Signal::Usr2) {
+            self.end_process(h, pid, None, Some(sig.number()));
+        }
+        Ok(())
+    }
+
+    async fn watch_process(&self, h: &RuntimeHandle, pid: u32) -> Result<()> {
+        self.faults.check("runtime.watch_process")?;
+        self.watched_processes
+            .lock()
+            .unwrap()
+            .insert((h.clone(), pid));
+        Ok(())
+    }
+
+    async fn list_processes(&self, h: &RuntimeHandle) -> Result<Vec<ProcInfo>> {
+        if self.containers.lock().unwrap().get(h) != Some(&RuntimeState::Running) {
+            return Err(Error::FailedPrecondition(format!("{} is not running", h.0)));
+        }
+        Ok(self
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == h)
+            .map(|&(_, pid)| ProcInfo {
+                pid,
+                cmd: "fake".into(),
+            })
+            .collect())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FakeFile {
+    /// Bytes still on disk: the head, once a limit is enforced.
+    pub data: Vec<u8>,
+    /// Bytes written (the file's logical size).
+    pub size: Bytes,
+}
+
+/// Output files in memory. A watched file keeps only its head, as the
+/// punch-hole watcher would.
+#[derive(Default)]
+pub struct FakeOutput {
+    pub files: Mutex<HashMap<PathBuf, FakeFile>>,
+    /// Watched process directories and their limits.
+    pub watched: Mutex<HashMap<PathBuf, Bytes>>,
+    pub faults: Arc<Faults>,
+}
+
+impl FakeOutput {
+    /// The process writes to one of its streams.
+    pub fn write(&self, io: &ProcessIo, s: Stream, bytes: &[u8]) {
+        let limit = self.watched.lock().unwrap().get(&io.dir).copied();
+        let mut files = self.files.lock().unwrap();
+        let f = files.entry(io.stream(s).clone()).or_default();
+        f.size += bytes.len() as Bytes;
+        f.data.extend_from_slice(bytes);
+        if let Some(l) = limit {
+            f.data.truncate(l as usize);
+        }
+    }
+
+    fn trim_now(&self, io: &ProcessIo, limit: Bytes) {
+        let mut files = self.files.lock().unwrap();
+        for p in [&io.stdout, &io.stderr] {
+            if let Some(f) = files.get_mut(p) {
+                f.data.truncate(limit as usize);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl OutputStore for FakeOutput {
+    fn io(&self, tenant_dir: &Path, s: &SandboxId, p: &ProcessId) -> ProcessIo {
+        let dir = tenant_dir
+            .join("sandboxes")
+            .join(s.as_str())
+            .join("processes")
+            .join(p.as_str());
+        ProcessIo {
+            stdout: dir.join("stdout"),
+            stderr: dir.join("stderr"),
+            pid_file: dir.join("pid"),
+            dir,
+        }
+    }
+
+    async fn prepare(&self, io: &ProcessIo) -> Result<()> {
+        self.faults.check("output.prepare")?;
+        let mut files = self.files.lock().unwrap();
+        files.insert(io.stdout.clone(), FakeFile::default());
+        files.insert(io.stderr.clone(), FakeFile::default());
+        Ok(())
+    }
+
+    async fn watch(&self, io: &ProcessIo, limit: Bytes) -> Result<()> {
+        self.watched.lock().unwrap().insert(io.dir.clone(), limit);
+        self.trim_now(io, limit);
+        Ok(())
+    }
+
+    async fn unwatch(&self, io: &ProcessIo) {
+        self.watched.lock().unwrap().remove(&io.dir);
+    }
+
+    async fn trim(&self, io: &ProcessIo, limit: Bytes) -> Result<()> {
+        self.trim_now(io, limit);
+        Ok(())
+    }
+
+    async fn sizes(&self, io: &ProcessIo) -> Result<(Bytes, Bytes)> {
+        let files = self.files.lock().unwrap();
+        let size = |p: &PathBuf| files.get(p).map_or(0, |f| f.size);
+        Ok((size(&io.stdout), size(&io.stderr)))
+    }
+
+    async fn read(&self, io: &ProcessIo, s: Stream, offset: Bytes, len: usize) -> Result<Vec<u8>> {
+        let files = self.files.lock().unwrap();
+        Ok(files
+            .get(io.stream(s))
+            .map(|f| {
+                let start = (offset as usize).min(f.data.len());
+                f.data[start..(start + len).min(f.data.len())].to_vec()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn remove(&self, io: &ProcessIo) -> Result<()> {
+        self.faults.check("output.remove")?;
+        self.watched.lock().unwrap().remove(&io.dir);
+        self.files
+            .lock()
+            .unwrap()
+            .retain(|p, _| !p.starts_with(&io.dir));
+        Ok(())
     }
 }
 
@@ -454,6 +683,14 @@ pids = 1024
 rootfs = "host-overlay"
 network = "egress"
 
+[profiles.default.exec]
+enabled = true
+users = ["image", "1000"]
+max_processes = 2
+output_limit = 16
+retention_secs = 60
+tombstone_secs = 120
+
 [profiles.scratch]
 images = ["docker.io/library/*"]
 memory = "1g"
@@ -470,6 +707,7 @@ pub struct Host {
     pub runtime: Arc<FakeRuntime>,
     pub images: Arc<FakeImages>,
     pub network: Arc<FakeNetwork>,
+    pub output: Arc<FakeOutput>,
     pub state: SqliteState,
     pub faults: Arc<Faults>,
 }
@@ -492,6 +730,10 @@ impl Host {
                 ..Default::default()
             }),
             network: Arc::new(FakeNetwork {
+                faults: faults.clone(),
+                ..Default::default()
+            }),
+            output: Arc::new(FakeOutput {
                 faults: faults.clone(),
                 ..Default::default()
             }),
@@ -521,6 +763,7 @@ impl Host {
                 runtime: self.runtime.clone(),
                 images: self.images.clone(),
                 network: self.network.clone(),
+                output: self.output.clone(),
                 state: Arc::new(self.state.clone()),
             },
         )
@@ -549,8 +792,11 @@ impl Env {
     }
 
     /// Simulate a daemon crash and restart: a fresh service over the same
-    /// host and state. In-memory locks, health and blocks are lost.
+    /// host and state. In-memory locks, health and blocks are lost, and so
+    /// are the runtime's process watches and the output watcher.
     pub async fn restart(&mut self) {
+        self.host.runtime.watched_processes.lock().unwrap().clear();
+        self.host.output.watched.lock().unwrap().clear();
         self.tenantd = self.host.service(TEST_CONFIG);
         self.tenantd.check_health().await;
     }

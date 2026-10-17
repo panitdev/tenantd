@@ -17,6 +17,7 @@ pub mod pb {
     tonic::include_proto!("tenantd.v1");
 }
 
+pub use pb::processes_client::ProcessesClient;
 pub use pb::sandboxes_client::SandboxesClient;
 pub use pb::system_client::SystemClient;
 pub use pb::tenants_client::TenantsClient;

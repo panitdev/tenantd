@@ -1,4 +1,5 @@
-//! OCI `config.json` for one sandbox, built only from the resolved spec.
+//! OCI `config.json` for one sandbox, and the `process.json` for one exec,
+//! built only from resolved specs.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -6,12 +7,12 @@ use std::path::{Path, PathBuf};
 use oci_spec::runtime::{
     Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxMemoryBuilder,
     LinuxNamespaceBuilder, LinuxNamespaceType, LinuxPidsBuilder, LinuxResourcesBuilder, Mount,
-    MountBuilder, PosixRlimitBuilder, PosixRlimitType, ProcessBuilder, RootBuilder, Spec,
+    MountBuilder, PosixRlimitBuilder, PosixRlimitType, Process, ProcessBuilder, RootBuilder, Spec,
     SpecBuilder, UserBuilder,
 };
 use tenantd_core::backend::{NetAttachment, RootfsSpec};
 use tenantd_core::error::Context;
-use tenantd_core::model::{NetworkMode, ResolvedSandbox};
+use tenantd_core::model::{NetworkMode, ResolvedProcess, ResolvedSandbox};
 use tenantd_core::{Error, Result};
 
 const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -58,14 +59,7 @@ fn capabilities(names: &[String]) -> Result<HashSet<Capability>> {
 /// Resolve the image's `User` to numeric IDs. Names are looked up in the
 /// image's /etc/passwd and /etc/group, never following symlinks out of it.
 pub fn resolve_user(user: Option<&str>, rootfs: &Path) -> Result<(u32, u32)> {
-    let Some(u) = user.filter(|u| !u.is_empty()) else {
-        return Ok((0, 0));
-    };
-    let (name, group) = match u.split_once(':') {
-        Some((n, g)) => (n, Some(g)),
-        None => (u, None),
-    };
-    let read = |file: &str| -> String {
+    resolve_user_with(user, |file| {
         let etc = rootfs.join("etc");
         let path = etc.join(file);
         let plain = |p: &Path| {
@@ -78,6 +72,40 @@ pub fn resolve_user(user: Option<&str>, rootfs: &Path) -> Result<(u32, u32)> {
         } else {
             String::new()
         }
+    })
+}
+
+/// [`resolve_user`] against the image's unpacked layers (topmost first)
+/// rather than a sandbox root, which the tenant can write to. A whiteout
+/// (0/0 char device) hides the file in lower layers; symlinks are never
+/// followed.
+pub fn resolve_user_in_layers(user: Option<&str>, layers: &[PathBuf]) -> Result<(u32, u32)> {
+    resolve_user_with(user, |file| {
+        for layer in layers.iter().rev() {
+            let etc = layer.join("etc");
+            let path = etc.join(file);
+            let Ok(m) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let etc_ok = std::fs::symlink_metadata(&etc).is_ok_and(|m| m.is_dir());
+            // A whiteout, a symlink or anything else hides it: no entries.
+            return if etc_ok && m.is_file() {
+                std::fs::read_to_string(path).unwrap_or_default()
+            } else {
+                String::new()
+            };
+        }
+        String::new()
+    })
+}
+
+fn resolve_user_with(user: Option<&str>, read: impl Fn(&str) -> String) -> Result<(u32, u32)> {
+    let Some(u) = user.filter(|u| !u.is_empty()) else {
+        return Ok((0, 0));
+    };
+    let (name, group) = match u.split_once(':') {
+        Some((n, g)) => (n, Some(g)),
+        None => (u, None),
     };
     let lookup = |db: &str, key: &str, field: usize| -> Option<u32> {
         db.lines()
@@ -113,6 +141,64 @@ pub fn resolve_user(user: Option<&str>, rootfs: &Path) -> Result<(u32, u32)> {
     Ok((uid, gid))
 }
 
+/// The locked-down process: the given capabilities in the bounding,
+/// effective and permitted sets only, `noNewPrivileges`, no terminal.
+fn process(
+    args: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
+    (uid, gid): (u32, u32),
+    cap_names: &[String],
+) -> Result<Process> {
+    let caps = capabilities(cap_names)?;
+    ProcessBuilder::default()
+        .terminal(false)
+        .user(
+            UserBuilder::default()
+                .uid(uid)
+                .gid(gid)
+                .build()
+                .context("user")?,
+        )
+        .args(args)
+        .env(env)
+        .cwd(cwd)
+        .no_new_privileges(true)
+        .capabilities(
+            LinuxCapabilitiesBuilder::default()
+                .bounding(caps.clone())
+                .effective(caps.clone())
+                .permitted(caps)
+                .inheritable(HashSet::new())
+                .ambient(HashSet::new())
+                .build()
+                .context("capabilities")?,
+        )
+        .rlimits(vec![
+            PosixRlimitBuilder::default()
+                .typ(PosixRlimitType::RlimitNofile)
+                .soft(65536u64)
+                .hard(65536u64)
+                .build()
+                .context("rlimit")?,
+        ])
+        .build()
+        .context("process")
+}
+
+/// `process.json` for `runsc exec --process`. Env and cwd are already final;
+/// capabilities are the sandbox's.
+pub fn exec_process(p: &ResolvedProcess) -> Result<Process> {
+    let ids = resolve_user_in_layers(p.user.as_deref(), &p.image_layers)?;
+    process(
+        p.args.clone(),
+        p.env.clone(),
+        p.cwd.clone(),
+        ids,
+        &p.capabilities,
+    )
+}
+
 pub fn build(
     s: &ResolvedSandbox,
     root: &RootfsSpec,
@@ -137,41 +223,13 @@ pub fn build(
     }
     env.push(format!("HOSTNAME={}", s.key.sandbox));
     let (uid, gid) = resolve_user(img.user.as_deref(), root_path)?;
-
-    let caps = capabilities(&s.capabilities)?;
-    let process = ProcessBuilder::default()
-        .terminal(false)
-        .user(
-            UserBuilder::default()
-                .uid(uid)
-                .gid(gid)
-                .build()
-                .context("user")?,
-        )
-        .args(args)
-        .env(env)
-        .cwd(img.working_dir.clone().unwrap_or_else(|| "/".into()))
-        .no_new_privileges(true)
-        .capabilities(
-            LinuxCapabilitiesBuilder::default()
-                .bounding(caps.clone())
-                .effective(caps.clone())
-                .permitted(caps)
-                .inheritable(HashSet::new())
-                .ambient(HashSet::new())
-                .build()
-                .context("capabilities")?,
-        )
-        .rlimits(vec![
-            PosixRlimitBuilder::default()
-                .typ(PosixRlimitType::RlimitNofile)
-                .soft(65536u64)
-                .hard(65536u64)
-                .build()
-                .context("rlimit")?,
-        ])
-        .build()
-        .context("process")?;
+    let process = process(
+        args,
+        env,
+        img.working_dir.clone().unwrap_or_else(|| "/".into()),
+        (uid, gid),
+        &s.capabilities,
+    )?;
 
     let tmpfs_size = |n: u64| format!("size={n}");
     let mut mounts = vec![
@@ -378,6 +436,52 @@ mod tests {
             .collect();
         assert!(dests.contains(&"/tmp") && dests.contains(&"/etc/resolv.conf"));
         assert!(v.get("hooks").is_none() || v["hooks"].is_null());
+    }
+
+    #[test]
+    fn exec_process_is_locked_down_and_reads_users_from_the_image() {
+        let d = tempfile::tempdir().unwrap();
+        let (base, top) = (d.path().join("base"), d.path().join("top"));
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::create_dir_all(top.join("etc")).unwrap();
+        std::fs::write(base.join("etc/passwd"), "app:x:1:1::/:/bin/sh\n").unwrap();
+        std::fs::write(top.join("etc/passwd"), "app:x:1001:1002::/:/bin/sh\n").unwrap();
+        let mut p = ResolvedProcess {
+            key: "t.s"
+                .parse::<tenantd_core::SandboxKey>()
+                .map(|k| tenantd_core::ProcessKey::new(k, "p".parse().unwrap()))
+                .unwrap(),
+            args: vec!["make".into(), "test".into()],
+            env: vec!["PATH=/bin".into(), "CI=1".into()],
+            cwd: "/src".into(),
+            user: Some("app".into()),
+            capabilities: vec!["CAP_NET_BIND_SERVICE".into()],
+            image_layers: vec![base.clone(), top.clone()],
+        };
+        let v = serde_json::to_value(exec_process(&p).unwrap()).unwrap();
+        assert_eq!(v["noNewPrivileges"], true);
+        assert_eq!(
+            (v["user"]["uid"].clone(), v["user"]["gid"].clone()),
+            (1001.into(), 1002.into())
+        );
+        assert_eq!(v["args"], serde_json::json!(["make", "test"]));
+        assert_eq!(v["cwd"], "/src");
+        assert_eq!(v["env"], serde_json::json!(["PATH=/bin", "CI=1"]));
+        assert_eq!(
+            v["capabilities"]["bounding"],
+            serde_json::json!(["CAP_NET_BIND_SERVICE"])
+        );
+        assert_eq!(v["capabilities"]["ambient"], serde_json::json!([]));
+        assert_eq!(v["terminal"], false);
+
+        // The top layer's file is a symlink: it hides the base layer's
+        // passwd rather than being followed.
+        std::fs::remove_file(top.join("etc/passwd")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", top.join("etc/passwd")).unwrap();
+        assert!(exec_process(&p).is_err());
+        p.user = Some("7:8".into());
+        let v = serde_json::to_value(exec_process(&p).unwrap()).unwrap();
+        assert_eq!(v["user"]["uid"], 7);
     }
 
     #[test]

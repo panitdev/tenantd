@@ -1,6 +1,6 @@
 //! SQLite state. One connection behind a mutex, used from `spawn_blocking`.
 //! Records are columns for what reconcile and admission query, plus the
-//! resolved sandbox spec as JSON.
+//! resolved sandbox spec (and a process's request, limits and paths) as JSON.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -9,11 +9,14 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use tenantd_core::model::{
-    Overrides, ResolvedSandbox, SandboxRecord, SandboxState, TenantLimits, TenantRecord,
+    Overrides, ProcessIo, ProcessLimits, ProcessRecord, ProcessSpec, ProcessState,
+    ProcessTombstone, ResolvedSandbox, SandboxRecord, SandboxState, TenantLimits, TenantRecord,
     TenantState,
 };
 use tenantd_core::state::StateStore;
-use tenantd_core::{Error, ProjectId, Result, SandboxId, TenantId, now};
+use tenantd_core::{
+    Error, ProcessId, ProcessKey, ProjectId, Result, SandboxId, SandboxKey, TenantId, now,
+};
 
 const MIGRATIONS: &[&str] = &[
     // 1
@@ -39,6 +42,34 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (tenant_id, id)
+    );",
+    // 2
+    "CREATE TABLE processes (
+        tenant_id      TEXT NOT NULL,
+        sandbox_id     TEXT NOT NULL,
+        id             TEXT NOT NULL,
+        spec           TEXT NOT NULL,
+        limits         TEXT NOT NULL,
+        io             TEXT NOT NULL,
+        state          TEXT NOT NULL,
+        pid            INTEGER,
+        exit_code      INTEGER,
+        signal         INTEGER,
+        stdout_dropped INTEGER NOT NULL,
+        stderr_dropped INTEGER NOT NULL,
+        created_at     INTEGER NOT NULL,
+        updated_at     INTEGER NOT NULL,
+        exited_at      INTEGER,
+        PRIMARY KEY (tenant_id, sandbox_id, id),
+        FOREIGN KEY (tenant_id, sandbox_id) REFERENCES sandboxes(tenant_id, id)
+    );
+    CREATE TABLE process_tombstones (
+        tenant_id   TEXT NOT NULL,
+        sandbox_id  TEXT NOT NULL,
+        id          TEXT NOT NULL,
+        spec_digest TEXT NOT NULL,
+        expires_at  INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, sandbox_id, id)
     );",
 ];
 
@@ -158,6 +189,43 @@ fn sandbox_row(r: &Row) -> rusqlite::Result<SandboxRecord> {
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
     })
+}
+
+fn decode<T: serde::de::DeserializeOwned>(s: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(s).map_err(conv)
+}
+
+const PROCESS_COLS: &str = "tenant_id, sandbox_id, id, spec, limits, io, state, pid, exit_code, \
+     signal, stdout_dropped, stderr_dropped, created_at, updated_at, exited_at";
+
+fn process_row(r: &Row) -> rusqlite::Result<ProcessRecord> {
+    let state: ProcessState =
+        serde_json::from_value(serde_json::Value::String(r.get(6)?)).map_err(conv)?;
+    Ok(ProcessRecord {
+        tenant: TenantId::new(r.get::<_, String>(0)?).map_err(conv)?,
+        sandbox: SandboxId::new(r.get::<_, String>(1)?).map_err(conv)?,
+        id: ProcessId::new(r.get::<_, String>(2)?).map_err(conv)?,
+        spec: decode::<ProcessSpec>(&r.get::<_, String>(3)?)?,
+        limits: decode::<ProcessLimits>(&r.get::<_, String>(4)?)?,
+        io: decode::<ProcessIo>(&r.get::<_, String>(5)?)?,
+        state,
+        pid: r.get(7)?,
+        exit_code: r.get(8)?,
+        signal: r.get(9)?,
+        stdout_dropped: r.get::<_, i64>(10)? as u64,
+        stderr_dropped: r.get::<_, i64>(11)? as u64,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
+        exited_at: r.get(14)?,
+    })
+}
+
+fn process_key_params(k: &ProcessKey) -> [String; 3] {
+    [
+        k.tenant.to_string(),
+        k.sandbox.to_string(),
+        k.id.to_string(),
+    ]
 }
 
 fn is_constraint(e: &rusqlite::Error) -> bool {
@@ -391,12 +459,199 @@ impl StateStore for SqliteState {
     async fn delete_sandbox(&self, t: &TenantId, s: &SandboxId) -> Result<()> {
         let (t, s) = (t.clone(), s.clone());
         self.run(move |c| {
-            c.execute(
+            let tx = c.transaction().map_err(db)?;
+            for table in ["processes", "process_tombstones"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE tenant_id = ?1 AND sandbox_id = ?2"),
+                    [t.as_str(), s.as_str()],
+                )
+                .map_err(db)?;
+            }
+            tx.execute(
                 "DELETE FROM sandboxes WHERE tenant_id = ?1 AND id = ?2",
                 [t.as_str(), s.as_str()],
             )
             .map_err(db)?;
+            tx.commit().map_err(db)
+        })
+        .await
+    }
+
+    async fn insert_process(&self, rec: &ProcessRecord) -> Result<()> {
+        let rec = rec.clone();
+        let (spec, limits, io) = (json(&rec.spec)?, json(&rec.limits)?, json(&rec.io)?);
+        self.run(move |c| {
+            c.execute(
+                &format!(
+                    "INSERT INTO processes ({PROCESS_COLS})
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+                ),
+                params![
+                    rec.tenant.as_str(),
+                    rec.sandbox.as_str(),
+                    rec.id.as_str(),
+                    spec,
+                    limits,
+                    io,
+                    rec.state.as_str(),
+                    rec.pid,
+                    rec.exit_code,
+                    rec.signal,
+                    rec.stdout_dropped as i64,
+                    rec.stderr_dropped as i64,
+                    rec.created_at,
+                    rec.updated_at,
+                    rec.exited_at
+                ],
+            )
+            .map_err(|e| {
+                if is_constraint(&e) {
+                    Error::AlreadyExists(format!("process {}", rec.key()))
+                } else {
+                    db(e)
+                }
+            })?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn get_process(&self, k: &ProcessKey) -> Result<Option<ProcessRecord>> {
+        let k = process_key_params(k);
+        self.run(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {PROCESS_COLS} FROM processes
+                     WHERE tenant_id = ?1 AND sandbox_id = ?2 AND id = ?3"
+                ),
+                k,
+                process_row,
+            )
+            .optional()
+            .map_err(db)
+        })
+        .await
+    }
+
+    async fn list_processes(&self, s: Option<&SandboxKey>) -> Result<Vec<ProcessRecord>> {
+        let s = s.cloned();
+        self.run(move |c| {
+            let rows = match &s {
+                Some(s) => {
+                    let mut st = c
+                        .prepare(&format!(
+                            "SELECT {PROCESS_COLS} FROM processes
+                             WHERE tenant_id = ?1 AND sandbox_id = ?2 ORDER BY id"
+                        ))
+                        .map_err(db)?;
+                    st.query_map([s.tenant.as_str(), s.sandbox.as_str()], process_row)
+                        .map_err(db)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                }
+                None => {
+                    let mut st = c
+                        .prepare(&format!(
+                            "SELECT {PROCESS_COLS} FROM processes
+                             ORDER BY tenant_id, sandbox_id, id"
+                        ))
+                        .map_err(db)?;
+                    st.query_map([], process_row)
+                        .map_err(db)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                }
+            };
+            rows.map_err(db)
+        })
+        .await
+    }
+
+    async fn update_process(&self, rec: &ProcessRecord) -> Result<()> {
+        let rec = rec.clone();
+        self.run(move |c| {
+            let n = c
+                .execute(
+                    "UPDATE processes SET state = ?4, pid = ?5, exit_code = ?6, signal = ?7,
+                         stdout_dropped = ?8, stderr_dropped = ?9, updated_at = ?10, exited_at = ?11
+                     WHERE tenant_id = ?1 AND sandbox_id = ?2 AND id = ?3",
+                    params![
+                        rec.tenant.as_str(),
+                        rec.sandbox.as_str(),
+                        rec.id.as_str(),
+                        rec.state.as_str(),
+                        rec.pid,
+                        rec.exit_code,
+                        rec.signal,
+                        rec.stdout_dropped as i64,
+                        rec.stderr_dropped as i64,
+                        rec.updated_at,
+                        rec.exited_at
+                    ],
+                )
+                .map_err(db)?;
+            if n == 0 {
+                return Err(Error::NotFound(format!("process {}", rec.key())));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_process(
+        &self,
+        k: &ProcessKey,
+        tombstone: Option<&ProcessTombstone>,
+    ) -> Result<()> {
+        let (kp, tomb) = (process_key_params(k), tombstone.cloned());
+        self.run(move |c| {
+            let tx = c.transaction().map_err(db)?;
+            tx.execute(
+                "DELETE FROM processes WHERE tenant_id = ?1 AND sandbox_id = ?2 AND id = ?3",
+                params![kp[0], kp[1], kp[2]],
+            )
+            .map_err(db)?;
+            if let Some(t) = tomb {
+                tx.execute(
+                    "INSERT OR REPLACE INTO process_tombstones
+                         (tenant_id, sandbox_id, id, spec_digest, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![kp[0], kp[1], kp[2], t.spec_digest, t.expires_at],
+                )
+                .map_err(db)?;
+            }
+            tx.commit().map_err(db)
+        })
+        .await
+    }
+
+    async fn get_tombstone(&self, k: &ProcessKey) -> Result<Option<ProcessTombstone>> {
+        let key = k.clone();
+        let kp = process_key_params(k);
+        self.run(move |c| {
+            c.query_row(
+                "SELECT spec_digest, expires_at FROM process_tombstones
+                 WHERE tenant_id = ?1 AND sandbox_id = ?2 AND id = ?3",
+                kp,
+                |r| {
+                    Ok(ProcessTombstone {
+                        key,
+                        spec_digest: r.get(0)?,
+                        expires_at: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db)
+        })
+        .await
+    }
+
+    async fn purge_tombstones(&self, now: i64) -> Result<usize> {
+        self.run(move |c| {
+            c.execute(
+                "DELETE FROM process_tombstones WHERE expires_at <= ?1",
+                [now],
+            )
+            .map_err(db)
         })
         .await
     }
@@ -405,7 +660,6 @@ impl StateStore for SqliteState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tenantd_core::SandboxKey;
     use tenantd_core::model::{ImageConfig, LayerKind, NetworkMode, ResolvedImage};
 
     fn limits() -> TenantLimits {
@@ -458,6 +712,134 @@ mod tests {
         s.update_tenant(&rc).await.unwrap();
         assert_eq!(s.get_tenant(&c).await.unwrap().unwrap(), rc);
         assert_eq!(s.list_tenants().await.unwrap().len(), 2);
+    }
+
+    fn sandbox(t: &TenantId, id: &str) -> SandboxRecord {
+        let id = SandboxId::new(id).unwrap();
+        SandboxRecord {
+            tenant: t.clone(),
+            id: id.clone(),
+            profile: "default".into(),
+            image: "alpine".into(),
+            overrides: Overrides {
+                memory: Some(1),
+                ..Default::default()
+            },
+            spec: ResolvedSandbox {
+                key: SandboxKey::new(t.clone(), id),
+                profile: "default".into(),
+                image: ResolvedImage {
+                    reference: "docker.io/library/alpine:latest".into(),
+                    digest: "sha256:00".into(),
+                    layers: vec!["/data/images/layers/x".into()],
+                    config: ImageConfig::default(),
+                },
+                memory: 1,
+                cpus: 1.0,
+                pids: 10,
+                capabilities: vec![],
+                rootfs: LayerKind::HostOverlay,
+                size: None,
+                tmp_size: 0,
+                network: NetworkMode::None,
+                dns: vec![],
+            },
+            state: SandboxState::Creating,
+            exit_code: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn processes_and_tombstones() {
+        let s = SqliteState::in_memory().unwrap();
+        let t = TenantId::new("t").unwrap();
+        s.insert_tenant(&t, &limits(), (1, 5), &HashSet::new())
+            .await
+            .unwrap();
+        let sb = sandbox(&t, "box");
+        s.insert_sandbox(&sb).await.unwrap();
+        let key = ProcessKey::new(sb.key(), ProcessId::new("p1").unwrap());
+        let mut p = ProcessRecord {
+            tenant: t.clone(),
+            sandbox: sb.id.clone(),
+            id: key.id.clone(),
+            spec: ProcessSpec {
+                args: vec!["sh".into(), "-c".into(), "true".into()],
+                env: vec!["A=1".into()],
+                cwd: Some("/w".into()),
+                user: None,
+                tty: false,
+                stdin: false,
+            },
+            limits: ProcessLimits {
+                output_limit: 16,
+                retention_secs: 1,
+                tombstone_secs: 2,
+            },
+            io: ProcessIo {
+                dir: "/d/p1".into(),
+                stdout: "/d/p1/stdout".into(),
+                stderr: "/d/p1/stderr".into(),
+                pid_file: "/d/p1/pid".into(),
+            },
+            state: ProcessState::Starting,
+            pid: None,
+            exit_code: None,
+            signal: None,
+            stdout_dropped: 0,
+            stderr_dropped: 0,
+            created_at: 1,
+            updated_at: 1,
+            exited_at: None,
+        };
+        s.insert_process(&p).await.unwrap();
+        assert!(matches!(
+            s.insert_process(&p).await,
+            Err(Error::AlreadyExists(_))
+        ));
+        p.state = ProcessState::Exited;
+        p.pid = Some(7);
+        p.signal = Some(9);
+        p.stdout_dropped = 5;
+        p.exited_at = Some(3);
+        s.update_process(&p).await.unwrap();
+        assert_eq!(s.get_process(&key).await.unwrap().unwrap(), p);
+        assert_eq!(
+            s.list_processes(Some(&sb.key())).await.unwrap(),
+            vec![p.clone()]
+        );
+        assert_eq!(s.list_processes(None).await.unwrap().len(), 1);
+
+        let tomb = ProcessTombstone {
+            key: key.clone(),
+            spec_digest: p.spec.digest(),
+            expires_at: 10,
+        };
+        s.delete_process(&key, Some(&tomb)).await.unwrap();
+        assert!(s.get_process(&key).await.unwrap().is_none());
+        assert_eq!(s.get_tombstone(&key).await.unwrap(), Some(tomb));
+        assert_eq!(s.purge_tombstones(9).await.unwrap(), 0);
+        assert_eq!(s.purge_tombstones(10).await.unwrap(), 1);
+        assert!(s.get_tombstone(&key).await.unwrap().is_none());
+
+        // A sandbox takes its processes and tombstones with it.
+        s.insert_process(&p).await.unwrap();
+        s.delete_process(
+            &key,
+            Some(&ProcessTombstone {
+                key: ProcessKey::new(sb.key(), ProcessId::new("p2").unwrap()),
+                spec_digest: "x".into(),
+                expires_at: 99,
+            }),
+        )
+        .await
+        .unwrap();
+        s.insert_process(&p).await.unwrap();
+        s.delete_sandbox(&t, &sb.id).await.unwrap();
+        assert!(s.list_processes(None).await.unwrap().is_empty());
+        assert_eq!(s.purge_tombstones(i64::MAX).await.unwrap(), 0);
     }
 
     #[tokio::test]

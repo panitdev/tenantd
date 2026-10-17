@@ -31,6 +31,15 @@ pids = 1024
 rootfs = "host-overlay"       # host-overlay | memory | read-only
 network = "egress"            # none | egress
 
+[profiles.default.exec]       # processes callers may start in running sandboxes
+enabled = true                # default false -> PERMISSION_DENIED "profiles.default.exec"
+users = ["image", "1000"]     # allowed StartProcess users; "" means "image"
+max_processes = 16            # live tracked processes per sandbox
+tty = false                   # tty/stdin/attach are not implemented yet
+output_limit = "16m"          # per stream; the head is kept, the rest discarded
+retention_secs = 3600         # exited processes are garbage-collected after this
+tombstone_secs = 86400        # process IDs stay reserved this long after GC
+
 [profiles.scratch]
 images = ["ghcr.io/example/*"]
 memory = "2g"

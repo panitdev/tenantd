@@ -103,6 +103,53 @@ mod tests {
                 Cmd::Client(cli::ClientCmd::Sandbox { .. })
             ));
         }
+        match parse(&[
+            "exec",
+            "acme",
+            "box1",
+            "-e",
+            "A=1",
+            "--",
+            "sh",
+            "-c",
+            "make test",
+        ])
+        .unwrap()
+        .cmd
+        {
+            Cmd::Client(cli::ClientCmd::Exec { args, .. }) => {
+                assert_eq!(args.args, ["sh", "-c", "make test"]);
+                assert_eq!((args.env, args.detach), (vec!["A=1".to_string()], false));
+            }
+            _ => panic!(),
+        }
+        assert!(
+            parse(&["exec", "acme", "box1"]).is_err(),
+            "a command is required"
+        );
+        for args in [
+            &["process", "ps", "acme", "box1"][..],
+            &[
+                "process", "kill", "acme", "box1", "b1", "--signal", "SIGINT",
+            ][..],
+            &["process", "logs", "acme", "box1", "b1", "--stderr", "-f"][..],
+            &["process", "wait", "acme", "box1", "b1"][..],
+            &["process", "rm", "acme", "box1", "b1", "--force"][..],
+        ] {
+            assert!(
+                matches!(
+                    parse(args).unwrap().cmd,
+                    Cmd::Client(cli::ClientCmd::Process { .. })
+                ),
+                "{args:?}"
+            );
+        }
+        assert!(
+            parse(&[
+                "process", "kill", "acme", "box1", "b1", "--signal", "SIGSEGV"
+            ])
+            .is_err()
+        );
         assert!(matches!(
             parse(&["serve", "-c", "examples/tenantd.toml", "--log-json"])
                 .unwrap()

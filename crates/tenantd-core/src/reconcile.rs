@@ -9,8 +9,8 @@ use tracing::{info, warn};
 use crate::Tenantd;
 use crate::backend::RuntimeHandle;
 use crate::events::EventKind;
-use crate::model::{SandboxState, TenantState};
-use crate::{ProjectId, SandboxKey, TenantId};
+use crate::model::{ProcessState, SandboxState, TenantState};
+use crate::{ProjectId, SandboxKey, TenantId, now};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
@@ -44,6 +44,7 @@ impl Tenantd {
         self.check_health().await;
         self.reconcile_tenants(&mut rep).await;
         self.reconcile_sandboxes(&mut rep).await;
+        self.reconcile_processes(&mut rep).await;
         self.reconcile_images(&mut rep).await;
         rep
     }
@@ -363,6 +364,140 @@ impl Tenantd {
                     Err(e) => rep.err(&target, e),
                 }
             }
+        }
+    }
+
+    /// Live rows are adopted, re-armed or ended against what the runtime
+    /// reports; ended rows past their retention are collected into
+    /// tombstones, and expired tombstones dropped.
+    async fn reconcile_processes(&self, rep: &mut ReconcileReport) {
+        let rows = match self.state.list_processes(None).await {
+            Ok(r) => r,
+            Err(e) => return rep.err("state", e),
+        };
+        // In-sandbox PIDs per sandbox, listed once; `None` if listing failed.
+        let mut pids: HashMap<SandboxKey, Option<HashSet<u32>>> = HashMap::new();
+        let ts = now();
+        for row in rows {
+            let key = row.key();
+            let target = format!("process/{key}");
+            if !row.state.is_live() {
+                let since = row.exited_at.unwrap_or(row.updated_at);
+                if since.saturating_add(row.limits.retention_secs as i64) > ts {
+                    continue;
+                }
+                let _p = self.process_locks.lock(key.clone()).await;
+                let rec = match self.state.get_process(&key).await {
+                    Ok(Some(r)) if !r.state.is_live() => r,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        rep.err(&target, e);
+                        continue;
+                    }
+                };
+                match self.remove_process(&rec).await {
+                    Ok(()) => rep.act(self, "gc_process", &target, "retention passed"),
+                    Err(e) => rep.err(&target, e),
+                }
+                continue;
+            }
+
+            let sk = row.sandbox_key();
+            let _s = self.sandbox_locks.lock(sk.clone()).await;
+            let running = matches!(
+                self.state.get_sandbox(&sk.tenant, &sk.sandbox).await,
+                Ok(Some(s)) if s.state == SandboxState::Running
+            );
+            let _p = self.process_locks.lock(key.clone()).await;
+            let mut rec = match self.state.get_process(&key).await {
+                Ok(Some(r)) if r.state.is_live() => r,
+                Ok(_) => continue,
+                Err(e) => {
+                    rep.err(&target, e);
+                    continue;
+                }
+            };
+            if !running {
+                let state = match rec.state {
+                    ProcessState::Running => ProcessState::Exited,
+                    _ => ProcessState::Lost,
+                };
+                match self.finish_process(&mut rec, state, None, None).await {
+                    Ok(()) => rep.act(self, "end_process", &target, "sandbox not running"),
+                    Err(e) => rep.err(&target, e),
+                }
+                continue;
+            }
+            let h = RuntimeHandle::for_key(&sk);
+            if !pids.contains_key(&sk) {
+                let listed = match self.runtime.list_processes(&h).await {
+                    Ok(v) => Some(v.into_iter().map(|p| p.pid).collect()),
+                    Err(e) => {
+                        rep.err(format!("sandbox/{sk}"), e);
+                        None
+                    }
+                };
+                pids.insert(sk.clone(), listed);
+            }
+            let Some(alive) = &pids[&sk] else { continue };
+            // In-sandbox PIDs are allocated in sequence and only wrap after
+            // the whole PID space, so a listed PID is taken as the same
+            // process. (runsc's ps start time is minute-grained.)
+            match rec.state {
+                ProcessState::Starting => match self.runtime.recorded_pid(&rec.io).await {
+                    Ok(Some(pid)) if alive.contains(&pid) => {
+                        rec.pid = Some(pid);
+                        let res = async {
+                            self.set_process_state(&mut rec, ProcessState::Running)
+                                .await?;
+                            self.arm_process(&rec).await
+                        };
+                        match res.await {
+                            Ok(()) => rep.act(self, "adopt_process", &target, format!("pid {pid}")),
+                            Err(e) => rep.err(&target, e),
+                        }
+                    }
+                    Ok(_) => match self
+                        .finish_process(&mut rec, ProcessState::Lost, None, None)
+                        .await
+                    {
+                        Ok(()) => rep.act(self, "mark_process_lost", &target, "no live pid"),
+                        Err(e) => rep.err(&target, e),
+                    },
+                    Err(e) => rep.err(&target, e),
+                },
+                _ => {
+                    let pid = rec.pid.unwrap_or(0);
+                    if alive.contains(&pid) {
+                        if let Err(e) = self.arm_process(&rec).await {
+                            rep.err(&target, e);
+                        }
+                    } else {
+                        match self
+                            .finish_process(&mut rec, ProcessState::Exited, None, None)
+                            .await
+                        {
+                            Ok(()) => rep.act(
+                                self,
+                                "mark_process_exited",
+                                &target,
+                                format!("pid {pid} is gone"),
+                            ),
+                            Err(e) => rep.err(&target, e),
+                        }
+                    }
+                }
+            }
+        }
+        match self.state.purge_tombstones(ts).await {
+            Ok(0) => {}
+            Ok(n) => rep.act(
+                self,
+                "purge_tombstones",
+                "tombstones",
+                format!("{n} expired"),
+            ),
+            Err(e) => rep.err("state", e),
         }
     }
 

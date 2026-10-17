@@ -181,10 +181,89 @@ pub struct Profile {
     /// Size of the `/tmp` tmpfs on a read-only root.
     #[serde(default = "default_tmp_size")]
     pub tmp_size: ByteSize,
+    /// Processes callers may start inside the profile's running sandboxes.
+    /// Read at start time from the current config, not snapshotted with
+    /// the sandbox.
+    #[serde(default)]
+    pub exec: ExecPolicy,
 }
 
 fn default_tmp_size() -> ByteSize {
     ByteSize(64 << 20)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed values of a start's `user`: `"image"` (the image's user, also
+    /// what an empty `user` means), a numeric `uid[:gid]`, or a name looked
+    /// up in the image.
+    #[serde(default = "default_exec_users")]
+    pub users: Vec<String>,
+    /// Live (starting or running) tracked processes per sandbox.
+    #[serde(default = "default_max_processes")]
+    pub max_processes: u32,
+    #[serde(default)]
+    pub tty: bool,
+    /// Bytes kept per stream; output past this is discarded (head is kept).
+    #[serde(default = "default_output_limit")]
+    pub output_limit: ByteSize,
+    /// Exited processes are garbage-collected this long after exit.
+    #[serde(default = "default_retention")]
+    pub retention_secs: u64,
+    /// Process IDs stay reserved this long after garbage collection.
+    #[serde(default = "default_tombstone")]
+    pub tombstone_secs: u64,
+}
+
+impl Default for ExecPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            users: default_exec_users(),
+            max_processes: default_max_processes(),
+            tty: false,
+            output_limit: default_output_limit(),
+            retention_secs: default_retention(),
+            tombstone_secs: default_tombstone(),
+        }
+    }
+}
+
+fn default_exec_users() -> Vec<String> {
+    vec!["image".into()]
+}
+
+fn default_max_processes() -> u32 {
+    16
+}
+
+fn default_output_limit() -> ByteSize {
+    ByteSize(16 << 20)
+}
+
+fn default_retention() -> u64 {
+    3600
+}
+
+fn default_tombstone() -> u64 {
+    86400
+}
+
+/// `image`, `uid`, `uid:gid`, `name` or `name:group`.
+fn valid_exec_user(u: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 32
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    };
+    match u.split_once(':') {
+        Some((a, b)) => part(a) && part(b),
+        None => part(u),
+    }
 }
 
 pub const KNOWN_CAPABILITIES: &[&str] = &[
@@ -300,6 +379,22 @@ impl Config {
             if p.size.is_some_and(|s| s.0 == 0) {
                 return bad(format!("{} must be positive", at("size")));
             }
+            let e = &p.exec;
+            if e.max_processes == 0 || e.output_limit.0 == 0 {
+                return bad(format!(
+                    "{}: max_processes and output_limit must be positive",
+                    at("exec")
+                ));
+            }
+            if e.tombstone_secs <= e.retention_secs {
+                return bad(format!(
+                    "{} must be longer than retention_secs",
+                    at("exec.tombstone_secs")
+                ));
+            }
+            if let Some(u) = e.users.iter().find(|u| !valid_exec_user(u)) {
+                return bad(format!("{}: bad user {u:?}", at("exec.users")));
+            }
         }
         Ok(())
     }
@@ -340,6 +435,10 @@ mod tests {
         assert_eq!(cfg.profiles["scratch"].rootfs, LayerKind::Memory);
         assert_eq!(cfg.server.callers[0].uid, 1000);
         assert_eq!(cfg.reconcile.interval_secs, 180);
+        let exec = &cfg.profiles["default"].exec;
+        assert!(exec.enabled);
+        assert_eq!(exec.output_limit.0, 16 << 20);
+        assert!(!cfg.profiles["scratch"].exec.enabled);
     }
 
     #[test]
@@ -359,5 +458,9 @@ mod tests {
             ))
             .is_err()
         );
+        assert!(Config::from_toml(&with("tombstone_secs = 86400", "tombstone_secs = 60")).is_err());
+        assert!(Config::from_toml(&with("max_processes = 16", "max_processes = 0")).is_err());
+        assert!(Config::from_toml(&with("\"1000\"]", "\"a/b\"]")).is_err());
+        assert!(Config::from_toml(&with("tty = false", "tty = false\nprivileged = true")).is_err());
     }
 }

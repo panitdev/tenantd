@@ -4,9 +4,16 @@
 use crate::backend::LayerTraits;
 use crate::config::{Config, Profile};
 use crate::model::{
-    LayerKind, NetworkMode, Overrides, ResolvedImage, ResolvedSandbox, SandboxRecord, TenantRecord,
+    LayerKind, NetworkMode, Overrides, ProcessLimits, ProcessSpec, ResolvedImage, ResolvedProcess,
+    ResolvedSandbox, SandboxRecord, TenantRecord,
 };
-use crate::{Bytes, Error, Result, SandboxKey};
+use crate::{Bytes, Error, ProcessKey, Result, SandboxKey};
+
+/// Caps on a process start's args and env.
+pub const PROCESS_MAX_ENTRIES: usize = 256;
+pub const PROCESS_MAX_BYTES: usize = 128 << 10;
+
+const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// A request that passed profile policy but whose image is not resolved yet.
 #[derive(Clone, Debug)]
@@ -164,6 +171,111 @@ pub fn admit(
         }
     }
     Ok(())
+}
+
+/// Shape checks on a process spec that need no config.
+pub fn validate_process_spec(p: &ProcessSpec) -> Result<()> {
+    if p.args.is_empty() || p.args[0].is_empty() {
+        return Err(Error::invalid("args are required"));
+    }
+    if p.args.len() > PROCESS_MAX_ENTRIES || p.env.len() > PROCESS_MAX_ENTRIES {
+        return Err(Error::invalid(format!(
+            "args and env take at most {PROCESS_MAX_ENTRIES} entries each"
+        )));
+    }
+    let strings = p.args.iter().chain(&p.env).chain(&p.cwd).chain(&p.user);
+    if strings.clone().any(|s| s.contains('\0')) {
+        return Err(Error::invalid(
+            "args, env, cwd and user must not contain NUL",
+        ));
+    }
+    let total: usize = strings.map(|s| s.len()).sum();
+    if total > PROCESS_MAX_BYTES {
+        return Err(Error::invalid(format!(
+            "args, env, cwd and user take at most {PROCESS_MAX_BYTES} bytes together"
+        )));
+    }
+    if let Some(e) = p
+        .env
+        .iter()
+        .find(|e| e.split_once('=').is_none_or(|(k, _)| k.is_empty()))
+    {
+        return Err(Error::invalid(format!("env entry {e:?} is not KEY=VALUE")));
+    }
+    if p.cwd.as_ref().is_some_and(|c| !c.starts_with('/')) {
+        return Err(Error::invalid("cwd must be an absolute path"));
+    }
+    Ok(())
+}
+
+/// Resolve a process start against the sandbox and the exec policy of its
+/// profile in the *current* config. The process gets the sandbox's
+/// capabilities, never more.
+pub fn plan_process(
+    cfg: &Config,
+    sandbox: &SandboxRecord,
+    key: ProcessKey,
+    p: &ProcessSpec,
+) -> Result<(ResolvedProcess, ProcessLimits)> {
+    validate_process_spec(p)?;
+    let name = &sandbox.profile;
+    let exec = &cfg.profile(name)?.exec;
+    let rule = |f: &str| format!("profiles.{name}.exec{f}");
+    if !exec.enabled {
+        return Err(Error::denied(
+            rule(""),
+            "exec is not enabled for this profile",
+        ));
+    }
+    let user = p
+        .user
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .unwrap_or("image");
+    if !exec.users.iter().any(|u| u == user) {
+        return Err(Error::denied(
+            rule(".users"),
+            format!("user {user:?} is not allowed"),
+        ));
+    }
+    if p.tty && !exec.tty {
+        return Err(Error::denied(rule(".tty"), "tty is not allowed"));
+    }
+    if p.tty || p.stdin {
+        return Err(Error::invalid(
+            "tty and stdin processes are not supported yet",
+        ));
+    }
+
+    let img = &sandbox.spec.image.config;
+    let mut env = img.env.clone();
+    if !env.iter().any(|e| e.starts_with("PATH=")) {
+        env.push(DEFAULT_PATH.into());
+    }
+    env.push(format!("HOSTNAME={}", sandbox.id));
+    env.extend(p.env.iter().cloned());
+    let resolved = ResolvedProcess {
+        key,
+        args: p.args.clone(),
+        env,
+        cwd: p
+            .cwd
+            .clone()
+            .or_else(|| img.working_dir.clone().filter(|d| !d.is_empty()))
+            .unwrap_or_else(|| "/".into()),
+        user: match user {
+            "image" => img.user.clone().filter(|u| !u.is_empty()),
+            u => Some(u.to_string()),
+        },
+        capabilities: sandbox.spec.capabilities.clone(),
+        image_layers: sandbox.spec.image.layers.clone(),
+    };
+    let limits = ProcessLimits {
+        output_limit: exec.output_limit.0,
+        retention_secs: exec.retention_secs,
+        tombstone_secs: exec.tombstone_secs,
+    };
+    Ok((resolved, limits))
 }
 
 /// Normalise a reference the way registries resolve it:

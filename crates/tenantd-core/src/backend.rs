@@ -10,8 +10,11 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RuntimeKind;
-use crate::model::{LayerKind, NetworkMode, ResolvedImage, ResolvedSandbox};
-use crate::{Bytes, ProjectId, Result, SandboxId, SandboxKey, TenantId};
+use crate::model::{
+    LayerKind, NetworkMode, ProcessIo, ResolvedImage, ResolvedProcess, ResolvedSandbox, Signal,
+    Stream,
+};
+use crate::{Bytes, ProcessId, ProjectId, Result, SandboxId, SandboxKey, TenantId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
@@ -21,7 +24,8 @@ pub struct Usage {
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
-    /// Refuse to start if quota is not actually enforced on the storage root.
+    /// Refuse to start if quota is not actually enforced on the storage root,
+    /// or if the filesystem can't punch holes (process output limits need it).
     async fn verify(&self) -> Result<()>;
     /// The directory a tenant lives in. Pure; touches nothing.
     fn tenant_dir(&self, t: &TenantId) -> PathBuf;
@@ -135,6 +139,21 @@ pub enum RuntimeEvent {
         exit_code: Option<i32>,
         oom: bool,
     },
+    /// An exec'd process ended. `signal` is the raw number when a signal
+    /// killed it; both are `None` when the status couldn't be read.
+    ProcessExited {
+        handle: RuntimeHandle,
+        pid: u32,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
+}
+
+/// A process the runtime sees inside a sandbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub cmd: String,
 }
 
 /// Where the sandbox's network namespace is.
@@ -164,6 +183,47 @@ pub trait RuntimeBackend: Send + Sync {
     /// restart to re-attach.
     async fn watch(&self, h: &RuntimeHandle) -> Result<()>;
     fn events(&self) -> BoxStream<'static, RuntimeEvent>;
+
+    /// Start `p` detached in the running container, with stdout and stderr
+    /// going straight to the files in `io`. Returns the in-sandbox PID,
+    /// which is also written to `io.pid_file`.
+    async fn exec(&self, h: &RuntimeHandle, p: &ResolvedProcess, io: &ProcessIo) -> Result<u32>;
+    /// The PID an earlier [`RuntimeBackend::exec`] with `io` recorded, if it
+    /// got that far. For reconcile after a crash mid-start.
+    async fn recorded_pid(&self, io: &ProcessIo) -> Result<Option<u32>>;
+    /// Signal one process. A process that is already gone is success.
+    async fn signal(&self, h: &RuntimeHandle, pid: u32, sig: Signal) -> Result<()>;
+    /// Make sure the process's exit will be reported as
+    /// [`RuntimeEvent::ProcessExited`]. Idempotent, like `watch`.
+    async fn watch_process(&self, h: &RuntimeHandle, pid: u32) -> Result<()>;
+    /// Processes in the container, for reconcile.
+    async fn list_processes(&self, h: &RuntimeHandle) -> Result<Vec<ProcInfo>>;
+}
+
+/// Process output files. The runtime writes them directly; this keeps each
+/// stream to its first `limit` bytes on disk, discarding the rest while
+/// leaving the file's logical size (the bytes written) intact.
+#[async_trait]
+pub trait OutputStore: Send + Sync {
+    /// Where a process's files go under its sandbox's directory. Pure.
+    fn io(&self, tenant_dir: &Path, s: &SandboxId, p: &ProcessId) -> ProcessIo;
+    /// Create the directory and empty stream files, replacing any leftovers.
+    async fn prepare(&self, io: &ProcessIo) -> Result<()>;
+    /// Enforce `limit` as the files grow. Idempotent; trims once right away,
+    /// so re-arming after a restart applies anything missed.
+    async fn watch(&self, io: &ProcessIo, limit: Bytes) -> Result<()>;
+    /// Stop watching. Never fails.
+    async fn unwatch(&self, io: &ProcessIo);
+    /// Discard everything past `limit` now.
+    async fn trim(&self, io: &ProcessIo, limit: Bytes) -> Result<()>;
+    /// Bytes written to each stream so far (stdout, stderr). Missing files
+    /// count as empty.
+    async fn sizes(&self, io: &ProcessIo) -> Result<(Bytes, Bytes)>;
+    /// Up to `len` bytes from `offset`. Short or empty at the end of the
+    /// file or when it is missing.
+    async fn read(&self, io: &ProcessIo, s: Stream, offset: Bytes, len: usize) -> Result<Vec<u8>>;
+    /// Remove the directory. Idempotent.
+    async fn remove(&self, io: &ProcessIo) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

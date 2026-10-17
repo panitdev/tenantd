@@ -2,9 +2,10 @@
 //! state store before touching the host, and every host step is idempotent,
 //! so a crash at any point leaves something reconcile can finish or undo.
 //!
-//! Locking: one async mutex per tenant and one per sandbox, always taken in
+//! Locking: one async mutex per tenant, sandbox and process, always taken in
 //! that order. Tenant locks cover admission and tenant lifecycle; sandbox
-//! locks cover host work on one sandbox.
+//! locks cover host work on one sandbox; process locks cover one process's
+//! exec and row.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -12,12 +13,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::sync::{OwnedMutexGuard, broadcast};
+use tokio::sync::{OwnedMutexGuard, broadcast, watch};
 use tracing::{info, warn};
 
 use crate::backend::{
-    ImageStore, NetworkBackend, RuntimeBackend, RuntimeEvent, RuntimeHandle, RuntimeState,
-    StorageBackend, Usage, WritableLayer,
+    ImageStore, NetworkBackend, OutputStore, RuntimeBackend, RuntimeEvent, RuntimeHandle,
+    RuntimeState, StorageBackend, Usage, WritableLayer,
 };
 use crate::config::Config;
 use crate::events::{Event, EventKind};
@@ -26,7 +27,7 @@ use crate::model::{
 };
 use crate::policy;
 use crate::state::StateStore;
-use crate::{Error, ProjectId, Result, SandboxId, SandboxKey, TenantId, now};
+use crate::{Error, ProcessKey, ProjectId, Result, SandboxId, SandboxKey, TenantId, now};
 
 pub struct Backends {
     pub storage: Arc<dyn StorageBackend>,
@@ -34,6 +35,7 @@ pub struct Backends {
     pub runtime: Arc<dyn RuntimeBackend>,
     pub images: Arc<dyn ImageStore>,
     pub network: Arc<dyn NetworkBackend>,
+    pub output: Arc<dyn OutputStore>,
     pub state: Arc<dyn StateStore>,
 }
 
@@ -58,9 +60,14 @@ pub struct Tenantd {
     pub(crate) runtime: Arc<dyn RuntimeBackend>,
     pub(crate) images: Arc<dyn ImageStore>,
     pub(crate) network: Arc<dyn NetworkBackend>,
+    pub(crate) output: Arc<dyn OutputStore>,
     pub(crate) state: Arc<dyn StateStore>,
     pub(crate) tenant_locks: KeyedLocks<TenantId>,
     pub(crate) sandbox_locks: KeyedLocks<SandboxKey>,
+    pub(crate) process_locks: KeyedLocks<ProcessKey>,
+    /// Bumped whenever a process row changes state, so waiters and output
+    /// followers wake up.
+    pub(crate) process_epoch: watch::Sender<u64>,
     /// Image resolution holds it shared until the sandbox row exists; GC
     /// holds it exclusively, so GC never removes an image mid-create.
     pub(crate) image_gate: tokio::sync::RwLock<()>,
@@ -84,9 +91,12 @@ impl Tenantd {
             runtime: b.runtime,
             images: b.images,
             network: b.network,
+            output: b.output,
             state: b.state,
             tenant_locks: KeyedLocks::default(),
             sandbox_locks: KeyedLocks::default(),
+            process_locks: KeyedLocks::default(),
+            process_epoch: watch::Sender::new(0),
             image_gate: tokio::sync::RwLock::new(()),
             events,
             health: Mutex::new(Vec::new()),
@@ -160,7 +170,7 @@ impl Tenantd {
         self.health.lock().unwrap().clone()
     }
 
-    fn require_enforcement(&self) -> Result<()> {
+    pub(crate) fn require_enforcement(&self) -> Result<()> {
         let h = self.health.lock().unwrap();
         if h.is_empty() {
             return Err(Error::Unavailable("health not checked yet".into()));
@@ -174,7 +184,7 @@ impl Tenantd {
         }
     }
 
-    fn require_unblocked(&self, t: &TenantId) -> Result<()> {
+    pub(crate) fn require_unblocked(&self, t: &TenantId) -> Result<()> {
         match self.blocked.lock().unwrap().get(t) {
             Some(why) => Err(Error::FailedPrecondition(format!(
                 "tenant {t} is blocked: {why}"
@@ -521,6 +531,9 @@ impl Tenantd {
             self.set_state(&mut rec, SandboxState::Destroying).await?;
         }
         self.tear_down(&rec, true).await?;
+        for p in self.state.list_processes(Some(&rec.key())).await? {
+            self.output.remove(&p.io).await?;
+        }
         self.state.delete_sandbox(&rec.tenant, &rec.id).await?;
         info!(sandbox = %rec.key(), "sandbox destroyed");
         Ok(())
@@ -561,9 +574,9 @@ impl Tenantd {
         self.runtime.watch(&h).await
     }
 
-    /// Stop and remove the container and the network; remove the layer too
-    /// when `remove_layer` or when the layer doesn't survive a stop. Tries
-    /// every step and returns the first error.
+    /// End the sandbox's processes, stop and remove the container and the
+    /// network; remove the layer too when `remove_layer` or when the layer
+    /// doesn't survive a stop. Tries every step and returns the first error.
     pub(crate) async fn tear_down(&self, rec: &SandboxRecord, remove_layer: bool) -> Result<()> {
         let key = rec.key();
         let h = RuntimeHandle::for_key(&key);
@@ -574,6 +587,7 @@ impl Tenantd {
                 first.get_or_insert(e);
             }
         };
+        keep(self.end_processes(&key).await);
         let runtime = async {
             match self.runtime.inspect(&h).await? {
                 RuntimeState::Missing => Ok(()),
@@ -618,11 +632,24 @@ impl Tenantd {
     }
 
     pub async fn on_runtime_event(&self, ev: RuntimeEvent) {
-        let RuntimeEvent::Exited {
-            handle,
-            exit_code,
-            oom,
-        } = ev;
+        let (handle, exit_code, oom) = match ev {
+            RuntimeEvent::Exited {
+                handle,
+                exit_code,
+                oom,
+            } => (handle, exit_code, oom),
+            RuntimeEvent::ProcessExited {
+                handle,
+                pid,
+                exit_code,
+                signal,
+            } => {
+                if let Some(key) = handle.key() {
+                    self.on_process_exit(&key, pid, exit_code, signal).await;
+                }
+                return;
+            }
+        };
         let Some(key) = handle.key() else { return };
         if oom {
             self.emit(EventKind::SandboxOom { key: key.clone() });

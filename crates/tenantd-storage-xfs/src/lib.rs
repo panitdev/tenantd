@@ -60,6 +60,29 @@ fn apply_project_tree(dir: &Path, project: u32, dev: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Process output limits free the blocks past the limit with punch-hole;
+/// without it output would grow unbounded, so fail closed.
+fn check_punch_hole(root: &Path) -> Result<()> {
+    let probe = root.join(".tenantd-punch-probe");
+    let res = (|| {
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&probe)?;
+        f.set_len(1 << 16)?;
+        sys::punch_hole(&f, 0, 4096)
+    })();
+    let _ = fs::remove_file(&probe);
+    res.map_err(|e| {
+        Error::Unavailable(format!(
+            "{} can't punch holes, which process output limits need: {e}",
+            root.display()
+        ))
+    })
+}
+
 fn read_project(dir: &Path) -> io::Result<Option<ProjectId>> {
     let x = sys::get_xattr(&File::open(dir)?)?;
     Ok((x.projid != 0 && x.xflags & sys::FS_XFLAG_PROJINHERIT != 0).then_some(ProjectId(x.projid)))
@@ -83,7 +106,7 @@ impl StorageBackend for XfsProjectQuota {
                     root.display()
                 )));
             }
-            Ok(())
+            check_punch_hole(&root)
         })
         .await
     }
@@ -228,5 +251,17 @@ mod tests {
                 Err(Error::Unavailable(_))
             ));
         }
+    }
+
+    #[test]
+    fn punch_hole_probe_cleans_up() {
+        let d = tempfile::tempdir().unwrap();
+        // tmpfs, ext4 and XFS all punch; the probe leaves nothing behind.
+        check_punch_hole(d.path()).unwrap();
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 0);
+        assert!(matches!(
+            check_punch_hole(&d.path().join("missing")),
+            Err(Error::Unavailable(_))
+        ));
     }
 }

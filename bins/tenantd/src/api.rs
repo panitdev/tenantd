@@ -3,16 +3,20 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::Stream;
 use tenantd_client::pb::{
-    self, sandboxes_server::Sandboxes, system_server::System, tenants_server::Tenants,
+    self, processes_server::Processes, sandboxes_server::Sandboxes, system_server::System,
+    tenants_server::Tenants,
 };
 use tenantd_core::events::{Event, EventKind};
-use tenantd_core::model::{Overrides, SandboxRecord, TenantLimits, TenantRecord};
+use tenantd_core::model::{
+    Overrides, ProcessRecord, ProcessSpec, SandboxRecord, Signal, TenantLimits, TenantRecord,
+};
+use tenantd_core::process::OutputChunk;
 use tenantd_core::service::TenantInfo;
-use tenantd_core::{Error, SandboxId, TenantId, Tenantd};
+use tenantd_core::{Error, ProcessId, ProcessKey, SandboxId, SandboxKey, TenantId, Tenantd};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
@@ -68,6 +72,88 @@ fn tenant_id(s: &str) -> tenantd_core::Result<TenantId> {
 
 fn sandbox_id(s: &str) -> tenantd_core::Result<SandboxId> {
     SandboxId::new(s)
+}
+
+fn process_key(t: &str, s: &str, p: &str) -> tenantd_core::Result<ProcessKey> {
+    Ok(ProcessKey::new(
+        SandboxKey::new(tenant_id(t)?, sandbox_id(s)?),
+        ProcessId::new(p)?,
+    ))
+}
+
+fn process_ref(r: Option<pb::ProcessRef>) -> tenantd_core::Result<ProcessKey> {
+    let r = r.ok_or_else(|| Error::invalid("process is required"))?;
+    process_key(&r.tenant, &r.sandbox, &r.id)
+}
+
+fn signal(raw: i32) -> tenantd_core::Result<Signal> {
+    use pb::Signal as S;
+    Ok(match S::try_from(raw).unwrap_or(S::Unspecified) {
+        S::Sigterm => Signal::Term,
+        S::Sigkill => Signal::Kill,
+        S::Sigint => Signal::Int,
+        S::Sighup => Signal::Hup,
+        S::Sigquit => Signal::Quit,
+        S::Sigusr1 => Signal::Usr1,
+        S::Sigusr2 => Signal::Usr2,
+        S::Unspecified => return Err(Error::invalid("signal is required")),
+    })
+}
+
+/// A raw signal number as the enum; numbers outside it are UNSPECIFIED.
+fn pb_signal(n: i32) -> i32 {
+    use pb::Signal as S;
+    (match Signal::from_number(n) {
+        Some(Signal::Term) => S::Sigterm,
+        Some(Signal::Kill) => S::Sigkill,
+        Some(Signal::Int) => S::Sigint,
+        Some(Signal::Hup) => S::Sighup,
+        Some(Signal::Quit) => S::Sigquit,
+        Some(Signal::Usr1) => S::Sigusr1,
+        Some(Signal::Usr2) => S::Sigusr2,
+        None => S::Unspecified,
+    }) as i32
+}
+
+fn stream(raw: i32) -> tenantd_core::Result<tenantd_core::model::Stream> {
+    match pb::Stream::try_from(raw) {
+        Ok(pb::Stream::Stdout) => Ok(tenantd_core::model::Stream::Stdout),
+        Ok(pb::Stream::Stderr) => Ok(tenantd_core::model::Stream::Stderr),
+        _ => Err(Error::invalid("stream must be STDOUT or STDERR")),
+    }
+}
+
+fn pb_process(r: ProcessRecord) -> pb::Process {
+    pb::Process {
+        tenant: r.tenant.into(),
+        sandbox: r.sandbox.into(),
+        id: r.id.into(),
+        args: r.spec.args,
+        user: r.spec.user.unwrap_or_default(),
+        tty: r.spec.tty,
+        state: r.state.as_str().into(),
+        pid: r.pid.unwrap_or(0),
+        exit_code: r.exit_code,
+        signal: r.signal.map(pb_signal),
+        stdout_dropped: r.stdout_dropped,
+        stderr_dropped: r.stderr_dropped,
+        created_at: r.created_at,
+        exited_at: r.exited_at,
+        output_limit: r.limits.output_limit,
+    }
+}
+
+fn pb_chunk(c: OutputChunk) -> pb::OutputChunk {
+    use pb::output_chunk::{Data, Kind, Truncated};
+    pb::OutputChunk {
+        kind: Some(match c {
+            OutputChunk::Data { offset, bytes } => Kind::Data(Data { offset, bytes }),
+            OutputChunk::Truncated { offset, dropped } => Kind::Truncated(Truncated {
+                offset,
+                dropped_bytes: dropped,
+            }),
+        }),
+    }
 }
 
 fn limits(l: Option<pb::TenantLimits>) -> tenantd_core::Result<TenantLimits> {
@@ -134,6 +220,21 @@ pub fn pb_event(e: Event) -> pb::Event {
         EventKind::SandboxOom { key } => Kind::SandboxOom(pb::SandboxOom {
             tenant: key.tenant.into(),
             id: key.sandbox.into(),
+        }),
+        EventKind::ProcessExited {
+            key,
+            exit_code,
+            signal,
+            stdout_dropped,
+            stderr_dropped,
+        } => Kind::ProcessExited(pb::ProcessExited {
+            tenant: key.tenant.into(),
+            sandbox: key.sandbox.into(),
+            id: key.id.into(),
+            exit_code,
+            signal: signal.map(pb_signal),
+            stdout_dropped,
+            stderr_dropped,
         }),
         EventKind::QuotaExceeded {
             tenant,
@@ -334,6 +435,116 @@ impl Sandboxes for Api {
                 .destroy_sandbox(&tenant_id(&r.tenant)?, &sandbox_id(&r.id)?)
                 .await?;
             Ok(pb::DestroySandboxResponse {})
+        })
+        .await
+    }
+}
+
+type OutputStream = Pin<Box<dyn Stream<Item = Result<pb::OutputChunk, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl Processes for Api {
+    async fn start_process(
+        &self,
+        req: Request<pb::StartProcessRequest>,
+    ) -> Result<Response<pb::Process>, Status> {
+        let r = req.into_inner();
+        self.timed("StartProcess", async {
+            let key = process_key(&r.tenant, &r.sandbox, &r.id)?;
+            let none_if_empty = |s: String| Some(s).filter(|s| !s.is_empty());
+            let spec = ProcessSpec {
+                args: r.args,
+                env: r.env,
+                cwd: none_if_empty(r.cwd),
+                user: none_if_empty(r.user),
+                tty: r.tty,
+                stdin: r.stdin,
+            };
+            Ok(pb_process(self.tenantd.start_process(key, spec).await?))
+        })
+        .await
+    }
+
+    async fn get_process(
+        &self,
+        req: Request<pb::ProcessRef>,
+    ) -> Result<Response<pb::Process>, Status> {
+        let r = req.into_inner();
+        self.timed("GetProcess", async {
+            let key = process_key(&r.tenant, &r.sandbox, &r.id)?;
+            Ok(pb_process(self.tenantd.get_process(&key).await?))
+        })
+        .await
+    }
+
+    async fn list_processes(
+        &self,
+        req: Request<pb::ListProcessesRequest>,
+    ) -> Result<Response<pb::ListProcessesResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("ListProcesses", async {
+            let sk = SandboxKey::new(tenant_id(&r.tenant)?, sandbox_id(&r.sandbox)?);
+            let recs = self.tenantd.list_processes(&sk).await?;
+            Ok(pb::ListProcessesResponse {
+                processes: recs.into_iter().map(pb_process).collect(),
+            })
+        })
+        .await
+    }
+
+    async fn signal_process(
+        &self,
+        req: Request<pb::SignalProcessRequest>,
+    ) -> Result<Response<pb::Process>, Status> {
+        let r = req.into_inner();
+        self.timed("SignalProcess", async {
+            let key = process_ref(r.process)?;
+            let rec = self.tenantd.signal_process(&key, signal(r.signal)?).await?;
+            Ok(pb_process(rec))
+        })
+        .await
+    }
+
+    async fn wait_process(
+        &self,
+        req: Request<pb::WaitProcessRequest>,
+    ) -> Result<Response<pb::Process>, Status> {
+        let r = req.into_inner();
+        self.timed("WaitProcess", async {
+            let key = process_ref(r.process)?;
+            let timeout = (r.timeout_ms > 0).then(|| Duration::from_millis(r.timeout_ms));
+            Ok(pb_process(self.tenantd.wait_process(&key, timeout).await?))
+        })
+        .await
+    }
+
+    type ReadOutputStream = OutputStream;
+
+    async fn read_output(
+        &self,
+        req: Request<pb::ReadOutputRequest>,
+    ) -> Result<Response<OutputStream>, Status> {
+        let r = req.into_inner();
+        let res = self
+            .timed("ReadOutput", async {
+                let key = process_ref(r.process)?;
+                let s = stream(r.stream)?;
+                self.tenantd.read_output(key, s, r.offset, r.follow).await
+            })
+            .await?;
+        let out = res.into_inner().map(|c| c.map(pb_chunk).map_err(status));
+        Ok(Response::new(Box::pin(out)))
+    }
+
+    async fn delete_process(
+        &self,
+        req: Request<pb::DeleteProcessRequest>,
+    ) -> Result<Response<pb::DeleteProcessResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("DeleteProcess", async {
+            let key = process_ref(r.process)?;
+            self.tenantd.delete_process(&key, r.force).await?;
+            Ok(pb::DeleteProcessResponse {})
         })
         .await
     }
