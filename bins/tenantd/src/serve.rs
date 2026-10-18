@@ -619,6 +619,11 @@ mod tests {
                 tenantd_core::model::Stream::Stdout,
                 b"0123456789abcdefXYZ",
             );
+            // Past the limit while the reader is already there: the mark
+            // must count this too.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            host.output
+                .write(&p.io, tenantd_core::model::Stream::Stdout, b"WV");
             tokio::time::sleep(Duration::from_millis(50)).await;
             host.runtime
                 .exit_process(&key.sandbox_key(), p.pid.unwrap(), 0);
@@ -631,7 +636,7 @@ mod tests {
         res.unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "0123456789abcdef\n[truncated: 3 bytes dropped]\n"
+            "0123456789abcdef\n[truncated: 5 bytes dropped]\n"
         );
     }
 

@@ -525,7 +525,9 @@ impl OutputReader {
                     self.offset += bytes.len() as u64;
                     return Ok(Some(OutputChunk::Data { offset, bytes }));
                 }
-            } else if size > limit && !self.truncated {
+            } else if size > limit && !self.truncated && (!self.follow || !rec.state.is_live()) {
+                // Following a live process, the size still grows: the mark
+                // waits for the end so it carries the final count.
                 self.truncated = true;
                 return Ok(Some(OutputChunk::Truncated {
                     offset: limit,
