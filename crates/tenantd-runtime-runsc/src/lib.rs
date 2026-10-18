@@ -2,19 +2,21 @@
 //! `runsc create/start/state/kill/wait/delete` itself, so flags are set per
 //! sandbox and no shim is needed. `--root` holds tenantd's containers only.
 //!
-//! Processes: `runsc exec --detach --process <json>` with stdout and stderr
-//! handed over as files (like create's), `kill --pid`, `wait --pid` and
-//! `ps --format=json`.
+//! Processes: a foreground `runsc exec --process <json>` child with stdout
+//! and stderr handed over as files (like create's), `kill --pid`,
+//! `wait --pid` and `ps --format=json`. Not `--detach`: its hidden child
+//! reaps the exit status, so a `wait --pid` issued after a fast process
+//! exits finds nothing. tenantd keeps the exec child instead.
 
 mod spec;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -27,18 +29,24 @@ use tenantd_core::config::{RuntimeConfig, RuntimeKind};
 use tenantd_core::error::Context;
 use tenantd_core::model::{NetworkMode, ProcessIo, ResolvedProcess, ResolvedSandbox, Signal};
 use tenantd_core::{Error, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 pub use spec::{build as build_spec, exec_process, resolve_user, resolve_user_in_layers};
 
-/// How long `runsc exec --detach` may take to start a process.
+/// How long `runsc exec` may take to start a process.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The raw exit code of a `runsc exec` child, once it exits.
+type ExecExit = oneshot::Receiver<Option<i32>>;
 
 pub struct RunscRuntime {
     cfg: RuntimeConfig,
     watched: Arc<Mutex<HashSet<String>>>,
     watched_processes: Arc<Mutex<HashSet<(String, u32)>>>,
+    /// Exit codes of the `runsc exec` children, until `watch_process`
+    /// takes them.
+    exec_children: Arc<Mutex<HashMap<(String, u32), ExecExit>>>,
     tx: mpsc::UnboundedSender<RuntimeEvent>,
     rx: Mutex<Option<mpsc::UnboundedReceiver<RuntimeEvent>>>,
 }
@@ -77,10 +85,28 @@ fn process_status(exit_status: i32) -> (Option<i32>, Option<i32>) {
     }
 }
 
+/// A foreground `runsc exec`'s own exit code: the process's code, or 128+N
+/// when signal N killed it (runsc emulates the shell), or 128 when runsc
+/// itself failed. Ambiguous for a process that exits 129 and up, so this is
+/// only the fallback for when `wait --pid` came too late.
+fn exec_exit_status(code: i32) -> (Option<i32>, Option<i32>) {
+    match code {
+        128 => (None, None),
+        129..=192 => (None, Some(code - 128)),
+        c => (Some(c), None),
+    }
+}
+
 fn log_tail(path: &Path) -> String {
     let all = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = all.lines().rev().take(5).collect();
     lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+/// A pid file once fully written; a partial write reads as not yet.
+async fn started_pid(path: &Path) -> Option<u32> {
+    let s = tokio::fs::read_to_string(path).await.ok()?;
+    s.trim().parse().ok()
 }
 
 fn flag_path(flag: &str, p: &Path) -> OsString {
@@ -116,6 +142,7 @@ impl RunscRuntime {
             cfg,
             watched: Arc::default(),
             watched_processes: Arc::default(),
+            exec_children: Arc::default(),
             tx,
             rx: Mutex::new(Some(rx)),
         }
@@ -471,12 +498,11 @@ impl RuntimeBackend for RunscRuntime {
             process_json.to_string_lossy(),
             io.pid_file.to_string_lossy(),
         );
-        let run = self
+        let mut child = self
             .command(
                 &flags,
                 &[
                     "exec",
-                    "--detach",
                     "--process",
                     &json_arg,
                     "--internal-pid-file",
@@ -486,23 +512,40 @@ impl RuntimeBackend for RunscRuntime {
             )
             .stdout(stdout)
             .stderr(stderr)
-            .status();
-        let status = tokio::time::timeout(EXEC_TIMEOUT, run)
-            .await
-            .map_err(|_| Error::Internal(format!("runsc exec {id} timed out")))?
+            .spawn()
             .context("running runsc exec")?;
-        if !status.success() {
-            return Err(Error::Internal(format!(
-                "runsc exec {id} failed ({status}): {}",
-                log_tail(&runsc_log)
-            )));
-        }
-        let pid = self.recorded_pid(io).await?.ok_or_else(|| {
-            Error::Internal(format!(
-                "runsc exec {id} left no pid in {}",
-                io.pid_file.display()
-            ))
-        })?;
+        // runsc writes the pid file once the process is started, then waits
+        // on it. A fast process can be gone by the time we look, so the pid
+        // file is checked again after the child exits.
+        let deadline = Instant::now() + EXEC_TIMEOUT;
+        let pid = loop {
+            if let Some(pid) = started_pid(&io.pid_file).await {
+                break pid;
+            }
+            if let Some(status) = child.try_wait().context("waiting for runsc exec")? {
+                match started_pid(&io.pid_file).await {
+                    Some(pid) => break pid,
+                    None => {
+                        return Err(Error::Internal(format!(
+                            "runsc exec {id} failed ({status}): {}",
+                            log_tail(&runsc_log)
+                        )));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Internal(format!("runsc exec {id} timed out")));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(child.wait().await.ok().and_then(|s| s.code()));
+        });
+        self.exec_children
+            .lock()
+            .unwrap()
+            .insert((id.to_string(), pid), rx);
         info!(sandbox = id, pid, process = %p.key.id, "process started");
         Ok(pid)
     }
@@ -536,6 +579,8 @@ impl RuntimeBackend for RunscRuntime {
         if !self.watched_processes.lock().unwrap().insert(key.clone()) {
             return Ok(());
         }
+        // Set when tenantd started the process itself (not after a restart).
+        let child = self.exec_children.lock().unwrap().remove(&key);
         let cmd = self
             .command(&[], &["wait", "--pid", &pid.to_string(), &h.0])
             .stdout(Stdio::piped())
@@ -543,18 +588,29 @@ impl RuntimeBackend for RunscRuntime {
             .output();
         let (watched, tx, handle) = (self.watched_processes.clone(), self.tx.clone(), h.clone());
         tokio::spawn(async move {
-            let (exit_code, signal) = match cmd.await {
+            let waited = match cmd.await {
                 Ok(out) if out.status.success() => serde_json::from_slice::<WaitOut>(&out.stdout)
-                    .map(|w| process_status(w.exit_status))
-                    .unwrap_or((None, None)),
+                    .ok()
+                    .map(|w| process_status(w.exit_status)),
                 Ok(out) => {
                     debug!(sandbox = handle.0, pid, stderr = %String::from_utf8_lossy(&out.stderr), "runsc wait --pid failed");
-                    (None, None)
+                    None
                 }
                 Err(e) => {
                     warn!(sandbox = handle.0, pid, error = %e, "runsc wait --pid could not run");
-                    (None, None)
+                    None
                 }
+            };
+            // runsc hands the exit status to one waiter only; when the exec
+            // child got it first, its exit code is all that is left.
+            let (exit_code, signal) = match (waited, child) {
+                (Some(s), _) => s,
+                (None, Some(rx)) => rx
+                    .await
+                    .ok()
+                    .flatten()
+                    .map_or((None, None), exec_exit_status),
+                (None, None) => (None, None),
             };
             watched.lock().unwrap().remove(&key);
             let _ = tx.send(RuntimeEvent::ProcessExited {
@@ -610,6 +666,9 @@ mod tests {
     fn process_output_shapes() {
         assert_eq!(process_status(3), (Some(3), None));
         assert_eq!(process_status(-9), (None, Some(9)));
+        assert_eq!(exec_exit_status(3), (Some(3), None));
+        assert_eq!(exec_exit_status(143), (None, Some(15)));
+        assert_eq!(exec_exit_status(128), (None, None));
         let ps: Option<Vec<PsItem>> = serde_json::from_str(
             r#"[{"UID":0,"PID":1,"PPID":0,"C":0,"STime":"12:00","Time":"0s","Cmd":"sleep"},
                 {"UID":0,"PID":7,"PPID":0,"C":0,"STime":"12:01","Time":"0s","Cmd":"make"}]"#,
