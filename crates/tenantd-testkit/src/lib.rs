@@ -465,10 +465,7 @@ impl RuntimeBackend for FakeRuntime {
             .unwrap()
             .iter()
             .filter(|(c, _)| c == h)
-            .map(|&(_, pid)| ProcInfo {
-                pid,
-                cmd: "fake".into(),
-            })
+            .map(|&(_, pid)| ProcInfo { pid })
             .collect())
     }
 }

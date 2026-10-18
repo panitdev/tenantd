@@ -153,7 +153,6 @@ pub enum RuntimeEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcInfo {
     pub pid: u32,
-    pub cmd: String,
 }
 
 /// Where the sandbox's network namespace is.

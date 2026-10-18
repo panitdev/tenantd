@@ -67,14 +67,6 @@ struct ListItem {
     id: String,
 }
 
-#[derive(Deserialize)]
-struct PsItem {
-    #[serde(rename = "PID")]
-    pid: u32,
-    #[serde(rename = "Cmd", default)]
-    cmd: String,
-}
-
 /// `wait --pid` status: negative is a signal number (runsc's encoding for
 /// a signalled process), otherwise the exit code.
 fn process_status(exit_status: i32) -> (Option<i32>, Option<i32>) {
@@ -101,6 +93,12 @@ fn log_tail(path: &Path) -> String {
     let all = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = all.lines().rev().take(5).collect();
     lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+/// `ps --format=json` prints the in-sandbox PIDs only, e.g. `[1,16]`.
+fn parse_ps(out: &str) -> Result<Vec<u32>> {
+    let pids: Option<Vec<u32>> = serde_json::from_str(out.trim()).context("parsing runsc ps")?;
+    Ok(pids.unwrap_or_default())
 }
 
 /// A pid file once fully written; a partial write reads as not yet.
@@ -628,15 +626,9 @@ impl RuntimeBackend for RunscRuntime {
             .run(&["ps", "--format=json", &h.0])
             .await
             .map_err(|e| Error::Internal(format!("runsc ps {}: {e}", h.0)))?;
-        let items: Option<Vec<PsItem>> =
-            serde_json::from_str(out.trim()).context("parsing runsc ps")?;
-        Ok(items
-            .unwrap_or_default()
+        Ok(parse_ps(&out)?
             .into_iter()
-            .map(|i| ProcInfo {
-                pid: i.pid,
-                cmd: i.cmd,
-            })
+            .map(|pid| ProcInfo { pid })
             .collect())
     }
 }
@@ -669,17 +661,7 @@ mod tests {
         assert_eq!(exec_exit_status(3), (Some(3), None));
         assert_eq!(exec_exit_status(143), (None, Some(15)));
         assert_eq!(exec_exit_status(128), (None, None));
-        let ps: Option<Vec<PsItem>> = serde_json::from_str(
-            r#"[{"UID":0,"PID":1,"PPID":0,"C":0,"STime":"12:00","Time":"0s","Cmd":"sleep"},
-                {"UID":0,"PID":7,"PPID":0,"C":0,"STime":"12:01","Time":"0s","Cmd":"make"}]"#,
-        )
-        .unwrap();
-        let ps = ps.unwrap();
-        assert_eq!((ps[1].pid, ps[1].cmd.as_str()), (7, "make"));
-        assert!(
-            serde_json::from_str::<Option<Vec<PsItem>>>("null")
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(parse_ps("[1,16]\n").unwrap(), vec![1, 16]);
+        assert!(parse_ps("null").unwrap().is_empty());
     }
 }
