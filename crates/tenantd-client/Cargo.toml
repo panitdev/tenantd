@@ -4,7 +4,13 @@ description = "Generated gRPC client (and server stubs) for tenantd over a Unix 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+rust-version = "1.88"
+readme = "README.md"
+keywords = ["tenantd", "grpc", "sandbox", "gvisor", "client"]
+categories = ["api-bindings", "network-programming"]
+# The codegen check reads ../../proto, which isn't in the package.
+exclude = ["/tests"]
 
 [dependencies]
 hyper-util.workspace = true
@@ -14,5 +20,6 @@ tonic.workspace = true
 tonic-prost.workspace = true
 tower.workspace = true
 
-[build-dependencies]
+[dev-dependencies]
+tempfile.workspace = true
 tonic-prost-build.workspace = true

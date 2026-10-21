@@ -4,7 +4,7 @@ description = "Holds a host's root-level sandbox powers and exposes a fixed set 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = false
 
 [dependencies]
 anyhow.workspace = true

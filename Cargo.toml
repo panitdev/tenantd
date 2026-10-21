@@ -6,7 +6,7 @@ members = ["crates/*", "bins/*"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-publish = false
+repository = "https://github.com/panitdev/tenantd"
 
 [workspace.dependencies]
 tenantd-core = { path = "crates/tenantd-core" }

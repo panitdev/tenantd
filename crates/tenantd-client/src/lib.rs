@@ -14,7 +14,8 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 
 pub mod pb {
-    tonic::include_proto!("tenantd.v1");
+    // Generated from proto/tenantd.proto; see tests/generated.rs.
+    include!("generated/tenantd.v1.rs");
 }
 
 pub use pb::processes_client::ProcessesClient;

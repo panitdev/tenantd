@@ -2258,6 +2258,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-util",
  "prost",
+ "tempfile",
  "tokio",
  "tonic",
  "tonic-prost",

@@ -17,3 +17,27 @@ jobs:
       release_name: ${{ github.ref_name }}
       publish_repos: true
     secrets: inherit
+
+  # tenantd-client only; every other crate is publish = false. Auth is
+  # crates.io Trusted Publishing (OIDC), so there is no registry token secret.
+  # Runs after the packages are out so a failed pipeline never leaves a
+  # crates.io version (which can't be deleted) without matching packages.
+  crates:
+    needs: pipeline
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml v$v"; exit 1; }
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked -p tenantd-client
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
