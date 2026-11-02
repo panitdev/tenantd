@@ -19,7 +19,8 @@ use tenantd_core::model::{
     ResolvedSandbox, Signal, Stream,
 };
 use tenantd_core::{
-    Backends, Bytes, Error, ProcessId, ProjectId, Result, SandboxId, SandboxKey, TenantId, Tenantd,
+    Backends, Bytes, ContainerId, ContainerKey, Error, ProcessId, ProjectId, Result, SandboxId,
+    SandboxKey, TenantId, Tenantd,
 };
 use tenantd_state::SqliteState;
 
@@ -152,6 +153,8 @@ pub struct FakeLayer {
     pub survives_stop: bool,
     /// (tenant dir, sandbox) -> mounted?
     pub dirs: Arc<Mutex<HashMap<(PathBuf, SandboxId), bool>>>,
+    /// Container roots, (tenant dir, sandbox, container).
+    pub container_dirs: Arc<Mutex<HashSet<(PathBuf, SandboxId, ContainerId)>>>,
     pub faults: Arc<Faults>,
 }
 
@@ -202,6 +205,51 @@ impl WritableLayer for FakeLayer {
             .lock()
             .unwrap()
             .remove(&(tenant_dir.to_path_buf(), s.clone()));
+        // Container roots live inside the sandbox's directory.
+        self.container_dirs
+            .lock()
+            .unwrap()
+            .retain(|(d, sb, _)| !(d == tenant_dir && sb == s));
+        Ok(())
+    }
+
+    async fn prepare_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<RootfsSpec> {
+        self.faults.check("layer.prepare_container")?;
+        let root = tenant_dir
+            .join("sandboxes")
+            .join(s.key.sandbox.as_str())
+            .join("containers")
+            .join(c.as_str())
+            .join("rootfs");
+        self.container_dirs.lock().unwrap().insert((
+            tenant_dir.to_path_buf(),
+            s.key.sandbox.clone(),
+            c.clone(),
+        ));
+        Ok(match self.kind {
+            LayerKind::Memory => RootfsSpec::Memory(root),
+            LayerKind::ReadOnly => RootfsSpec::ReadOnly(root),
+            _ => RootfsSpec::Path(root),
+        })
+    }
+
+    async fn teardown_container(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<()> {
+        self.faults.check("layer.teardown_container")?;
+        self.container_dirs.lock().unwrap().remove(&(
+            tenant_dir.to_path_buf(),
+            s.clone(),
+            c.clone(),
+        ));
         Ok(())
     }
 
@@ -221,6 +269,8 @@ pub struct FakeRuntime {
     pub containers: Mutex<HashMap<RuntimeHandle, RuntimeState>>,
     pub watched: Mutex<HashSet<RuntimeHandle>>,
     pub created_specs: Mutex<Vec<(ResolvedSandbox, RootfsSpec, NetAttachment)>>,
+    /// Containers created in sandboxes, with their init and roots.
+    pub created_containers: Mutex<Vec<(ContainerKey, Vec<String>, RootfsSpec)>>,
     pub verified: AtomicBool,
     pub faults: Arc<Faults>,
     /// Exec'd processes still alive, by container.
@@ -243,6 +293,7 @@ impl FakeRuntime {
             containers: Mutex::default(),
             watched: Mutex::default(),
             created_specs: Mutex::default(),
+            created_containers: Mutex::default(),
             verified: AtomicBool::new(true),
             faults,
             processes: Mutex::default(),
@@ -311,6 +362,58 @@ impl FakeRuntime {
         });
     }
 
+    /// A container's init exits on its own.
+    pub fn exit_container(&self, k: &ContainerKey, code: i32) {
+        let h = RuntimeHandle::for_container(k);
+        self.containers
+            .lock()
+            .unwrap()
+            .insert(h.clone(), RuntimeState::Stopped);
+        self.kill_processes(&h);
+        let _ = self.tx.unbounded_send(RuntimeEvent::Exited {
+            handle: h,
+            exit_code: Some(code),
+            oom: false,
+        });
+    }
+
+    pub fn container_state(&self, k: &ContainerKey) -> RuntimeState {
+        self.containers
+            .lock()
+            .unwrap()
+            .get(&RuntimeHandle::for_container(k))
+            .copied()
+            .unwrap_or(RuntimeState::Missing)
+    }
+
+    pub fn container_alive(&self, k: &ContainerKey, pid: u32) -> bool {
+        self.processes
+            .lock()
+            .unwrap()
+            .contains(&(RuntimeHandle::for_container(k), pid))
+    }
+
+    /// A sandbox going down takes the containers in it along, as gVisor
+    /// does: they stop, unreported.
+    fn stop_containers_in(&self, h: &RuntimeHandle) {
+        let prefix = format!("{}.", h.0);
+        let inside: Vec<RuntimeHandle> = self
+            .containers
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|c| c.0.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for c in inside {
+            self.containers
+                .lock()
+                .unwrap()
+                .insert(c.clone(), RuntimeState::Stopped);
+            self.kill_processes(&c);
+        }
+    }
+
     pub fn state(&self, k: &SandboxKey) -> RuntimeState {
         self.containers
             .lock()
@@ -355,6 +458,35 @@ impl RuntimeBackend for FakeRuntime {
         Ok(h)
     }
 
+    async fn create_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerKey,
+        args: &[String],
+        root: &RootfsSpec,
+        _net: &NetAttachment,
+    ) -> Result<RuntimeHandle> {
+        self.faults.check("runtime.create_container")?;
+        let sandbox = RuntimeHandle::for_key(&s.key);
+        let h = RuntimeHandle::for_container(c);
+        let mut m = self.containers.lock().unwrap();
+        if m.get(&sandbox) != Some(&RuntimeState::Running) {
+            return Err(Error::FailedPrecondition(format!(
+                "sandbox {} is not running",
+                sandbox.0
+            )));
+        }
+        if m.contains_key(&h) {
+            return Err(Error::AlreadyExists(h.0));
+        }
+        m.insert(h.clone(), RuntimeState::Created);
+        self.created_containers
+            .lock()
+            .unwrap()
+            .push((c.clone(), args.to_vec(), root.clone()));
+        Ok(h)
+    }
+
     async fn start(&self, h: &RuntimeHandle) -> Result<()> {
         self.faults.check("runtime.start")?;
         match self.containers.lock().unwrap().get_mut(h) {
@@ -375,6 +507,7 @@ impl RuntimeBackend for FakeRuntime {
             *s = RuntimeState::Stopped;
         }
         self.kill_processes(h);
+        self.stop_containers_in(h);
         Ok(())
     }
 
@@ -383,6 +516,7 @@ impl RuntimeBackend for FakeRuntime {
         self.containers.lock().unwrap().remove(h);
         self.watched.lock().unwrap().remove(h);
         self.kill_processes(h);
+        self.stop_containers_in(h);
         Ok(())
     }
 
@@ -701,6 +835,7 @@ network = "none"
 pub struct Host {
     pub storage: Arc<FakeStorage>,
     pub layer_dirs: Arc<Mutex<HashMap<(PathBuf, SandboxId), bool>>>,
+    pub container_dirs: Arc<Mutex<HashSet<(PathBuf, SandboxId, ContainerId)>>>,
     pub runtime: Arc<FakeRuntime>,
     pub images: Arc<FakeImages>,
     pub network: Arc<FakeNetwork>,
@@ -721,6 +856,7 @@ impl Host {
                 faults: faults.clone(),
             }),
             layer_dirs: Arc::default(),
+            container_dirs: Arc::default(),
             runtime: Arc::new(FakeRuntime::new(faults.clone())),
             images: Arc::new(FakeImages {
                 faults: faults.clone(),
@@ -745,6 +881,7 @@ impl Host {
                 kind,
                 survives_stop,
                 dirs: self.layer_dirs.clone(),
+                container_dirs: self.container_dirs.clone(),
                 faults: self.faults.clone(),
             })
         };

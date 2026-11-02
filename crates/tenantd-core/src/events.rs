@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::{Bytes, ProcessKey, SandboxKey, TenantId};
+use crate::{Bytes, ContainerKey, ProcessKey, SandboxKey, TenantId};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -11,6 +11,10 @@ pub enum EventKind {
     },
     SandboxOom {
         key: SandboxKey,
+    },
+    ContainerExited {
+        key: ContainerKey,
+        exit_code: Option<i32>,
     },
     ProcessExited {
         key: ProcessKey,

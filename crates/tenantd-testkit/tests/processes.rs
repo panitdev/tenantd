@@ -102,7 +102,7 @@ async fn process_lifecycle() {
     sp.env = vec!["CI=1".into()];
     let rec = env
         .tenantd
-        .start_process(k.clone(), sp.clone())
+        .start_process(k.clone(), sp.clone(), None)
         .await
         .unwrap();
     assert_eq!(rec.state, ProcessState::Running);
@@ -138,13 +138,15 @@ async fn process_lifecycle() {
     // Idempotent on the key.
     let again = env
         .tenantd
-        .start_process(k.clone(), sp.clone())
+        .start_process(k.clone(), sp.clone(), None)
         .await
         .unwrap();
     assert_eq!((again.pid, again.created_at), (rec.pid, rec.created_at));
     assert_eq!(env.host.runtime.execs.lock().unwrap().len(), 1);
     assert!(matches!(
-        env.tenantd.start_process(k.clone(), spec(&["other"])).await,
+        env.tenantd
+            .start_process(k.clone(), spec(&["other"]), None)
+            .await,
         Err(Error::AlreadyExists(_))
     ));
     assert_eq!(
@@ -198,7 +200,7 @@ async fn process_lifecycle() {
     assert!(env.host.output.files.lock().unwrap().is_empty());
     for s in [sp, spec(&["other"])] {
         assert!(matches!(
-            env.tenantd.start_process(k.clone(), s).await,
+            env.tenantd.start_process(k.clone(), s, None).await,
             Err(Error::AlreadyExists(_))
         ));
     }
@@ -210,7 +212,7 @@ async fn exec_policy_denials_name_their_rule() {
     sandbox(&env, "scratch", "scratch").await;
     let e = env
         .tenantd
-        .start_process(pk("scratch", "p"), spec(&["true"]))
+        .start_process(pk("scratch", "p"), spec(&["true"]), None)
         .await
         .unwrap_err();
     assert_eq!(denied_rule(e), "profiles.scratch.exec");
@@ -221,13 +223,13 @@ async fn exec_policy_denials_name_their_rule() {
     };
     let e = env
         .tenantd
-        .start_process(pk("box", "root"), as_user("0"))
+        .start_process(pk("box", "root"), as_user("0"), None)
         .await
         .unwrap_err();
     assert_eq!(denied_rule(e), "profiles.default.exec.users");
     let ok = env
         .tenantd
-        .start_process(pk("box", "u"), as_user("1000"))
+        .start_process(pk("box", "u"), as_user("1000"), None)
         .await
         .unwrap();
     assert_eq!(
@@ -241,7 +243,7 @@ async fn exec_policy_denials_name_their_rule() {
     };
     let e = env
         .tenantd
-        .start_process(pk("box", "tty"), tty)
+        .start_process(pk("box", "tty"), tty, None)
         .await
         .unwrap_err();
     assert_eq!(denied_rule(e), "profiles.default.exec.tty");
@@ -260,7 +262,7 @@ async fn exec_policy_denials_name_their_rule() {
         spec(&vec!["x"; 257]),
     ] {
         assert!(matches!(
-            env.tenantd.start_process(pk("box", "bad"), bad).await,
+            env.tenantd.start_process(pk("box", "bad"), bad, None).await,
             Err(Error::InvalidArgument(_))
         ));
     }
@@ -268,12 +270,12 @@ async fn exec_policy_denials_name_their_rule() {
     // max_processes = 2 counts live processes only.
     let p2 = env
         .tenantd
-        .start_process(pk("box", "p2"), spec(&["sleep"]))
+        .start_process(pk("box", "p2"), spec(&["sleep"]), None)
         .await
         .unwrap();
     let e = env
         .tenantd
-        .start_process(pk("box", "p3"), spec(&["sleep"]))
+        .start_process(pk("box", "p3"), spec(&["sleep"]), None)
         .await
         .unwrap_err();
     assert_eq!(denied_rule(e), "profiles.default.exec.max_processes");
@@ -290,7 +292,7 @@ async fn exec_policy_denials_name_their_rule() {
         })
         .await;
     env.tenantd
-        .start_process(pk("box", "p3"), spec(&["sleep"]))
+        .start_process(pk("box", "p3"), spec(&["sleep"]), None)
         .await
         .unwrap();
     assert!(env.host.runtime.alive(&sk("box"), p2.pid.unwrap()));
@@ -302,7 +304,7 @@ async fn exec_policy_denials_name_their_rule() {
         .unwrap();
     assert!(matches!(
         env.tenantd
-            .start_process(pk("box", "p4"), spec(&["true"]))
+            .start_process(pk("box", "p4"), spec(&["true"]), None)
             .await,
         Err(Error::FailedPrecondition(_))
     ));
@@ -313,7 +315,7 @@ async fn reload_that_removes_exec_applies_to_new_starts_only() {
     let env = env().await;
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["sleep"]))
+        .start_process(pk("box", "p"), spec(&["sleep"]), None)
         .await
         .unwrap();
     let cfg = TEST_CONFIG.replacen("enabled = true", "enabled = false", 1);
@@ -322,7 +324,7 @@ async fn reload_that_removes_exec_applies_to_new_starts_only() {
         .unwrap();
     let e = env
         .tenantd
-        .start_process(pk("box", "q"), spec(&["sleep"]))
+        .start_process(pk("box", "q"), spec(&["sleep"]), None)
         .await
         .unwrap_err();
     assert_eq!(denied_rule(e), "profiles.default.exec");
@@ -339,7 +341,7 @@ async fn output_keeps_the_head_and_reports_what_was_dropped() {
     env.tenantd.spawn_event_pump();
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["yes"]))
+        .start_process(pk("box", "p"), spec(&["yes"]), None)
         .await
         .unwrap();
     let k = p.key();
@@ -399,7 +401,7 @@ async fn follow_streams_until_exit() {
     env.tenantd.spawn_event_pump();
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["build"]))
+        .start_process(pk("box", "p"), spec(&["build"]), None)
         .await
         .unwrap();
     let mut s = env
@@ -448,7 +450,7 @@ async fn wait_times_out_on_a_running_process() {
     let env = env().await;
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["sleep"]))
+        .start_process(pk("box", "p"), spec(&["sleep"]), None)
         .await
         .unwrap();
     let r = env
@@ -470,7 +472,7 @@ async fn signals_reach_the_process() {
     env.tenantd.spawn_event_pump();
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["sleep"]))
+        .start_process(pk("box", "p"), spec(&["sleep"]), None)
         .await
         .unwrap();
     env.tenantd
@@ -505,7 +507,7 @@ async fn force_delete_kills_a_live_process() {
     let env = env().await;
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["sleep"]))
+        .start_process(pk("box", "p"), spec(&["sleep"]), None)
         .await
         .unwrap();
     env.tenantd.delete_process(&p.key(), true).await.unwrap();
@@ -528,7 +530,7 @@ async fn sandbox_stop_and_destroy_end_its_processes() {
     let mut events = env.tenantd.subscribe();
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["sleep"]))
+        .start_process(pk("box", "p"), spec(&["sleep"]), None)
         .await
         .unwrap();
     env.host.output.write(&p.io, Stream::Stdout, &[b'x'; 20]);
@@ -556,7 +558,7 @@ async fn sandbox_stop_and_destroy_end_its_processes() {
     // same name starts with a clean process namespace.
     let q = env
         .tenantd
-        .start_process(pk("box", "q"), spec(&["sleep"]))
+        .start_process(pk("box", "q"), spec(&["sleep"]), None)
         .await
         .unwrap();
     env.host.output.write(&q.io, Stream::Stdout, b"x");
@@ -565,7 +567,7 @@ async fn sandbox_stop_and_destroy_end_its_processes() {
     assert!(env.host.output.files.lock().unwrap().is_empty());
     sandbox(&env, "box", "default").await;
     env.tenantd
-        .start_process(p.key(), spec(&["sleep"]))
+        .start_process(p.key(), spec(&["sleep"]), None)
         .await
         .unwrap();
 }
@@ -576,7 +578,7 @@ async fn failed_start_rolls_back_and_frees_the_id() {
     env.host.faults.fail("runtime.exec");
     assert!(
         env.tenantd
-            .start_process(pk("box", "p"), spec(&["true"]))
+            .start_process(pk("box", "p"), spec(&["true"]), None)
             .await
             .is_err()
     );
@@ -587,7 +589,7 @@ async fn failed_start_rolls_back_and_frees_the_id() {
     env.host.faults.fail("runtime.exec.after_start");
     assert!(
         env.tenantd
-            .start_process(pk("box", "p"), spec(&["true"]))
+            .start_process(pk("box", "p"), spec(&["true"]), None)
             .await
             .is_err()
     );
@@ -595,7 +597,7 @@ async fn failed_start_rolls_back_and_frees_the_id() {
     assert!(env.tenantd.list_all_processes().await.unwrap().is_empty());
 
     env.tenantd
-        .start_process(pk("box", "p"), spec(&["true"]))
+        .start_process(pk("box", "p"), spec(&["true"]), None)
         .await
         .unwrap();
 }
@@ -608,7 +610,7 @@ async fn crash_before_exec_ran_marks_the_process_lost() {
     env.host.faults.fail("output.remove");
     assert!(
         env.tenantd
-            .start_process(pk("box", "p"), spec(&["true"]))
+            .start_process(pk("box", "p"), spec(&["true"]), None)
             .await
             .is_err()
     );
@@ -637,7 +639,7 @@ async fn crash_after_exec_ran_is_adopted() {
     env.host.faults.fail("runtime.signal");
     assert!(
         env.tenantd
-            .start_process(pk("box", "p"), spec(&["true"]))
+            .start_process(pk("box", "p"), spec(&["true"]), None)
             .await
             .is_err()
     );
@@ -677,12 +679,12 @@ async fn reconcile_rearms_running_processes_and_ends_vanished_ones() {
     let mut env = env().await;
     let live = env
         .tenantd
-        .start_process(pk("box", "live"), spec(&["sleep"]))
+        .start_process(pk("box", "live"), spec(&["sleep"]), None)
         .await
         .unwrap();
     let gone = env
         .tenantd
-        .start_process(pk("box", "gone"), spec(&["sleep"]))
+        .start_process(pk("box", "gone"), spec(&["sleep"]), None)
         .await
         .unwrap();
     // Written while tenantd was down: nothing enforced the limit.
@@ -740,14 +742,14 @@ async fn retention_collects_rows_into_tombstones_that_expire() {
     let env = env().await;
     let p = env
         .tenantd
-        .start_process(pk("box", "p"), spec(&["true"]))
+        .start_process(pk("box", "p"), spec(&["true"]), None)
         .await
         .unwrap();
     env.host.output.write(&p.io, Stream::Stdout, b"out");
     env.tenantd.delete_process(&p.key(), true).await.unwrap();
     let q = env
         .tenantd
-        .start_process(pk("box", "q"), spec(&["true"]))
+        .start_process(pk("box", "q"), spec(&["true"]), None)
         .await
         .unwrap();
     env.tenantd
@@ -767,7 +769,9 @@ async fn retention_collects_rows_into_tombstones_that_expire() {
     assert!(rep.actions.iter().any(|a| a.0 == "gc_process"), "{rep:?}");
     assert!(env.tenantd.get_process(&q.key()).await.is_err());
     assert!(matches!(
-        env.tenantd.start_process(q.key(), spec(&["true"])).await,
+        env.tenantd
+            .start_process(q.key(), spec(&["true"]), None)
+            .await,
         Err(Error::AlreadyExists(_))
     ));
 
@@ -788,7 +792,7 @@ async fn retention_collects_rows_into_tombstones_that_expire() {
         "{rep:?}"
     );
     env.tenantd
-        .start_process(q.key(), spec(&["true"]))
+        .start_process(q.key(), spec(&["true"]), None)
         .await
         .unwrap();
 }

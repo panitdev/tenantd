@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod container;
 pub mod error;
 pub mod events;
 pub mod fsutil;
@@ -20,7 +21,9 @@ pub mod size;
 pub mod state;
 
 pub use error::{Error, Result};
-pub use id::{ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey, TenantId};
+pub use id::{
+    ContainerId, ContainerKey, ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey, TenantId,
+};
 pub use service::{Backends, Tenantd};
 
 /// Byte counts. Plain `u64` keeps arithmetic and serialisation simple.

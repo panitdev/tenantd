@@ -2,10 +2,11 @@
 //! state store before touching the host, and every host step is idempotent,
 //! so a crash at any point leaves something reconcile can finish or undo.
 //!
-//! Locking: one async mutex per tenant, sandbox and process, always taken in
-//! that order. Tenant locks cover admission and tenant lifecycle; sandbox
-//! locks cover host work on one sandbox; process locks cover one process's
-//! exec and row.
+//! Locking: one async mutex per tenant, sandbox, container and process,
+//! always taken in that order. Tenant locks cover admission and tenant
+//! lifecycle; sandbox locks cover host work on one sandbox; container locks
+//! cover host work on one container; process locks cover one process's exec
+//! and row.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -27,7 +28,9 @@ use crate::model::{
 };
 use crate::policy;
 use crate::state::StateStore;
-use crate::{Error, ProcessKey, ProjectId, Result, SandboxId, SandboxKey, TenantId, now};
+use crate::{
+    ContainerKey, Error, ProcessKey, ProjectId, Result, SandboxId, SandboxKey, TenantId, now,
+};
 
 pub struct Backends {
     pub storage: Arc<dyn StorageBackend>,
@@ -64,6 +67,7 @@ pub struct Tenantd {
     pub(crate) state: Arc<dyn StateStore>,
     pub(crate) tenant_locks: KeyedLocks<TenantId>,
     pub(crate) sandbox_locks: KeyedLocks<SandboxKey>,
+    pub(crate) container_locks: KeyedLocks<ContainerKey>,
     pub(crate) process_locks: KeyedLocks<ProcessKey>,
     /// Bumped whenever a process row changes state, so waiters and output
     /// followers wake up.
@@ -95,6 +99,7 @@ impl Tenantd {
             state: b.state,
             tenant_locks: KeyedLocks::default(),
             sandbox_locks: KeyedLocks::default(),
+            container_locks: KeyedLocks::default(),
             process_locks: KeyedLocks::default(),
             process_epoch: watch::Sender::new(0),
             image_gate: tokio::sync::RwLock::new(()),
@@ -133,7 +138,7 @@ impl Tenantd {
         })
     }
 
-    fn stop_grace(&self) -> Duration {
+    pub(crate) fn stop_grace(&self) -> Duration {
         Duration::from_secs(self.config().runtime.stop_grace_secs)
     }
 
@@ -574,9 +579,10 @@ impl Tenantd {
         self.runtime.watch(&h).await
     }
 
-    /// End the sandbox's processes, stop and remove the container and the
-    /// network; remove the layer too when `remove_layer` or when the layer
-    /// doesn't survive a stop. Tries every step and returns the first error.
+    /// End the sandbox's containers and processes, stop and remove the
+    /// sandbox and the network; remove the layer (and the containers' roots)
+    /// too when `remove_layer` or when the layer doesn't survive a stop.
+    /// Tries every step and returns the first error.
     pub(crate) async fn tear_down(&self, rec: &SandboxRecord, remove_layer: bool) -> Result<()> {
         let key = rec.key();
         let h = RuntimeHandle::for_key(&key);
@@ -587,6 +593,9 @@ impl Tenantd {
                 first.get_or_insert(e);
             }
         };
+        let layer = self.layers.get(&rec.spec.rootfs);
+        let remove_layer = remove_layer || !layer.is_some_and(|l| l.traits().survives_stop);
+        keep(self.end_containers(rec, remove_layer).await);
         keep(self.end_processes(&key).await);
         let runtime = async {
             match self.runtime.inspect(&h).await? {
@@ -600,8 +609,7 @@ impl Tenantd {
         };
         keep(runtime.await);
         keep(self.network.teardown(&key).await);
-        let layer = self.layers.get(&rec.spec.rootfs);
-        if remove_layer || !layer.is_some_and(|l| l.traits().survives_stop) {
+        if remove_layer {
             let layer = layer.or_else(|| self.layers.values().next());
             if let Some(l) = layer {
                 keep(
@@ -644,12 +652,14 @@ impl Tenantd {
                 exit_code,
                 signal,
             } => {
-                if let Some(key) = handle.key() {
-                    self.on_process_exit(&key, pid, exit_code, signal).await;
-                }
+                self.on_process_exit(&handle, pid, exit_code, signal).await;
                 return;
             }
         };
+        if let Some(key) = handle.container() {
+            self.on_container_exit(&key, exit_code).await;
+            return;
+        }
         let Some(key) = handle.key() else { return };
         if oom {
             self.emit(EventKind::SandboxOom { key: key.clone() });

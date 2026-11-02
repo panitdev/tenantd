@@ -12,8 +12,8 @@ use anyhow::{Context, bail};
 use clap::Args;
 use futures::Stream;
 use tenantd_client::pb::{
-    processes_server::ProcessesServer, sandboxes_server::SandboxesServer,
-    system_server::SystemServer, tenants_server::TenantsServer,
+    containers_server::ContainersServer, processes_server::ProcessesServer,
+    sandboxes_server::SandboxesServer, system_server::SystemServer, tenants_server::TenantsServer,
 };
 use tenantd_core::config::{Config, RuntimeKind, StorageKind};
 use tenantd_core::state::StateStore;
@@ -149,6 +149,7 @@ async fn serve_api(
     tonic::transport::Server::builder()
         .add_service(TenantsServer::new(api.clone()))
         .add_service(SandboxesServer::new(api.clone()))
+        .add_service(ContainersServer::new(api.clone()))
         .add_service(ProcessesServer::new(api.clone()))
         .add_service(SystemServer::new(api))
         .serve_with_incoming_shutdown(authorized(l, Arc::new(allowed)), shutdown)
@@ -405,6 +406,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn containers_over_unix_socket() {
+        let (_d, sock, host, _tenantd) = start(HashSet::from([me()])).await;
+        let ch = tenantd_client::connect(&sock).await.unwrap();
+        tenantd_client::TenantsClient::new(ch.clone())
+            .create_tenant(pb::CreateTenantRequest {
+                id: "acme".into(),
+                limits: Some(pb::TenantLimits {
+                    storage_bytes: 1 << 30,
+                    cpus: None,
+                    memory_bytes: None,
+                }),
+            })
+            .await
+            .unwrap();
+        tenantd_client::SandboxesClient::new(ch.clone())
+            .create_sandbox(pb::CreateSandboxRequest {
+                tenant: "acme".into(),
+                id: "box".into(),
+                profile: "default".into(),
+                image: "alpine".into(),
+                overrides: None,
+            })
+            .await
+            .unwrap();
+        let mut containers = tenantd_client::ContainersClient::new(ch.clone());
+        let r = pb::ContainerRef {
+            tenant: "acme".into(),
+            sandbox: "box".into(),
+            id: "s1".into(),
+        };
+        let c = containers
+            .create_container(pb::CreateContainerRequest {
+                tenant: "acme".into(),
+                sandbox: "box".into(),
+                id: "s1".into(),
+                args: vec![],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(c.state, "running");
+        assert_eq!(
+            containers
+                .list_containers(pb::ListContainersRequest {
+                    tenant: "acme".into(),
+                    sandbox: "box".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .containers,
+            vec![c]
+        );
+        let bad = containers
+            .create_container(pb::CreateContainerRequest {
+                tenant: "acme".into(),
+                sandbox: "box".into(),
+                id: "Bad".into(),
+                args: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+
+        let mut procs = tenantd_client::ProcessesClient::new(ch);
+        let p = procs
+            .start_process(pb::StartProcessRequest {
+                tenant: "acme".into(),
+                sandbox: "box".into(),
+                id: "p1".into(),
+                args: vec!["make".into()],
+                container: "s1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(p.container, "s1");
+        assert!(
+            host.runtime
+                .container_alive(&"acme.box.s1".parse().unwrap(), p.pid)
+        );
+
+        containers.delete_container(r.clone()).await.unwrap();
+        assert_eq!(
+            containers.get_container(r).await.unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
     async fn processes_over_unix_socket() {
         let (_d, sock, host, tenantd) = start(HashSet::from([me()])).await;
         tenantd.spawn_event_pump();
@@ -594,6 +686,7 @@ mod tests {
                     args: vec!["yes".into()],
                     ..Default::default()
                 },
+                None,
             )
             .await
             .unwrap();

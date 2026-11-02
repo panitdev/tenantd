@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Boot a distro cloud image in KVM and run the real install path against it:
 #   install package -> XFS data disk -> enable + start -> tenant + sandbox ->
-#   restart tenantd (sandbox must survive) -> reboot (reconcile) ->
-#   upgrade from the previous release (if one was downloaded).
+#   restart tenantd (sandbox must survive) -> processes -> containers ->
+#   reboot (reconcile) -> upgrade from the previous release (if one was
+#   downloaded).
 #
 # Usage: vm-test.sh <ubuntu-24.04|debian-12|rocky-9> <dist-dir> <prev-dir>
 set -euo pipefail
@@ -185,12 +186,29 @@ pcheck 'tenantd process get t1 s1 sleeper | grep -q running
 pcheck 'tenantd process rm t1 s1 hello
         ! tenantd exec --id hello t1 s1 -- echo again'
 
+# --- Containers: sessions on their own roots in one gVisor sandbox -------
+pcheck 'tenantd container create t1 s1 c1 -- sleep infinity
+        tenantd container create t1 s1 c2 -- sleep infinity
+        test "$(tenantd container list t1 s1 | grep -c " running")" = 2
+        test "$(tenantd exec --container c1 t1 s1 -- sh -c "echo a >/mine; cat /mine")" = a
+        ! tenantd exec --container c2 t1 s1 -- cat /mine
+        ! tenantd exec t1 s1 -- cat /mine
+        test "$(cat /data/tenants/t1/sandboxes/s1/containers/c1/upper/mine)" = a
+        test "$(pgrep -c -x runsc-sandbox)" = 1'
+pcheck 'tenantd container rm t1 s1 c2
+        ! test -e /data/tenants/t1/sandboxes/s1/containers/c2
+        tenantd container get t1 s1 c1 | grep -q " running"'
+
 # --- Reboot: /run is gone, reconcile must mark exited, start must remount --
 vm 'systemctl reboot' || true
 sleep 5; wait_ssh
 vm systemctl is-active tenantd
 wait_api
 expect_state exited
+# Its container ended with it and kept its root until removed.
+pcheck 'tenantd container get t1 s1 c1 | grep -q " exited"
+        test -e /data/tenants/t1/sandboxes/s1/containers/c1/upper/mine
+        tenantd container rm t1 s1 c1'
 vm tenantd sandbox start t1 s1
 expect_state running
 

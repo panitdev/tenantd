@@ -18,6 +18,7 @@ pub mod pb {
     include!("generated/tenantd.v1.rs");
 }
 
+pub use pb::containers_client::ContainersClient;
 pub use pb::processes_client::ProcessesClient;
 pub use pb::sandboxes_client::SandboxesClient;
 pub use pb::system_client::SystemClient;

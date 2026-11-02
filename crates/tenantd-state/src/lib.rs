@@ -9,13 +9,14 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use tenantd_core::model::{
-    Overrides, ProcessIo, ProcessLimits, ProcessRecord, ProcessSpec, ProcessState,
-    ProcessTombstone, ResolvedSandbox, SandboxRecord, SandboxState, TenantLimits, TenantRecord,
-    TenantState,
+    ContainerRecord, ContainerState, Overrides, ProcessIo, ProcessLimits, ProcessRecord,
+    ProcessSpec, ProcessState, ProcessTombstone, ResolvedSandbox, SandboxRecord, SandboxState,
+    TenantLimits, TenantRecord, TenantState,
 };
 use tenantd_core::state::StateStore;
 use tenantd_core::{
-    Error, ProcessId, ProcessKey, ProjectId, Result, SandboxId, SandboxKey, TenantId, now,
+    ContainerId, ContainerKey, Error, ProcessId, ProcessKey, ProjectId, Result, SandboxId,
+    SandboxKey, TenantId, now,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -71,6 +72,20 @@ const MIGRATIONS: &[&str] = &[
         expires_at  INTEGER NOT NULL,
         PRIMARY KEY (tenant_id, sandbox_id, id)
     );",
+    // 3
+    "CREATE TABLE containers (
+        tenant_id  TEXT NOT NULL,
+        sandbox_id TEXT NOT NULL,
+        id         TEXT NOT NULL,
+        args       TEXT NOT NULL,
+        state      TEXT NOT NULL,
+        exit_code  INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, sandbox_id, id),
+        FOREIGN KEY (tenant_id, sandbox_id) REFERENCES sandboxes(tenant_id, id)
+    );
+    ALTER TABLE processes ADD COLUMN container_id TEXT;",
 ];
 
 #[derive(Clone)]
@@ -196,7 +211,7 @@ fn decode<T: serde::de::DeserializeOwned>(s: &str) -> rusqlite::Result<T> {
 }
 
 const PROCESS_COLS: &str = "tenant_id, sandbox_id, id, spec, limits, io, state, pid, exit_code, \
-     signal, stdout_dropped, stderr_dropped, created_at, updated_at, exited_at";
+     signal, stdout_dropped, stderr_dropped, created_at, updated_at, exited_at, container_id";
 
 fn process_row(r: &Row) -> rusqlite::Result<ProcessRecord> {
     let state: ProcessState =
@@ -217,7 +232,38 @@ fn process_row(r: &Row) -> rusqlite::Result<ProcessRecord> {
         created_at: r.get(12)?,
         updated_at: r.get(13)?,
         exited_at: r.get(14)?,
+        container: r
+            .get::<_, Option<String>>(15)?
+            .map(ContainerId::new)
+            .transpose()
+            .map_err(conv)?,
     })
+}
+
+const CONTAINER_COLS: &str =
+    "tenant_id, sandbox_id, id, args, state, exit_code, created_at, updated_at";
+
+fn container_row(r: &Row) -> rusqlite::Result<ContainerRecord> {
+    let state: ContainerState =
+        serde_json::from_value(serde_json::Value::String(r.get(4)?)).map_err(conv)?;
+    Ok(ContainerRecord {
+        tenant: TenantId::new(r.get::<_, String>(0)?).map_err(conv)?,
+        sandbox: SandboxId::new(r.get::<_, String>(1)?).map_err(conv)?,
+        id: ContainerId::new(r.get::<_, String>(2)?).map_err(conv)?,
+        args: decode(&r.get::<_, String>(3)?)?,
+        state,
+        exit_code: r.get(5)?,
+        created_at: r.get(6)?,
+        updated_at: r.get(7)?,
+    })
+}
+
+fn container_key_params(k: &ContainerKey) -> [String; 3] {
+    [
+        k.tenant.to_string(),
+        k.sandbox.to_string(),
+        k.id.to_string(),
+    ]
 }
 
 fn process_key_params(k: &ProcessKey) -> [String; 3] {
@@ -460,7 +506,7 @@ impl StateStore for SqliteState {
         let (t, s) = (t.clone(), s.clone());
         self.run(move |c| {
             let tx = c.transaction().map_err(db)?;
-            for table in ["processes", "process_tombstones"] {
+            for table in ["processes", "process_tombstones", "containers"] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE tenant_id = ?1 AND sandbox_id = ?2"),
                     [t.as_str(), s.as_str()],
@@ -477,6 +523,125 @@ impl StateStore for SqliteState {
         .await
     }
 
+    async fn insert_container(&self, rec: &ContainerRecord) -> Result<()> {
+        let rec = rec.clone();
+        let args = json(&rec.args)?;
+        self.run(move |c| {
+            c.execute(
+                &format!(
+                    "INSERT INTO containers ({CONTAINER_COLS})
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                ),
+                params![
+                    rec.tenant.as_str(),
+                    rec.sandbox.as_str(),
+                    rec.id.as_str(),
+                    args,
+                    rec.state.as_str(),
+                    rec.exit_code,
+                    rec.created_at,
+                    rec.updated_at
+                ],
+            )
+            .map_err(|e| {
+                if is_constraint(&e) {
+                    Error::AlreadyExists(format!("container {}", rec.key()))
+                } else {
+                    db(e)
+                }
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_container(&self, k: &ContainerKey) -> Result<Option<ContainerRecord>> {
+        let k = container_key_params(k);
+        self.run(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {CONTAINER_COLS} FROM containers
+                     WHERE tenant_id = ?1 AND sandbox_id = ?2 AND id = ?3"
+                ),
+                k,
+                container_row,
+            )
+            .optional()
+            .map_err(db)
+        })
+        .await
+    }
+
+    async fn list_containers(&self, s: Option<&SandboxKey>) -> Result<Vec<ContainerRecord>> {
+        let s = s.cloned();
+        self.run(move |c| {
+            let rows = match &s {
+                Some(s) => {
+                    let mut st = c
+                        .prepare(&format!(
+                            "SELECT {CONTAINER_COLS} FROM containers
+                             WHERE tenant_id = ?1 AND sandbox_id = ?2 ORDER BY id"
+                        ))
+                        .map_err(db)?;
+                    st.query_map([s.tenant.as_str(), s.sandbox.as_str()], container_row)
+                        .map_err(db)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                }
+                None => {
+                    let mut st = c
+                        .prepare(&format!(
+                            "SELECT {CONTAINER_COLS} FROM containers
+                             ORDER BY tenant_id, sandbox_id, id"
+                        ))
+                        .map_err(db)?;
+                    st.query_map([], container_row)
+                        .map_err(db)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                }
+            };
+            rows.map_err(db)
+        })
+        .await
+    }
+
+    async fn update_container(&self, rec: &ContainerRecord) -> Result<()> {
+        let rec = rec.clone();
+        self.run(move |c| {
+            let n = c
+                .execute(
+                    "UPDATE containers SET state = ?4, exit_code = ?5, updated_at = ?6
+                     WHERE tenant_id = ?1 AND sandbox_id = ?2 AND id = ?3",
+                    params![
+                        rec.tenant.as_str(),
+                        rec.sandbox.as_str(),
+                        rec.id.as_str(),
+                        rec.state.as_str(),
+                        rec.exit_code,
+                        rec.updated_at
+                    ],
+                )
+                .map_err(db)?;
+            if n == 0 {
+                return Err(Error::NotFound(format!("container {}", rec.key())));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_container(&self, k: &ContainerKey) -> Result<()> {
+        let k = container_key_params(k);
+        self.run(move |c| {
+            c.execute(
+                "DELETE FROM containers WHERE tenant_id = ?1 AND sandbox_id = ?2 AND id = ?3",
+                k,
+            )
+            .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn insert_process(&self, rec: &ProcessRecord) -> Result<()> {
         let rec = rec.clone();
         let (spec, limits, io) = (json(&rec.spec)?, json(&rec.limits)?, json(&rec.io)?);
@@ -484,7 +649,7 @@ impl StateStore for SqliteState {
             c.execute(
                 &format!(
                     "INSERT INTO processes ({PROCESS_COLS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
                 ),
                 params![
                     rec.tenant.as_str(),
@@ -501,7 +666,8 @@ impl StateStore for SqliteState {
                     rec.stderr_dropped as i64,
                     rec.created_at,
                     rec.updated_at,
-                    rec.exited_at
+                    rec.exited_at,
+                    rec.container.as_ref().map(|c| c.as_str())
                 ],
             )
             .map_err(|e| {
@@ -793,6 +959,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             exited_at: None,
+            container: None,
         };
         s.insert_process(&p).await.unwrap();
         assert!(matches!(
@@ -840,6 +1007,81 @@ mod tests {
         s.delete_sandbox(&t, &sb.id).await.unwrap();
         assert!(s.list_processes(None).await.unwrap().is_empty());
         assert_eq!(s.purge_tombstones(i64::MAX).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn containers_roundtrip_and_go_with_their_sandbox() {
+        let s = SqliteState::in_memory().unwrap();
+        let t = TenantId::new("t").unwrap();
+        s.insert_tenant(&t, &limits(), (1, 5), &HashSet::new())
+            .await
+            .unwrap();
+        let sb = sandbox(&t, "box");
+        s.insert_sandbox(&sb).await.unwrap();
+        let mut c = ContainerRecord {
+            tenant: t.clone(),
+            sandbox: sb.id.clone(),
+            id: ContainerId::new("s1").unwrap(),
+            args: vec!["sleep".into(), "infinity".into()],
+            state: ContainerState::Creating,
+            exit_code: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        s.insert_container(&c).await.unwrap();
+        assert!(matches!(
+            s.insert_container(&c).await,
+            Err(Error::AlreadyExists(_))
+        ));
+        c.state = ContainerState::Exited;
+        c.exit_code = Some(3);
+        c.updated_at = 2;
+        s.update_container(&c).await.unwrap();
+        assert_eq!(s.get_container(&c.key()).await.unwrap(), Some(c.clone()));
+        assert_eq!(
+            s.list_containers(Some(&sb.key())).await.unwrap(),
+            vec![c.clone()]
+        );
+        s.delete_container(&c.key()).await.unwrap();
+        assert!(s.get_container(&c.key()).await.unwrap().is_none());
+
+        // A process remembers its container; the sandbox takes both along.
+        s.insert_container(&c).await.unwrap();
+        let mut p = ProcessRecord {
+            tenant: t.clone(),
+            sandbox: sb.id.clone(),
+            id: ProcessId::new("p1").unwrap(),
+            spec: ProcessSpec {
+                args: vec!["true".into()],
+                ..Default::default()
+            },
+            limits: ProcessLimits {
+                output_limit: 16,
+                retention_secs: 1,
+                tombstone_secs: 2,
+            },
+            io: ProcessIo {
+                dir: "/d/p1".into(),
+                stdout: "/d/p1/stdout".into(),
+                stderr: "/d/p1/stderr".into(),
+                pid_file: "/d/p1/pid".into(),
+            },
+            state: ProcessState::Running,
+            pid: Some(1),
+            exit_code: None,
+            signal: None,
+            stdout_dropped: 0,
+            stderr_dropped: 0,
+            created_at: 1,
+            updated_at: 1,
+            exited_at: None,
+            container: Some(c.id.clone()),
+        };
+        s.insert_process(&p).await.unwrap();
+        p = s.get_process(&p.key()).await.unwrap().unwrap();
+        assert_eq!(p.container_key(), Some(c.key()));
+        s.delete_sandbox(&t, &sb.id).await.unwrap();
+        assert!(s.list_containers(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]

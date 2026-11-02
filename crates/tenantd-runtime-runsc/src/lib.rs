@@ -2,6 +2,10 @@
 //! `runsc create/start/state/kill/wait/delete` itself, so flags are set per
 //! sandbox and no shim is needed. `--root` holds tenantd's containers only.
 //!
+//! A container in a sandbox is a second runsc container with its own bundle,
+//! joined to the sandbox's through the CRI annotations; every other call
+//! takes its ID like a sandbox's.
+//!
 //! Processes: a foreground `runsc exec --process <json>` child with stdout
 //! and stderr handed over as files (like create's), `kill --pid`,
 //! `wait --pid` and `ps --format=json`. Not `--detach`: its hidden child
@@ -28,7 +32,7 @@ use tenantd_core::backend::{
 use tenantd_core::config::{RuntimeConfig, RuntimeKind};
 use tenantd_core::error::Context;
 use tenantd_core::model::{NetworkMode, ProcessIo, ResolvedProcess, ResolvedSandbox, Signal};
-use tenantd_core::{Error, Result};
+use tenantd_core::{ContainerKey, Error, Result};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -246,6 +250,57 @@ impl RunscRuntime {
         Ok(spec::BundleFiles { resolv_conf, hosts })
     }
 
+    fn make_bundle(&self, h: &RuntimeHandle) -> Result<PathBuf> {
+        let bundle = self.bundle_dir(&h.0);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&bundle)?;
+        Ok(bundle)
+    }
+
+    /// Write `config.json` and run `runsc create`. A container whose spec
+    /// carries the CRI annotations joins the sandbox they name.
+    async fn create_from(
+        &self,
+        h: &RuntimeHandle,
+        bundle: &Path,
+        oci: &oci_spec::runtime::Spec,
+        root: &RootfsSpec,
+    ) -> Result<()> {
+        let id = h.0.as_str();
+        let json = serde_json::to_vec_pretty(oci).context("encoding config.json")?;
+        tokio::fs::write(bundle.join("config.json"), json).await?;
+
+        // The container inherits runsc create's stdio, so point it at the logs.
+        let logs = self.log_dir();
+        let stdout = self.open_log(&logs.join(format!("{id}.out")))?;
+        let stderr = self.open_log(&logs.join(format!("{id}.err")))?;
+        let runsc_log = logs.join(format!("{id}.runsc.log"));
+        let flags: Vec<OsString> = vec![
+            format!("--overlay2={}", spec::overlay_flag(root)).into(),
+            "--network=sandbox".into(),
+            flag_path("--log=", &runsc_log),
+        ];
+        let status = self
+            .command(
+                &flags,
+                &["create", "--bundle", &bundle.to_string_lossy(), id],
+            )
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()
+            .await
+            .context("running runsc create")?;
+        if !status.success() {
+            return Err(Error::Internal(format!(
+                "runsc create {id} failed ({status}): {}",
+                log_tail(&runsc_log)
+            )));
+        }
+        Ok(())
+    }
+
     /// Create or append; the daemon's umask keeps it private.
     fn open_log(&self, path: &Path) -> Result<std::fs::File> {
         std::fs::OpenOptions::new()
@@ -326,44 +381,29 @@ impl RuntimeBackend for RunscRuntime {
         net: &NetAttachment,
     ) -> Result<RuntimeHandle> {
         let h = RuntimeHandle::for_key(&s.key);
-        let id = h.0.as_str();
-        let bundle = self.bundle_dir(id);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&bundle)?;
+        let bundle = self.make_bundle(&h)?;
         let files = self.write_bundle_files(s, &bundle).await?;
         let oci = spec::build(s, root, net, &files)?;
-        let json = serde_json::to_vec_pretty(&oci).context("encoding config.json")?;
-        tokio::fs::write(bundle.join("config.json"), json).await?;
+        self.create_from(&h, &bundle, &oci, root).await?;
+        info!(sandbox = h.0, "runsc container created");
+        Ok(h)
+    }
 
-        // The sandbox inherits runsc create's stdio, so point it at the logs.
-        let logs = self.log_dir();
-        let stdout = self.open_log(&logs.join(format!("{id}.out")))?;
-        let stderr = self.open_log(&logs.join(format!("{id}.err")))?;
-        let runsc_log = logs.join(format!("{id}.runsc.log"));
-        let flags: Vec<OsString> = vec![
-            format!("--overlay2={}", spec::overlay_flag(root)).into(),
-            "--network=sandbox".into(),
-            flag_path("--log=", &runsc_log),
-        ];
-        let status = self
-            .command(
-                &flags,
-                &["create", "--bundle", &bundle.to_string_lossy(), id],
-            )
-            .stdout(stdout)
-            .stderr(stderr)
-            .status()
-            .await
-            .context("running runsc create")?;
-        if !status.success() {
-            return Err(Error::Internal(format!(
-                "runsc create {id} failed ({status}): {}",
-                log_tail(&runsc_log)
-            )));
-        }
-        info!(sandbox = id, "runsc container created");
+    async fn create_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerKey,
+        args: &[String],
+        root: &RootfsSpec,
+        net: &NetAttachment,
+    ) -> Result<RuntimeHandle> {
+        let h = RuntimeHandle::for_container(c);
+        let sandbox = RuntimeHandle::for_key(&s.key);
+        let bundle = self.make_bundle(&h)?;
+        let files = self.write_bundle_files(s, &bundle).await?;
+        let oci = spec::build_container(s, &sandbox.0, args, root, net, &files)?;
+        self.create_from(&h, &bundle, &oci, root).await?;
+        info!(container = h.0, "runsc container created in its sandbox");
         Ok(h)
     }
 

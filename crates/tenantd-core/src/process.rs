@@ -1,5 +1,6 @@
-//! Processes inside running sandboxes. Only processes tenantd started are
-//! visible or addressable.
+//! Processes inside running sandboxes, in the sandbox's own container or in
+//! one of its containers. Only processes tenantd started are visible or
+//! addressable.
 //!
 //! A start follows the intent pattern: the row is inserted as `starting`
 //! under the sandbox lock (so a stop can't race it and `max_processes` holds),
@@ -19,10 +20,10 @@ use crate::Tenantd;
 use crate::backend::RuntimeHandle;
 use crate::events::EventKind;
 use crate::model::{
-    ProcessRecord, ProcessSpec, ProcessState, ProcessTombstone, ResolvedProcess, SandboxState,
+    ContainerState, ProcessRecord, ProcessSpec, ProcessState, ProcessTombstone, ResolvedProcess,
     Signal, Stream,
 };
-use crate::{Bytes, Error, ProcessKey, Result, SandboxKey, now, policy};
+use crate::{Bytes, ContainerId, ContainerKey, Error, ProcessKey, Result, now, policy};
 
 /// Largest `Data` chunk a read sends.
 pub const OUTPUT_CHUNK: usize = 64 << 10;
@@ -44,27 +45,38 @@ pub enum OutputChunk {
 }
 
 impl Tenantd {
-    /// Idempotent on the key: the same spec returns the existing process, a
-    /// different one (or an ID still reserved by a tombstone) is
-    /// `AlreadyExists`. The sandbox must be running.
-    pub async fn start_process(&self, key: ProcessKey, spec: ProcessSpec) -> Result<ProcessRecord> {
+    /// Idempotent on the key: the same spec and container return the
+    /// existing process, a different one (or an ID still reserved by a
+    /// tombstone) is `AlreadyExists`. The sandbox must be running, and so
+    /// must `container` when given (`None` runs in the sandbox's own).
+    /// Process IDs are unique across the sandbox and its containers.
+    pub async fn start_process(
+        &self,
+        key: ProcessKey,
+        spec: ProcessSpec,
+        container: Option<ContainerId>,
+    ) -> Result<ProcessRecord> {
         policy::validate_process_spec(&spec)?;
         self.require_enforcement()?;
         self.require_unblocked(&key.tenant)?;
-        if let Some(r) = self.existing_process(&key, &spec).await? {
+        if let Some(r) = self.existing_process(&key, &spec, &container).await? {
             return Ok(r);
         }
 
         let sk = key.sandbox_key();
         let sandbox_lock = self.sandbox_locks.lock(sk.clone()).await;
-        let sandbox = self.get_sandbox(&key.tenant, &key.sandbox).await?;
-        if sandbox.state != SandboxState::Running {
-            return Err(Error::FailedPrecondition(format!(
-                "sandbox {sk} is {}",
-                sandbox.state.as_str()
-            )));
+        let sandbox = self.running_sandbox(&sk).await?;
+        if let Some(c) = &container {
+            let ck = ContainerKey::new(sk.clone(), c.clone());
+            let crec = self.get_container(&ck).await?;
+            if crec.state != ContainerState::Running {
+                return Err(Error::FailedPrecondition(format!(
+                    "container {ck} is {}",
+                    crec.state.as_str()
+                )));
+            }
         }
-        if let Some(r) = self.existing_process(&key, &spec).await? {
+        if let Some(r) = self.existing_process(&key, &spec, &container).await? {
             return Ok(r);
         }
         let cfg = self.config();
@@ -88,6 +100,7 @@ impl Tenantd {
             tenant: key.tenant.clone(),
             sandbox: key.sandbox.clone(),
             id: key.id.clone(),
+            container,
             io: self
                 .output
                 .io(&self.storage.tenant_dir(&key.tenant), &key.sandbox, &key.id),
@@ -124,6 +137,7 @@ impl Tenantd {
         &self,
         key: &ProcessKey,
         spec: &ProcessSpec,
+        container: &Option<ContainerId>,
     ) -> Result<Option<ProcessRecord>> {
         let mut row = self.state.get_process(key).await?;
         if row
@@ -134,7 +148,7 @@ impl Tenantd {
             row = self.state.get_process(key).await?;
         }
         if let Some(r) = row {
-            return if r.spec == *spec {
+            return if r.spec == *spec && r.container == *container {
                 Ok(Some(self.with_live_counts(r).await))
             } else {
                 Err(Error::AlreadyExists(format!(
@@ -160,7 +174,7 @@ impl Tenantd {
 
     /// Steps 2-3 of a start. Caller holds the process lock.
     async fn exec_process(&self, rec: &mut ProcessRecord, p: &ResolvedProcess) -> Result<()> {
-        let h = RuntimeHandle::for_key(&rec.sandbox_key());
+        let h = handle(rec);
         self.output.prepare(&rec.io).await?;
         // Armed before the first byte is written, so the limit holds from
         // the start.
@@ -179,7 +193,7 @@ impl Tenantd {
     /// remove its files and its row. The ID is free again. If this fails too
     /// the row stays `starting` for reconcile.
     async fn undo_start(&self, rec: &ProcessRecord) -> Result<()> {
-        let h = RuntimeHandle::for_key(&rec.sandbox_key());
+        let h = handle(rec);
         let pid = match rec.pid {
             Some(p) => Some(p),
             None => self.runtime.recorded_pid(&rec.io).await?,
@@ -202,7 +216,7 @@ impl Tenantd {
         Ok(self.with_live_counts(rec).await)
     }
 
-    pub async fn list_processes(&self, sk: &SandboxKey) -> Result<Vec<ProcessRecord>> {
+    pub async fn list_processes(&self, sk: &crate::SandboxKey) -> Result<Vec<ProcessRecord>> {
         self.get_sandbox(&sk.tenant, &sk.sandbox).await?;
         let mut out = Vec::new();
         for r in self.state.list_processes(Some(sk)).await? {
@@ -229,9 +243,7 @@ impl Tenantd {
                 )));
             }
         };
-        self.runtime
-            .signal(&RuntimeHandle::for_key(&rec.sandbox_key()), pid, sig)
-            .await?;
+        self.runtime.signal(&handle(&rec), pid, sig).await?;
         info!(process = %key, signal = sig.name(), "process signalled");
         Ok(rec)
     }
@@ -315,8 +327,9 @@ impl Tenantd {
                 None => self.runtime.recorded_pid(&rec.io).await?,
             };
             if let Some(pid) = pid {
-                let h = RuntimeHandle::for_key(&rec.sandbox_key());
-                self.runtime.signal(&h, pid, Signal::Kill).await?;
+                self.runtime
+                    .signal(&handle(&rec), pid, Signal::Kill)
+                    .await?;
             }
             self.finish_process(&mut rec, ProcessState::Exited, None, None)
                 .await?;
@@ -340,26 +353,32 @@ impl Tenantd {
         Ok(())
     }
 
-    /// A runtime exit report for `pid` in sandbox `sk`.
+    /// A runtime exit report for `pid` in the sandbox or container `h`.
+    /// PIDs are per container, so the handle picks the row.
     pub(crate) async fn on_process_exit(
         &self,
-        sk: &SandboxKey,
+        h: &RuntimeHandle,
         pid: u32,
         exit_code: Option<i32>,
         signal: Option<i32>,
     ) {
-        let Ok(rows) = self.state.list_processes(Some(sk)).await else {
+        let sk = match (h.key(), h.container()) {
+            (Some(sk), _) => sk,
+            (None, Some(ck)) => ck.sandbox_key(),
+            (None, None) => return,
+        };
+        let Ok(rows) = self.state.list_processes(Some(&sk)).await else {
             return;
         };
         for row in rows
             .into_iter()
-            .filter(|r| r.pid == Some(pid) && r.state == ProcessState::Running)
+            .filter(|r| r.pid == Some(pid) && r.state == ProcessState::Running && handle(r) == *h)
         {
             let _p = self.process_locks.lock(row.key()).await;
             let Ok(Some(mut rec)) = self.state.get_process(&row.key()).await else {
                 continue;
             };
-            if rec.state != ProcessState::Running || rec.pid != Some(pid) {
+            if rec.state != ProcessState::Running || rec.pid != Some(pid) || handle(&rec) != *h {
                 continue;
             }
             if let Err(e) = self
@@ -374,7 +393,7 @@ impl Tenantd {
     /// Every live process of a sandbox that is going away ends: running ones
     /// as `exited` (no exit code), starting ones as `lost`. Caller holds the
     /// sandbox lock.
-    pub(crate) async fn end_processes(&self, sk: &SandboxKey) -> Result<()> {
+    pub(crate) async fn end_processes(&self, sk: &crate::SandboxKey) -> Result<()> {
         for row in self.state.list_processes(Some(sk)).await? {
             if !row.state.is_live() {
                 continue;
@@ -448,9 +467,7 @@ impl Tenantd {
             .pid
             .ok_or_else(|| Error::Internal(format!("process {} has no pid", rec.key())))?;
         self.output.watch(&rec.io, rec.limits.output_limit).await?;
-        self.runtime
-            .watch_process(&RuntimeHandle::for_key(&rec.sandbox_key()), pid)
-            .await
+        self.runtime.watch_process(&handle(rec), pid).await
     }
 
     /// Dropped byte counts are final on the row once a process ends; while
@@ -467,6 +484,15 @@ impl Tenantd {
 
     pub(crate) fn bump_processes(&self) {
         self.process_epoch.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// The runtime handle a process runs under: its container's, or its
+/// sandbox's.
+pub(crate) fn handle(rec: &ProcessRecord) -> RuntimeHandle {
+    match rec.container_key() {
+        Some(ck) => RuntimeHandle::for_container(&ck),
+        None => RuntimeHandle::for_key(&rec.sandbox_key()),
     }
 }
 

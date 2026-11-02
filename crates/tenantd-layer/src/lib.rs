@@ -1,5 +1,6 @@
 //! Writable layers. Each sandbox owns `<tenant dir>/sandboxes/<id>/`, which
-//! inherits the tenant's project ID:
+//! inherits the tenant's project ID, and each of its containers
+//! `<sandbox dir>/containers/<id>/`, laid out the same way:
 //!
 //! - `host-overlay`: `upper/` and `work/` there, merged with the cached image
 //!   layers onto `rootfs/`. Every write is a real file in the tenant's quota.
@@ -25,7 +26,7 @@ use tenantd_core::config::RuntimeKind;
 use tenantd_core::error::Context;
 use tenantd_core::fsutil::remove_tree_one_fs;
 use tenantd_core::model::{LayerKind, ResolvedSandbox};
-use tenantd_core::{Error, Result, SandboxId};
+use tenantd_core::{ContainerId, Error, Result, SandboxId};
 use tracing::info;
 
 pub use mount::{is_mountpoint, mounts_under};
@@ -34,6 +35,12 @@ const RUNSC: &[RuntimeKind] = &[RuntimeKind::RunscDirect];
 
 pub fn sandbox_dir(tenant_dir: &Path, s: &SandboxId) -> PathBuf {
     tenant_dir.join("sandboxes").join(s.as_str())
+}
+
+pub fn container_dir(tenant_dir: &Path, s: &SandboxId, c: &ContainerId) -> PathBuf {
+    sandbox_dir(tenant_dir, s)
+        .join("containers")
+        .join(c.as_str())
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
@@ -154,6 +161,56 @@ async fn list_sandboxes(tenant_dir: &Path) -> Result<Vec<SandboxId>> {
     blocking(move || list_dirs(&d)).await
 }
 
+/// A writable overlay of `layers` on `<dir>/rootfs`, its upper and work
+/// directories beside it.
+async fn host_overlay(cache: PathBuf, layers: Vec<PathBuf>, dir: PathBuf) -> Result<RootfsSpec> {
+    blocking(move || {
+        let (upper, work, rootfs) = (dir.join("upper"), dir.join("work"), dir.join("rootfs"));
+        for d in [&upper, &work, &rootfs] {
+            fs::create_dir_all(d).context(format!("creating {}", d.display()))?;
+        }
+        // The overlay root takes the upperdir's mode. tenantd's umask
+        // would make it 0700, locking non-root image users out of `/`.
+        fs::set_permissions(&upper, fs::Permissions::from_mode(0o755))
+            .context(format!("chmod {}", upper.display()))?;
+        if !is_mountpoint(&rootfs)? {
+            let data = format!(
+                "lowerdir={},upperdir={},workdir={}",
+                join_lower(&lowerdirs(&cache, &layers)?),
+                upper.display(),
+                work.display()
+            );
+            mount::mount(
+                "overlay",
+                &rootfs,
+                Some("overlay"),
+                libc::MS_NODEV,
+                Some(&data),
+            )
+            .context("mounting host overlay")?;
+            info!(rootfs = %rootfs.display(), "host overlay mounted");
+        }
+        Ok(RootfsSpec::Path(rootfs))
+    })
+    .await
+}
+
+/// A read-only view of `layers` on `<dir>/rootfs`.
+async fn readonly_view(cache: PathBuf, layers: Vec<PathBuf>, dir: PathBuf) -> Result<PathBuf> {
+    blocking(move || {
+        let rootfs = dir.join("rootfs");
+        fs::create_dir_all(&rootfs)?;
+        mount_readonly_view(&cache, &layers, &rootfs)?;
+        Ok(rootfs)
+    })
+    .await
+}
+
+async fn teardown_container(s: &SandboxId, c: &ContainerId, tenant_dir: &Path) -> Result<()> {
+    let dir = container_dir(tenant_dir, s, c);
+    blocking(move || teardown_dir(&dir)).await
+}
+
 pub struct HostOverlay {
     image_cache: PathBuf,
 }
@@ -184,37 +241,7 @@ impl WritableLayer for HostOverlay {
 
     async fn prepare(&self, s: &ResolvedSandbox, tenant_dir: &Path) -> Result<RootfsSpec> {
         let dir = sandbox_dir(tenant_dir, &s.key.sandbox);
-        let cache = self.image_cache.clone();
-        let layers = s.image.layers.clone();
-        blocking(move || {
-            let (upper, work, rootfs) = (dir.join("upper"), dir.join("work"), dir.join("rootfs"));
-            for d in [&upper, &work, &rootfs] {
-                fs::create_dir_all(d).context(format!("creating {}", d.display()))?;
-            }
-            // The overlay root takes the upperdir's mode. tenantd's umask
-            // would make it 0700, locking non-root image users out of `/`.
-            fs::set_permissions(&upper, fs::Permissions::from_mode(0o755))
-                .context(format!("chmod {}", upper.display()))?;
-            if !is_mountpoint(&rootfs)? {
-                let data = format!(
-                    "lowerdir={},upperdir={},workdir={}",
-                    join_lower(&lowerdirs(&cache, &layers)?),
-                    upper.display(),
-                    work.display()
-                );
-                mount::mount(
-                    "overlay",
-                    &rootfs,
-                    Some("overlay"),
-                    libc::MS_NODEV,
-                    Some(&data),
-                )
-                .context("mounting host overlay")?;
-                info!(rootfs = %rootfs.display(), "host overlay mounted");
-            }
-            Ok(RootfsSpec::Path(rootfs))
-        })
-        .await
+        host_overlay(self.image_cache.clone(), s.image.layers.clone(), dir).await
     }
 
     async fn reclaim(&self, _h: &RuntimeHandle) -> Result<ReclaimOutcome> {
@@ -227,6 +254,25 @@ impl WritableLayer for HostOverlay {
 
     async fn list_owned(&self, tenant_dir: &Path) -> Result<Vec<SandboxId>> {
         list_sandboxes(tenant_dir).await
+    }
+
+    async fn prepare_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<RootfsSpec> {
+        let dir = container_dir(tenant_dir, &s.key.sandbox, c);
+        host_overlay(self.image_cache.clone(), s.image.layers.clone(), dir).await
+    }
+
+    async fn teardown_container(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<()> {
+        teardown_container(s, c, tenant_dir).await
     }
 }
 
@@ -259,14 +305,10 @@ impl WritableLayer for MemoryLayer {
     }
 
     async fn prepare(&self, s: &ResolvedSandbox, tenant_dir: &Path) -> Result<RootfsSpec> {
-        let rootfs = sandbox_dir(tenant_dir, &s.key.sandbox).join("rootfs");
-        let (cache, layers) = (self.image_cache.clone(), s.image.layers.clone());
-        blocking(move || {
-            fs::create_dir_all(&rootfs)?;
-            mount_readonly_view(&cache, &layers, &rootfs)?;
-            Ok(RootfsSpec::Memory(rootfs))
-        })
-        .await
+        let dir = sandbox_dir(tenant_dir, &s.key.sandbox);
+        readonly_view(self.image_cache.clone(), s.image.layers.clone(), dir)
+            .await
+            .map(RootfsSpec::Memory)
     }
 
     async fn reclaim(&self, _h: &RuntimeHandle) -> Result<ReclaimOutcome> {
@@ -279,6 +321,27 @@ impl WritableLayer for MemoryLayer {
 
     async fn list_owned(&self, tenant_dir: &Path) -> Result<Vec<SandboxId>> {
         list_sandboxes(tenant_dir).await
+    }
+
+    async fn prepare_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<RootfsSpec> {
+        let dir = container_dir(tenant_dir, &s.key.sandbox, c);
+        readonly_view(self.image_cache.clone(), s.image.layers.clone(), dir)
+            .await
+            .map(RootfsSpec::Memory)
+    }
+
+    async fn teardown_container(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<()> {
+        teardown_container(s, c, tenant_dir).await
     }
 }
 
@@ -311,14 +374,10 @@ impl WritableLayer for ReadOnlyLayer {
     }
 
     async fn prepare(&self, s: &ResolvedSandbox, tenant_dir: &Path) -> Result<RootfsSpec> {
-        let rootfs = sandbox_dir(tenant_dir, &s.key.sandbox).join("rootfs");
-        let (cache, layers) = (self.image_cache.clone(), s.image.layers.clone());
-        blocking(move || {
-            fs::create_dir_all(&rootfs)?;
-            mount_readonly_view(&cache, &layers, &rootfs)?;
-            Ok(RootfsSpec::ReadOnly(rootfs))
-        })
-        .await
+        let dir = sandbox_dir(tenant_dir, &s.key.sandbox);
+        readonly_view(self.image_cache.clone(), s.image.layers.clone(), dir)
+            .await
+            .map(RootfsSpec::ReadOnly)
     }
 
     async fn reclaim(&self, _h: &RuntimeHandle) -> Result<ReclaimOutcome> {
@@ -331,6 +390,27 @@ impl WritableLayer for ReadOnlyLayer {
 
     async fn list_owned(&self, tenant_dir: &Path) -> Result<Vec<SandboxId>> {
         list_sandboxes(tenant_dir).await
+    }
+
+    async fn prepare_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<RootfsSpec> {
+        let dir = container_dir(tenant_dir, &s.key.sandbox, c);
+        readonly_view(self.image_cache.clone(), s.image.layers.clone(), dir)
+            .await
+            .map(RootfsSpec::ReadOnly)
+    }
+
+    async fn teardown_container(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<()> {
+        teardown_container(s, c, tenant_dir).await
     }
 }
 
@@ -420,6 +500,32 @@ mod tests {
             layer.list_owned(&tenant).await.unwrap(),
             vec![s.key.sandbox.clone()]
         );
+
+        // A container gets its own overlay of the same image, inside the
+        // sandbox's directory.
+        let c = ContainerId::new("c1").unwrap();
+        let RootfsSpec::Path(croot) = layer.prepare_container(&s, &c, &tenant).await.unwrap()
+        else {
+            panic!()
+        };
+        layer.prepare_container(&s, &c, &tenant).await.unwrap(); // idempotent
+        assert_eq!(fs::read_to_string(croot.join("base")).unwrap(), "1");
+        assert!(
+            !croot.join("new").exists(),
+            "the sandbox's writes stay its own"
+        );
+        fs::write(croot.join("mine"), "c").unwrap();
+        let cdir = container_dir(&tenant, &s.key.sandbox, &c);
+        assert_eq!(fs::read_to_string(cdir.join("upper/mine")).unwrap(), "c");
+        assert!(!root.join("mine").exists());
+        layer
+            .teardown_container(&s.key.sandbox, &c, &tenant)
+            .await
+            .unwrap();
+        assert!(!cdir.exists());
+        assert!(root.join("new").exists(), "the sandbox's root is untouched");
+        // A sandbox's teardown takes container roots still there along.
+        layer.prepare_container(&s, &c, &tenant).await.unwrap();
 
         layer.teardown(&s.key.sandbox, &tenant).await.unwrap();
         assert!(!sandbox_dir(&tenant, &s.key.sandbox).exists());

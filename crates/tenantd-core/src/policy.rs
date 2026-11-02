@@ -208,6 +208,28 @@ pub fn validate_process_spec(p: &ProcessSpec) -> Result<()> {
     Ok(())
 }
 
+/// A container's init command. Empty runs the image's entrypoint and cmd,
+/// as the sandbox's own init does; anything else is a command like a
+/// process start's and needs the profile's exec rights. It runs as the
+/// image's user, with the image's env and working directory.
+pub fn check_container_args(cfg: &Config, sandbox: &SandboxRecord, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    validate_process_spec(&ProcessSpec {
+        args: args.to_vec(),
+        ..Default::default()
+    })?;
+    let name = &sandbox.profile;
+    if !cfg.profile(name)?.exec.enabled {
+        return Err(Error::denied(
+            format!("profiles.{name}.exec"),
+            "exec is not enabled for this profile, so a container runs the image's own command",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a process start against the sandbox and the exec policy of its
 /// profile in the *current* config. The process gets the sandbox's
 /// capabilities, never more.

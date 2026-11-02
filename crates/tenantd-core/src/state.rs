@@ -2,8 +2,10 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 
-use crate::model::{ProcessRecord, ProcessTombstone, SandboxRecord, TenantLimits, TenantRecord};
-use crate::{ProcessKey, Result, SandboxId, SandboxKey, TenantId};
+use crate::model::{
+    ContainerRecord, ProcessRecord, ProcessTombstone, SandboxRecord, TenantLimits, TenantRecord,
+};
+use crate::{ContainerKey, ProcessKey, Result, SandboxId, SandboxKey, TenantId};
 
 /// Durable records. Each call is atomic.
 #[async_trait]
@@ -29,8 +31,15 @@ pub trait StateStore: Send + Sync {
     async fn get_sandbox(&self, t: &TenantId, s: &SandboxId) -> Result<Option<SandboxRecord>>;
     async fn list_sandboxes(&self, t: Option<&TenantId>) -> Result<Vec<SandboxRecord>>;
     async fn update_sandbox(&self, rec: &SandboxRecord) -> Result<()>;
-    /// Also deletes the sandbox's process rows and tombstones.
+    /// Also deletes the sandbox's container rows, process rows and tombstones.
     async fn delete_sandbox(&self, t: &TenantId, s: &SandboxId) -> Result<()>;
+
+    /// `AlreadyExists` if the row exists.
+    async fn insert_container(&self, rec: &ContainerRecord) -> Result<()>;
+    async fn get_container(&self, k: &ContainerKey) -> Result<Option<ContainerRecord>>;
+    async fn list_containers(&self, s: Option<&SandboxKey>) -> Result<Vec<ContainerRecord>>;
+    async fn update_container(&self, rec: &ContainerRecord) -> Result<()>;
+    async fn delete_container(&self, k: &ContainerKey) -> Result<()>;
 
     /// `AlreadyExists` if the row exists.
     async fn insert_process(&self, rec: &ProcessRecord) -> Result<()>;

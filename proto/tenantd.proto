@@ -30,6 +30,22 @@ service Sandboxes {
   rpc DestroySandbox(SandboxRef) returns (DestroySandboxResponse);
 }
 
+// Containers inside running sandboxes: the sandbox's image on a writable
+// root of their own (in the tenant's quota), sharing the sandbox's kernel,
+// network and limits, so many of them cost one sandbox. A container is never
+// restarted: it ends "exited" when its init exits or its sandbox stops, and
+// keeps its root until deleted.
+service Containers {
+  // Idempotent on (tenant, sandbox, id), like every create. The sandbox
+  // must be running.
+  rpc CreateContainer(CreateContainerRequest) returns (Container);
+  rpc GetContainer(ContainerRef) returns (Container);
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+  // Ends its processes and removes it and its root. Their process rows stay
+  // until their retention passes.
+  rpc DeleteContainer(ContainerRef) returns (DeleteContainerResponse);
+}
+
 // Processes inside running sandboxes. Only processes tenantd started are
 // visible; the sandbox's init process and anything the image spawns are out
 // of reach. What a caller may run is the sandbox profile's exec policy.
@@ -152,16 +168,54 @@ message Sandbox {
   int64 updated_at = 13;
 }
 
-message StartProcessRequest {
+message CreateContainerRequest {
   string tenant = 1;
   string sandbox = 2;
   string id = 3;
+  // Its init; empty runs the image's entrypoint and cmd. Anything else needs
+  // the profile's exec rights and runs as the image user. No shell is implied.
+  repeated string args = 4;
+}
+
+message ContainerRef {
+  string tenant = 1;
+  string sandbox = 2;
+  string id = 3;
+}
+
+message ListContainersRequest {
+  string tenant = 1;
+  string sandbox = 2;
+}
+
+message ListContainersResponse {
+  repeated Container containers = 1;
+}
+
+message DeleteContainerResponse {}
+
+message Container {
+  string tenant = 1;
+  string sandbox = 2;
+  string id = 3;
+  string state = 4;             // creating | running | exited | destroying
+  optional int32 exit_code = 5;
+  int64 created_at = 6;
+  int64 updated_at = 7;
+  repeated string args = 8;     // empty: the image's entrypoint and cmd
+}
+
+message StartProcessRequest {
+  string tenant = 1;
+  string sandbox = 2;
+  string id = 3;              // unique across the sandbox and its containers
   repeated string args = 4;  // required; no shell is implied
   repeated string env = 5;   // KEY=VALUE, appended to the image env
   string cwd = 6;            // default: the image WorkingDir
   string user = 7;           // "" = image user; otherwise must be in profile exec.users
   bool tty = 8;              // not supported yet
   bool stdin = 9;            // not supported yet
+  string container = 10;     // "" = the sandbox's own; otherwise must be running
 }
 
 message ProcessRef {
@@ -231,6 +285,7 @@ message Process {
   int64 created_at = 13;
   optional int64 exited_at = 14;
   uint64 output_limit = 15;     // bytes kept per stream
+  string container = 16;        // "" = the sandbox's own
 }
 
 message ReadOutputRequest {
@@ -281,6 +336,7 @@ message Event {
     QuotaExceeded quota_exceeded = 4;
     ReconcileAction reconcile = 5;
     ProcessExited process_exited = 6;
+    ContainerExited container_exited = 7;
   }
 }
 
@@ -293,6 +349,13 @@ message SandboxExited {
 message SandboxOom {
   string tenant = 1;
   string id = 2;
+}
+
+message ContainerExited {
+  string tenant = 1;
+  string sandbox = 2;
+  string id = 3;
+  optional int32 exit_code = 4;
 }
 
 message QuotaExceeded {

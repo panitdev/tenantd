@@ -92,6 +92,8 @@ tenantd sandbox create acme box1 --profile default --image ghcr.io/example/app:1
 
 tenantd exec acme box1 -- sh -c 'make test'     # streams output, exits with its code
 tenantd exec -d --id build1 acme box1 -- make   # detached
+tenantd container create acme box1 s1 -- sleep infinity  # own root, same sandbox
+tenantd exec --container s1 acme box1 -- make test
 tenantd process logs acme box1 build1 -f
 
 tenantd sandbox stop acme box1                  # writable layer is kept
@@ -112,6 +114,11 @@ it. Run `tenantd --help` for the full command list, including `process ps`,
 - **Runtime.** tenantd builds OCI bundles and drives `runsc` directly. Docker
   is not involved. Images are pulled by digest, verified, and cached as shared
   layers.
+- **Containers.** A sandbox can run more containers from its image, each
+  with its own writable root in the tenant's quota but sharing the
+  sandbox's gVisor kernel, network and limits, so many of them cost one
+  sandbox. runsc adds them to the running sandbox; they are never
+  restarted, and stopping the sandbox ends them.
 - **Policy.** Everything a caller can do is defined by a profile in the
   operator's config: allowed images, resources, network and exec rights. A
   denial returns `PERMISSION_DENIED` naming the rule, for example

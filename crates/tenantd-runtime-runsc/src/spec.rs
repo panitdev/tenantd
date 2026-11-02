@@ -1,7 +1,7 @@
-//! OCI `config.json` for one sandbox, and the `process.json` for one exec,
-//! built only from resolved specs.
+//! OCI `config.json` for one sandbox or one container in it, and the
+//! `process.json` for one exec, built only from resolved specs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use oci_spec::runtime::{
@@ -356,6 +356,42 @@ pub fn build(
         .context("spec")
 }
 
+/// The CRI annotations runsc reads to start a container inside an existing
+/// sandbox rather than a sandbox of its own.
+pub const CONTAINER_TYPE: &str = "io.kubernetes.cri.container-type";
+pub const SANDBOX_ID: &str = "io.kubernetes.cri.sandbox-id";
+
+/// `config.json` for a container in the sandbox `s`, which runs as
+/// `sandbox_id`: the sandbox's process (with `args` in place of the image's
+/// command, unless empty), mounts and namespaces on the container's own
+/// root, and no cgroup or resources of its own, since the sandbox's limits
+/// cover every container in it.
+pub fn build_container(
+    s: &ResolvedSandbox,
+    sandbox_id: &str,
+    args: &[String],
+    root: &RootfsSpec,
+    net: &NetAttachment,
+    files: &BundleFiles,
+) -> Result<Spec> {
+    let mut spec = build(s, root, net, files)?;
+    if !args.is_empty()
+        && let Some(p) = spec.process_mut()
+    {
+        p.set_args(Some(args.to_vec()));
+    }
+    spec.set_hostname(None);
+    if let Some(linux) = spec.linux_mut() {
+        linux.set_cgroups_path(None);
+        linux.set_resources(None);
+    }
+    spec.set_annotations(Some(HashMap::from([
+        (CONTAINER_TYPE.to_string(), "container".to_string()),
+        (SANDBOX_ID.to_string(), sandbox_id.to_string()),
+    ])));
+    Ok(spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +472,43 @@ mod tests {
             .collect();
         assert!(dests.contains(&"/tmp") && dests.contains(&"/etc/resolv.conf"));
         assert!(v.get("hooks").is_none() || v["hooks"].is_null());
+    }
+
+    #[test]
+    fn container_joins_its_sandbox_with_the_same_lockdown() {
+        let s = sandbox();
+        let files = BundleFiles {
+            resolv_conf: None,
+            hosts: "/b/hosts".into(),
+        };
+        let net = NetAttachment {
+            netns: "/run/tenantd/netns/t.s".into(),
+        };
+        let root = RootfsSpec::Path("/t/sandboxes/s/containers/c/rootfs".into());
+        let spec = build_container(&s, "t.s", &[], &root, &net, &files).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["annotations"][CONTAINER_TYPE], "container");
+        assert_eq!(v["annotations"][SANDBOX_ID], "t.s");
+        assert_eq!(v["root"]["path"], "/t/sandboxes/s/containers/c/rootfs");
+        assert_eq!(v["root"]["readonly"], false);
+        assert_eq!(v["process"]["noNewPrivileges"], true);
+        assert_eq!(
+            v["process"]["capabilities"]["bounding"],
+            serde_json::json!(["CAP_NET_BIND_SERVICE"])
+        );
+        // The sandbox's cgroup and limits cover it.
+        assert!(v["linux"].get("cgroupsPath").is_none_or(|p| p.is_null()));
+        assert!(v["linux"].get("resources").is_none_or(|r| r.is_null()));
+        assert!(v.get("hostname").is_none_or(|h| h.is_null()));
+        assert_eq!(
+            v["process"]["args"],
+            serde_json::json!(["/bin/sh", "-c", "sleep 1"])
+        );
+        let args = ["sleep".to_string(), "infinity".to_string()];
+        let spec = build_container(&s, "t.s", &args, &root, &net, &files).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["process"]["args"], serde_json::json!(args));
+        assert_eq!(v["process"]["user"]["uid"], 1000);
     }
 
     #[test]

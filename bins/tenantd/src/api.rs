@@ -7,16 +7,20 @@ use std::time::{Duration, Instant};
 
 use futures::Stream;
 use tenantd_client::pb::{
-    self, processes_server::Processes, sandboxes_server::Sandboxes, system_server::System,
-    tenants_server::Tenants,
+    self, containers_server::Containers, processes_server::Processes, sandboxes_server::Sandboxes,
+    system_server::System, tenants_server::Tenants,
 };
 use tenantd_core::events::{Event, EventKind};
 use tenantd_core::model::{
-    Overrides, ProcessRecord, ProcessSpec, SandboxRecord, Signal, TenantLimits, TenantRecord,
+    ContainerRecord, Overrides, ProcessRecord, ProcessSpec, SandboxRecord, Signal, TenantLimits,
+    TenantRecord,
 };
 use tenantd_core::process::OutputChunk;
 use tenantd_core::service::TenantInfo;
-use tenantd_core::{Error, ProcessId, ProcessKey, SandboxId, SandboxKey, TenantId, Tenantd};
+use tenantd_core::{
+    ContainerId, ContainerKey, Error, ProcessId, ProcessKey, SandboxId, SandboxKey, TenantId,
+    Tenantd,
+};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
@@ -81,6 +85,26 @@ fn process_key(t: &str, s: &str, p: &str) -> tenantd_core::Result<ProcessKey> {
     ))
 }
 
+fn container_key(t: &str, s: &str, c: &str) -> tenantd_core::Result<ContainerKey> {
+    Ok(ContainerKey::new(
+        SandboxKey::new(tenant_id(t)?, sandbox_id(s)?),
+        ContainerId::new(c)?,
+    ))
+}
+
+fn pb_container(r: ContainerRecord) -> pb::Container {
+    pb::Container {
+        tenant: r.tenant.into(),
+        sandbox: r.sandbox.into(),
+        id: r.id.into(),
+        state: r.state.as_str().into(),
+        exit_code: r.exit_code,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        args: r.args,
+    }
+}
+
 fn process_ref(r: Option<pb::ProcessRef>) -> tenantd_core::Result<ProcessKey> {
     let r = r.ok_or_else(|| Error::invalid("process is required"))?;
     process_key(&r.tenant, &r.sandbox, &r.id)
@@ -140,6 +164,7 @@ fn pb_process(r: ProcessRecord) -> pb::Process {
         created_at: r.created_at,
         exited_at: r.exited_at,
         output_limit: r.limits.output_limit,
+        container: r.container.map(String::from).unwrap_or_default(),
     }
 }
 
@@ -236,6 +261,14 @@ pub fn pb_event(e: Event) -> pb::Event {
             stdout_dropped,
             stderr_dropped,
         }),
+        EventKind::ContainerExited { key, exit_code } => {
+            Kind::ContainerExited(pb::ContainerExited {
+                tenant: key.tenant.into(),
+                sandbox: key.sandbox.into(),
+                id: key.id.into(),
+                exit_code,
+            })
+        }
         EventKind::QuotaExceeded {
             tenant,
             used,
@@ -440,6 +473,63 @@ impl Sandboxes for Api {
     }
 }
 
+#[tonic::async_trait]
+impl Containers for Api {
+    async fn create_container(
+        &self,
+        req: Request<pb::CreateContainerRequest>,
+    ) -> Result<Response<pb::Container>, Status> {
+        let r = req.into_inner();
+        self.timed("CreateContainer", async {
+            let key = container_key(&r.tenant, &r.sandbox, &r.id)?;
+            Ok(pb_container(
+                self.tenantd.create_container(key, r.args).await?,
+            ))
+        })
+        .await
+    }
+
+    async fn get_container(
+        &self,
+        req: Request<pb::ContainerRef>,
+    ) -> Result<Response<pb::Container>, Status> {
+        let r = req.into_inner();
+        self.timed("GetContainer", async {
+            let key = container_key(&r.tenant, &r.sandbox, &r.id)?;
+            Ok(pb_container(self.tenantd.get_container(&key).await?))
+        })
+        .await
+    }
+
+    async fn list_containers(
+        &self,
+        req: Request<pb::ListContainersRequest>,
+    ) -> Result<Response<pb::ListContainersResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("ListContainers", async {
+            let sk = SandboxKey::new(tenant_id(&r.tenant)?, sandbox_id(&r.sandbox)?);
+            let recs = self.tenantd.list_containers(&sk).await?;
+            Ok(pb::ListContainersResponse {
+                containers: recs.into_iter().map(pb_container).collect(),
+            })
+        })
+        .await
+    }
+
+    async fn delete_container(
+        &self,
+        req: Request<pb::ContainerRef>,
+    ) -> Result<Response<pb::DeleteContainerResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("DeleteContainer", async {
+            let key = container_key(&r.tenant, &r.sandbox, &r.id)?;
+            self.tenantd.delete_container(&key).await?;
+            Ok(pb::DeleteContainerResponse {})
+        })
+        .await
+    }
+}
+
 type OutputStream = Pin<Box<dyn Stream<Item = Result<pb::OutputChunk, Status>> + Send>>;
 
 #[tonic::async_trait]
@@ -460,7 +550,13 @@ impl Processes for Api {
                 tty: r.tty,
                 stdin: r.stdin,
             };
-            Ok(pb_process(self.tenantd.start_process(key, spec).await?))
+            let container = match r.container.as_str() {
+                "" => None,
+                c => Some(ContainerId::new(c)?),
+            };
+            Ok(pb_process(
+                self.tenantd.start_process(key, spec, container).await?,
+            ))
         })
         .await
     }

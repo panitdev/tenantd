@@ -14,7 +14,9 @@ use crate::model::{
     LayerKind, NetworkMode, ProcessIo, ResolvedImage, ResolvedProcess, ResolvedSandbox, Signal,
     Stream,
 };
-use crate::{Bytes, ProcessId, ProjectId, Result, SandboxId, SandboxKey, TenantId};
+use crate::{
+    Bytes, ContainerId, ContainerKey, ProcessId, ProjectId, Result, SandboxId, SandboxKey, TenantId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
@@ -108,9 +110,27 @@ pub trait WritableLayer: Send + Sync {
     async fn teardown(&self, s: &SandboxId, tenant_dir: &Path) -> Result<()>;
     /// Sandbox directories under the tenant dir. For reconcile.
     async fn list_owned(&self, tenant_dir: &Path) -> Result<Vec<SandboxId>>;
+    /// Build container `c`'s root from the sandbox's image, inside the
+    /// sandbox's directory. Idempotent.
+    async fn prepare_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<RootfsSpec>;
+    /// Unmount and remove everything the container owns. Idempotent; the
+    /// sandbox's own teardown removes its containers' too.
+    async fn teardown_container(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<()>;
 }
 
-/// The runtime's name for a sandbox; tenantd uses the sandbox key.
+/// The runtime's name for a sandbox or a container in one; tenantd uses
+/// the sandbox key (`<tenant>.<sandbox>`) or the container key
+/// (`<tenant>.<sandbox>.<container>`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RuntimeHandle(pub String);
 
@@ -119,7 +139,17 @@ impl RuntimeHandle {
         Self(k.to_string())
     }
 
+    pub fn for_container(k: &ContainerKey) -> Self {
+        Self(k.to_string())
+    }
+
+    /// The sandbox, when this is a sandbox's handle.
     pub fn key(&self) -> Option<SandboxKey> {
+        self.0.parse().ok()
+    }
+
+    /// The container, when this is a container's handle.
+    pub fn container(&self) -> Option<ContainerKey> {
         self.0.parse().ok()
     }
 }
@@ -168,6 +198,18 @@ pub trait RuntimeBackend: Send + Sync {
     async fn create(
         &self,
         spec: &ResolvedSandbox,
+        root: &RootfsSpec,
+        net: &NetAttachment,
+    ) -> Result<RuntimeHandle>;
+    /// Create container `c` in the running sandbox `s`: the sandbox's image
+    /// on `root`, running `args` (empty: the image's entrypoint and cmd),
+    /// sharing the sandbox's kernel, network and limits. The handle works
+    /// with every other call here.
+    async fn create_container(
+        &self,
+        s: &ResolvedSandbox,
+        c: &ContainerKey,
+        args: &[String],
         root: &RootfsSpec,
         net: &NetAttachment,
     ) -> Result<RuntimeHandle>;

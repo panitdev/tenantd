@@ -8,9 +8,11 @@ use tracing::{info, warn};
 
 use crate::Tenantd;
 use crate::backend::RuntimeHandle;
+use crate::backend::RuntimeState;
 use crate::events::EventKind;
-use crate::model::{ProcessState, SandboxState, TenantState};
-use crate::{ProjectId, SandboxKey, TenantId, now};
+use crate::model::{ContainerState, ProcessState, SandboxState, TenantState};
+use crate::process::handle;
+use crate::{ContainerKey, ProjectId, SandboxKey, TenantId, now};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
@@ -44,6 +46,7 @@ impl Tenantd {
         self.check_health().await;
         self.reconcile_tenants(&mut rep).await;
         self.reconcile_sandboxes(&mut rep).await;
+        self.reconcile_containers(&mut rep).await;
         self.reconcile_processes(&mut rep).await;
         self.reconcile_images(&mut rep).await;
         rep
@@ -293,8 +296,13 @@ impl Tenantd {
         }
 
         let known: HashSet<SandboxKey> = rows.iter().map(|r| r.key()).collect();
+        let known_containers: HashSet<ContainerKey> = match self.state.list_containers(None).await {
+            Ok(v) => v.into_iter().map(|c| c.key()).collect(),
+            Err(e) => return rep.err("state", e),
+        };
         for h in containers {
-            let owned = h.key().is_some_and(|k| known.contains(&k));
+            let owned = h.key().is_some_and(|k| known.contains(&k))
+                || h.container().is_some_and(|k| known_containers.contains(&k));
             if owned {
                 continue;
             }
@@ -367,6 +375,115 @@ impl Tenantd {
         }
     }
 
+    /// Containers left mid-create or mid-delete are finished or undone;
+    /// running ones are re-watched, or marked exited once their sandbox or
+    /// their runtime container is gone; exited ones lose any leftover
+    /// runtime container.
+    async fn reconcile_containers(&self, rep: &mut ReconcileReport) {
+        let rows = match self.state.list_containers(None).await {
+            Ok(r) => r,
+            Err(e) => return rep.err("state", e),
+        };
+        for row in rows {
+            let key = row.key();
+            let sk = key.sandbox_key();
+            let target = format!("container/{key}");
+            let _s = self.sandbox_locks.lock(sk.clone()).await;
+            let _c = self.container_locks.lock(key.clone()).await;
+            let (sandbox, mut rec) = match (
+                self.state.get_sandbox(&sk.tenant, &sk.sandbox).await,
+                self.state.get_container(&key).await,
+            ) {
+                (Ok(Some(s)), Ok(Some(c))) => (s, c),
+                (Ok(_), Ok(_)) => continue,
+                (Err(e), _) | (_, Err(e)) => {
+                    rep.err(&target, e);
+                    continue;
+                }
+            };
+            let sandbox_running = sandbox.state == SandboxState::Running;
+            let h = RuntimeHandle::for_container(&key);
+            match rec.state {
+                ContainerState::Creating => {
+                    let res = async {
+                        if !sandbox_running {
+                            return Err(crate::Error::FailedPrecondition(format!(
+                                "sandbox is {}",
+                                sandbox.state.as_str()
+                            )));
+                        }
+                        self.bring_up_container(&sandbox, &rec).await?;
+                        self.set_container_state(&mut rec, ContainerState::Running)
+                            .await
+                    };
+                    match res.await {
+                        Ok(()) => rep.act(self, "finish_create", &target, "running"),
+                        Err(e) => {
+                            let undo = async {
+                                self.tear_down_container(&sandbox, &rec, true).await?;
+                                self.state.delete_container(&key).await
+                            };
+                            match undo.await {
+                                Ok(()) => rep.act(self, "rollback_create", &target, e),
+                                Err(e2) => {
+                                    rep.err(&target, format!("rollback after {e} failed: {e2}"))
+                                }
+                            }
+                        }
+                    }
+                }
+                ContainerState::Destroying => {
+                    match self.delete_container_locked(&sandbox, rec).await {
+                        Ok(()) => rep.act(self, "finish_delete", &target, "deleted"),
+                        Err(e) => rep.err(&target, e),
+                    }
+                }
+                ContainerState::Running => {
+                    let state = if sandbox_running {
+                        match self.runtime.inspect(&h).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                rep.err(&target, e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        RuntimeState::Missing
+                    };
+                    match state {
+                        RuntimeState::Running => {
+                            if let Err(e) = self.runtime.watch(&h).await {
+                                rep.err(&target, e);
+                            }
+                        }
+                        state => match self.mark_container_exited(&sandbox, &mut rec, None).await {
+                            Ok(()) => rep.act(
+                                self,
+                                "mark_exited",
+                                &target,
+                                format!("sandbox {}, container {state:?}", sandbox.state.as_str()),
+                            ),
+                            Err(e) => rep.err(&target, e),
+                        },
+                    }
+                }
+                ContainerState::Exited => match self.runtime.inspect(&h).await {
+                    Ok(RuntimeState::Missing) => {}
+                    Ok(_) => match self.tear_down_container(&sandbox, &rec, false).await {
+                        Ok(()) => rep.act(
+                            self,
+                            "cleanup_exited",
+                            &target,
+                            "removed leftover container",
+                        ),
+                        Err(e) => rep.err(&target, e),
+                    },
+                    Err(e) => rep.err(&target, e),
+                },
+            }
+        }
+    }
+
     /// Live rows are adopted, re-armed or ended against what the runtime
     /// reports; ended rows past their retention are collected into
     /// tombstones, and expired tombstones dropped.
@@ -375,8 +492,8 @@ impl Tenantd {
             Ok(r) => r,
             Err(e) => return rep.err("state", e),
         };
-        // In-sandbox PIDs per sandbox, listed once; `None` if listing failed.
-        let mut pids: HashMap<SandboxKey, Option<HashSet<u32>>> = HashMap::new();
+        // PIDs per sandbox or container, listed once; `None` if listing failed.
+        let mut pids: HashMap<RuntimeHandle, Option<HashSet<u32>>> = HashMap::new();
         let ts = now();
         for row in rows {
             let key = row.key();
@@ -407,7 +524,13 @@ impl Tenantd {
             let running = matches!(
                 self.state.get_sandbox(&sk.tenant, &sk.sandbox).await,
                 Ok(Some(s)) if s.state == SandboxState::Running
-            );
+            ) && match row.container_key() {
+                None => true,
+                Some(ck) => matches!(
+                    self.state.get_container(&ck).await,
+                    Ok(Some(c)) if c.state == ContainerState::Running
+                ),
+            };
             let _p = self.process_locks.lock(key.clone()).await;
             let mut rec = match self.state.get_process(&key).await {
                 Ok(Some(r)) if r.state.is_live() => r,
@@ -423,23 +546,28 @@ impl Tenantd {
                     _ => ProcessState::Lost,
                 };
                 match self.finish_process(&mut rec, state, None, None).await {
-                    Ok(()) => rep.act(self, "end_process", &target, "sandbox not running"),
+                    Ok(()) => rep.act(
+                        self,
+                        "end_process",
+                        &target,
+                        "sandbox or container not running",
+                    ),
                     Err(e) => rep.err(&target, e),
                 }
                 continue;
             }
-            let h = RuntimeHandle::for_key(&sk);
-            if !pids.contains_key(&sk) {
+            let h = handle(&rec);
+            if !pids.contains_key(&h) {
                 let listed = match self.runtime.list_processes(&h).await {
                     Ok(v) => Some(v.into_iter().map(|p| p.pid).collect()),
                     Err(e) => {
-                        rep.err(format!("sandbox/{sk}"), e);
+                        rep.err(format!("runtime/{}", h.0), e);
                         None
                     }
                 };
-                pids.insert(sk.clone(), listed);
+                pids.insert(h.clone(), listed);
             }
-            let Some(alive) = &pids[&sk] else { continue };
+            let Some(alive) = &pids[&h] else { continue };
             // In-sandbox PIDs are allocated in sequence and only wrap after
             // the whole PID space, so a listed PID is taken as the same
             // process. (runsc's ps start time is minute-grained.)

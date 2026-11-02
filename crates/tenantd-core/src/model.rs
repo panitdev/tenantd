@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Bytes, ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey, TenantId};
+use crate::{
+    Bytes, ContainerId, ContainerKey, ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey,
+    TenantId,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TenantLimits {
@@ -194,6 +197,66 @@ impl SandboxRecord {
     }
 }
 
+/// The container lifecycle. `Creating` and `Destroying` are intents
+/// recorded before touching the host. A container ends `Exited` when its
+/// init exits or its sandbox stops; it is not restarted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerState {
+    Creating,
+    Running,
+    Exited,
+    Destroying,
+}
+
+impl ContainerState {
+    pub const ALL: [ContainerState; 4] = [
+        Self::Creating,
+        Self::Running,
+        Self::Exited,
+        Self::Destroying,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Destroying => "destroying",
+        }
+    }
+}
+
+/// A container inside a running sandbox: the sandbox's image on its own
+/// writable root, sharing the sandbox's kernel, network and limits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContainerRecord {
+    pub tenant: TenantId,
+    pub sandbox: SandboxId,
+    pub id: ContainerId,
+    /// Its init, as the caller asked; empty runs the image's entrypoint
+    /// and cmd.
+    pub args: Vec<String>,
+    pub state: ContainerState,
+    pub exit_code: Option<i32>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl ContainerRecord {
+    pub fn key(&self) -> ContainerKey {
+        ContainerKey {
+            tenant: self.tenant.clone(),
+            sandbox: self.sandbox.clone(),
+            id: self.id.clone(),
+        }
+    }
+
+    pub fn sandbox_key(&self) -> SandboxKey {
+        SandboxKey::new(self.tenant.clone(), self.sandbox.clone())
+    }
+}
+
 /// A process start as the caller asked for it. Kept on the row so a
 /// repeated start can be compared with the original.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +440,8 @@ pub struct ProcessRecord {
     pub tenant: TenantId,
     pub sandbox: SandboxId,
     pub id: ProcessId,
+    /// The container it runs in; `None` is the sandbox's own.
+    pub container: Option<ContainerId>,
     pub spec: ProcessSpec,
     pub limits: ProcessLimits,
     pub io: ProcessIo,
@@ -404,6 +469,11 @@ impl ProcessRecord {
 
     pub fn sandbox_key(&self) -> SandboxKey {
         SandboxKey::new(self.tenant.clone(), self.sandbox.clone())
+    }
+
+    pub fn container_key(&self) -> Option<ContainerKey> {
+        let c = self.container.clone()?;
+        Some(ContainerKey::new(self.sandbox_key(), c))
     }
 
     pub fn dropped(&self, s: Stream) -> Bytes {

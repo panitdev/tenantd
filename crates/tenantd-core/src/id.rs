@@ -81,6 +81,7 @@ macro_rules! id_type {
 id_type!(TenantId, "tenant");
 id_type!(SandboxId, "sandbox");
 id_type!(ProcessId, "process");
+id_type!(ContainerId, "container");
 
 /// A sandbox is scoped to its tenant. The key renders as `<tenant>.<sandbox>`;
 /// `.` is outside the ID alphabet, so the split is unambiguous.
@@ -143,6 +144,50 @@ impl fmt::Display for ProcessKey {
     }
 }
 
+/// A container is scoped to its sandbox. Renders as `<tenant>.<sandbox>.<id>`,
+/// which is also its runsc container ID.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ContainerKey {
+    pub tenant: TenantId,
+    pub sandbox: SandboxId,
+    pub id: ContainerId,
+}
+
+impl ContainerKey {
+    pub fn new(sandbox: SandboxKey, id: ContainerId) -> Self {
+        Self {
+            tenant: sandbox.tenant,
+            sandbox: sandbox.sandbox,
+            id,
+        }
+    }
+
+    pub fn sandbox_key(&self) -> SandboxKey {
+        SandboxKey::new(self.tenant.clone(), self.sandbox.clone())
+    }
+}
+
+impl fmt::Display for ContainerKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.tenant, self.sandbox, self.id)
+    }
+}
+
+impl FromStr for ContainerKey {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let mut parts = s.split('.');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(t), Some(sb), Some(c), None) => Ok(Self {
+                tenant: t.parse()?,
+                sandbox: sb.parse()?,
+                id: c.parse()?,
+            }),
+            _ => Err(Error::invalid(format!("bad container key {s:?}"))),
+        }
+    }
+}
+
 /// Filesystem project ID. Allocated by tenantd from the configured range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProjectId(pub u32);
@@ -176,5 +221,10 @@ mod tests {
         assert_eq!(k.to_string(), "acme.box-1");
         assert!("acme".parse::<SandboxKey>().is_err());
         assert!("a.b.c".parse::<SandboxKey>().is_err());
+        let c: ContainerKey = "acme.box-1.s1".parse().unwrap();
+        assert_eq!(c.sandbox_key().to_string(), "acme.box-1");
+        assert_eq!(c.to_string(), "acme.box-1.s1");
+        assert!("acme.box-1".parse::<ContainerKey>().is_err());
+        assert!("a.b.c.d".parse::<ContainerKey>().is_err());
     }
 }

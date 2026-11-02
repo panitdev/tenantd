@@ -7,7 +7,9 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{Args, Subcommand};
 use tenantd_client::pb;
-use tenantd_client::{ProcessesClient, SandboxesClient, SystemClient, TenantsClient};
+use tenantd_client::{
+    ContainersClient, ProcessesClient, SandboxesClient, SystemClient, TenantsClient,
+};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::transport::Channel;
 
@@ -39,6 +41,13 @@ pub enum ClientCmd {
         conn: Conn,
         #[command(subcommand)]
         cmd: SandboxCmd,
+    },
+    /// Manage containers inside sandboxes.
+    Container {
+        #[command(flatten)]
+        conn: Conn,
+        #[command(subcommand)]
+        cmd: ContainerCmd,
     },
     /// Run a command in a running sandbox: start it, stream its output and
     /// exit with its exit code (128+n when signal n killed it).
@@ -153,10 +162,41 @@ pub enum SandboxCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum ContainerCmd {
+    /// Start a container from the sandbox's image, inside the running sandbox.
+    Create {
+        tenant: String,
+        sandbox: String,
+        id: String,
+        /// Its init and arguments; default: the image's entrypoint and cmd.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    Get {
+        tenant: String,
+        sandbox: String,
+        id: String,
+    },
+    List {
+        tenant: String,
+        sandbox: String,
+    },
+    /// End its processes and remove it and its root.
+    Rm {
+        tenant: String,
+        sandbox: String,
+        id: String,
+    },
+}
+
 #[derive(Args)]
 pub struct ExecArgs {
     pub tenant: String,
     pub sandbox: String,
+    /// Run in this container of the sandbox; default: the sandbox's own.
+    #[arg(long, short)]
+    pub container: Option<String>,
     /// Process ID; generated when omitted. Starting the same ID again with
     /// the same command returns the existing process.
     #[arg(long)]
@@ -361,6 +401,7 @@ async fn exec(ch: Channel, a: ExecArgs) -> anyhow::Result<()> {
             user: a.user.unwrap_or_default(),
             tty: false,
             stdin: false,
+            container: a.container.unwrap_or_default(),
         })
         .await?
         .into_inner();
@@ -523,6 +564,14 @@ fn print_sandbox(s: &pb::Sandbox) {
     );
 }
 
+fn print_container(c: &pb::Container) {
+    let exit = c
+        .exit_code
+        .map(|c| format!(" (exit {c})"))
+        .unwrap_or_default();
+    println!("{}.{}.{:<20} {}{exit}", c.tenant, c.sandbox, c.id, c.state);
+}
+
 fn event_json(e: pb::Event) -> serde_json::Value {
     use pb::event::Kind;
     use serde_json::json;
@@ -538,6 +587,10 @@ fn event_json(e: pb::Event) -> serde_json::Value {
             json!({"type": "process_exited", "tenant": x.tenant, "sandbox": x.sandbox, "id": x.id,
                    "exit_code": x.exit_code, "signal": signal,
                    "stdout_dropped": x.stdout_dropped, "stderr_dropped": x.stderr_dropped})
+        }
+        Some(Kind::ContainerExited(x)) => {
+            json!({"type": "container_exited", "tenant": x.tenant, "sandbox": x.sandbox, "id": x.id,
+                   "exit_code": x.exit_code})
         }
         Some(Kind::QuotaExceeded(x)) => {
             json!({"type": "quota_exceeded", "tenant": x.tenant, "used_bytes": x.used_bytes, "limit_bytes": x.limit_bytes})
@@ -556,6 +609,7 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
     let socket = match &cmd {
         ClientCmd::Tenant { conn, .. }
         | ClientCmd::Sandbox { conn, .. }
+        | ClientCmd::Container { conn, .. }
         | ClientCmd::Exec { conn, .. }
         | ClientCmd::Process { conn, .. }
         | ClientCmd::Health { conn }
@@ -654,6 +708,51 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                 SandboxCmd::Destroy { tenant, id } => {
                     s.destroy_sandbox(r(tenant.clone(), id.clone())).await?;
                     println!("destroyed {tenant}.{id}");
+                }
+            }
+        }
+        ClientCmd::Container { cmd: c, .. } => {
+            let mut k = ContainersClient::new(ch);
+            let r = |tenant, sandbox, id| pb::ContainerRef {
+                tenant,
+                sandbox,
+                id,
+            };
+            match c {
+                ContainerCmd::Create {
+                    tenant,
+                    sandbox,
+                    id,
+                    args,
+                } => {
+                    let req = pb::CreateContainerRequest {
+                        tenant,
+                        sandbox,
+                        id,
+                        args,
+                    };
+                    print_container(&k.create_container(req).await?.into_inner())
+                }
+                ContainerCmd::Get {
+                    tenant,
+                    sandbox,
+                    id,
+                } => print_container(&k.get_container(r(tenant, sandbox, id)).await?.into_inner()),
+                ContainerCmd::List { tenant, sandbox } => k
+                    .list_containers(pb::ListContainersRequest { tenant, sandbox })
+                    .await?
+                    .into_inner()
+                    .containers
+                    .iter()
+                    .for_each(print_container),
+                ContainerCmd::Rm {
+                    tenant,
+                    sandbox,
+                    id,
+                } => {
+                    k.delete_container(r(tenant.clone(), sandbox.clone(), id.clone()))
+                        .await?;
+                    println!("deleted {tenant}.{sandbox}.{id}");
                 }
             }
         }
