@@ -27,7 +27,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use tenantd_core::backend::{
-    NetAttachment, ProcInfo, RootfsSpec, RuntimeBackend, RuntimeEvent, RuntimeHandle, RuntimeState,
+    BindMount, NetAttachment, ProcInfo, RootfsSpec, RuntimeBackend, RuntimeEvent, RuntimeHandle,
+    RuntimeState,
 };
 use tenantd_core::config::{RuntimeConfig, RuntimeKind};
 use tenantd_core::error::Context;
@@ -395,13 +396,14 @@ impl RuntimeBackend for RunscRuntime {
         c: &ContainerKey,
         args: &[String],
         root: &RootfsSpec,
+        mounts: &[BindMount],
         net: &NetAttachment,
     ) -> Result<RuntimeHandle> {
         let h = RuntimeHandle::for_container(c);
         let sandbox = RuntimeHandle::for_key(&s.key);
         let bundle = self.make_bundle(&h)?;
         let files = self.write_bundle_files(s, &bundle).await?;
-        let oci = spec::build_container(s, &sandbox.0, args, root, net, &files)?;
+        let oci = spec::build_container(s, &sandbox.0, args, root, mounts, net, &files)?;
         self.create_from(&h, &bundle, &oci, root).await?;
         info!(container = h.0, "runsc container created in its sandbox");
         Ok(h)

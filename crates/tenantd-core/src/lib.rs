@@ -19,10 +19,12 @@ pub mod reconcile;
 pub mod service;
 pub mod size;
 pub mod state;
+pub mod volume;
 
 pub use error::{Error, Result};
 pub use id::{
-    ContainerId, ContainerKey, ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey, TenantId,
+    ContainerId, ContainerKey, ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey, SlotName,
+    TenantId, VolumeId, VolumeKey,
 };
 pub use service::{Backends, Tenantd};
 

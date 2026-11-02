@@ -10,8 +10,13 @@
 //!
 //! Lowerdirs only ever come from the image cache, and every path is built
 //! from validated IDs under the storage root.
+//!
+//! The crate also holds the other host directories tenantd manages:
+//! volumes ([`HostVolumes`]) and containers' FUSE mounts ([`HostFuse`]).
 
+mod fuse;
 mod mount;
+mod volume;
 
 use std::fs;
 use std::io;
@@ -29,7 +34,9 @@ use tenantd_core::model::{LayerKind, ResolvedSandbox};
 use tenantd_core::{ContainerId, Error, Result, SandboxId};
 use tracing::info;
 
+pub use fuse::HostFuse;
 pub use mount::{is_mountpoint, mounts_under};
+pub use volume::HostVolumes;
 
 const RUNSC: &[RuntimeKind] = &[RuntimeKind::RunscDirect];
 
@@ -43,7 +50,9 @@ pub fn container_dir(tenant_dir: &Path, s: &SandboxId, c: &ContainerId) -> PathB
         .join(c.as_str())
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| Error::internal("layer task", e))?

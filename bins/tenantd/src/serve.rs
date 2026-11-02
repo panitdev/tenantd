@@ -14,6 +14,7 @@ use futures::Stream;
 use tenantd_client::pb::{
     containers_server::ContainersServer, processes_server::ProcessesServer,
     sandboxes_server::SandboxesServer, system_server::SystemServer, tenants_server::TenantsServer,
+    volumes_server::VolumesServer,
 };
 use tenantd_core::config::{Config, RuntimeKind, StorageKind};
 use tenantd_core::state::StateStore;
@@ -93,6 +94,8 @@ fn build_backends(cfg: &Config, state: Arc<dyn StateStore>) -> anyhow::Result<Ba
         )),
         network: Arc::new(tenantd_net::CniNetwork::new(cfg.network.clone())),
         output: Arc::new(tenantd_output::FileOutput::new()),
+        volumes: Arc::new(tenantd_layer::HostVolumes),
+        fuse: Arc::new(tenantd_layer::HostFuse::new(&cfg.runtime.fuse_dir)),
         state,
     })
 }
@@ -115,24 +118,29 @@ fn bind_socket(path: &Path, gid: Option<u32>) -> anyhow::Result<UnixListener> {
     Ok(l)
 }
 
-/// Accepted connections whose peer (by `SO_PEERCRED`) is root or a listed
-/// caller UID. Everything else is dropped before a byte is read.
+/// Whether the peer (by `SO_PEERCRED`) is root or a listed caller UID.
+pub fn peer_allowed(s: &UnixStream, allowed: &HashSet<u32>) -> bool {
+    match s.peer_cred() {
+        Ok(c) if c.uid() == 0 || allowed.contains(&c.uid()) => true,
+        Ok(c) => {
+            warn!(uid = c.uid(), pid = ?c.pid(), "refused connection from unlisted uid");
+            false
+        }
+        Err(e) => {
+            warn!(error = %e, "refused connection: no peer credentials");
+            false
+        }
+    }
+}
+
+/// Accepted connections whose peer is allowed. Everything else is dropped
+/// before a byte is read.
 fn authorized(
     l: UnixListener,
     allowed: Arc<HashSet<u32>>,
 ) -> impl Stream<Item = std::io::Result<UnixStream>> {
     UnixListenerStream::new(l).filter_map(move |conn| match conn {
-        Ok(s) => match s.peer_cred() {
-            Ok(c) if c.uid() == 0 || allowed.contains(&c.uid()) => Some(Ok(s)),
-            Ok(c) => {
-                warn!(uid = c.uid(), pid = ?c.pid(), "refused connection from unlisted uid");
-                None
-            }
-            Err(e) => {
-                warn!(error = %e, "refused connection: no peer credentials");
-                None
-            }
-        },
+        Ok(s) => peer_allowed(&s, &allowed).then_some(Ok(s)),
         Err(e) => {
             warn!(error = %e, "accept failed");
             None
@@ -150,6 +158,7 @@ async fn serve_api(
         .add_service(TenantsServer::new(api.clone()))
         .add_service(SandboxesServer::new(api.clone()))
         .add_service(ContainersServer::new(api.clone()))
+        .add_service(VolumesServer::new(api.clone()))
         .add_service(ProcessesServer::new(api.clone()))
         .add_service(SystemServer::new(api))
         .serve_with_incoming_shutdown(authorized(l, Arc::new(allowed)), shutdown)
@@ -233,7 +242,13 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     let listener = bind_socket(&cfg.server.socket, cfg.server.socket_gid)?;
     let allowed: HashSet<u32> = cfg.server.callers.iter().map(|c| c.uid).collect();
-    info!(socket = %cfg.server.socket.display(), callers = ?allowed, "tenantd serving");
+    let fuse_listener = bind_socket(&cfg.server.fuse_socket, cfg.server.socket_gid)?;
+    tokio::spawn(crate::fuse_socket::serve(
+        fuse_listener,
+        Arc::new(allowed.clone()),
+        tenantd.clone(),
+    ));
+    info!(socket = %cfg.server.socket.display(), fuse_socket = %cfg.server.fuse_socket.display(), callers = ?allowed, "tenantd serving");
     let mut term = signal(SignalKind::terminate())?;
     let shutdown = async move {
         tokio::select! {
@@ -244,6 +259,7 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
     };
     serve_api(listener, allowed, Api { tenantd, metrics }, shutdown).await?;
     let _ = std::fs::remove_file(&cfg.server.socket);
+    let _ = std::fs::remove_file(&cfg.server.fuse_socket);
     Ok(())
 }
 
@@ -441,7 +457,7 @@ mod tests {
                 tenant: "acme".into(),
                 sandbox: "box".into(),
                 id: "s1".into(),
-                args: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -464,7 +480,7 @@ mod tests {
                 tenant: "acme".into(),
                 sandbox: "box".into(),
                 id: "Bad".into(),
-                args: vec![],
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -494,6 +510,160 @@ mod tests {
             containers.get_container(r).await.unwrap_err().code(),
             tonic::Code::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn volumes_and_fuse_over_unix_sockets() {
+        use tenantd_core::backend::FuseBackend;
+        let (d, sock, host, tenantd) = start(HashSet::from([me()])).await;
+        let fuse_sock = d.path().join("fuse.sock");
+        let l = bind_socket(&fuse_sock, None).unwrap();
+        tokio::spawn(crate::fuse_socket::serve(
+            l,
+            Arc::new(HashSet::from([me()])),
+            tenantd,
+        ));
+        let ch = tenantd_client::connect(&sock).await.unwrap();
+        tenantd_client::TenantsClient::new(ch.clone())
+            .create_tenant(pb::CreateTenantRequest {
+                id: "acme".into(),
+                limits: Some(pb::TenantLimits {
+                    storage_bytes: 1 << 30,
+                    cpus: None,
+                    memory_bytes: None,
+                }),
+            })
+            .await
+            .unwrap();
+        tenantd_client::SandboxesClient::new(ch.clone())
+            .create_sandbox(pb::CreateSandboxRequest {
+                tenant: "acme".into(),
+                id: "box".into(),
+                profile: "default".into(),
+                image: "alpine".into(),
+                overrides: None,
+            })
+            .await
+            .unwrap();
+
+        let mut volumes = tenantd_client::VolumesClient::new(ch.clone());
+        let v = volumes
+            .create_volume(pb::CreateVolumeRequest {
+                tenant: "acme".into(),
+                id: "ws".into(),
+                uid: Some(1000),
+                gid: Some(1000),
+                mode: Some(0o1777),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((v.state.as_str(), v.uid, v.mode), ("ready", 1000, 0o1777));
+        assert_eq!(v.path, "/data/tenants/acme/volumes/ws");
+        let denied = volumes
+            .create_volume(pb::CreateVolumeRequest {
+                tenant: "acme".into(),
+                id: "x".into(),
+                uid: Some(4242),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            denied.metadata().get(api::RULE_METADATA).unwrap(),
+            "server.callers"
+        );
+
+        let mut containers = tenantd_client::ContainersClient::new(ch.clone());
+        let r = pb::ContainerRef {
+            tenant: "acme".into(),
+            sandbox: "box".into(),
+            id: "s1".into(),
+        };
+        let c = containers
+            .create_container(pb::CreateContainerRequest {
+                tenant: "acme".into(),
+                sandbox: "box".into(),
+                id: "s1".into(),
+                volumes: [("workspace".to_string(), "ws".to_string())].into(),
+                fuse: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(c.state, "created");
+        assert_eq!(c.fuse_path, "/mnt");
+        assert_eq!(c.volumes[0].path, "/workspace");
+        assert_eq!(
+            containers
+                .start_container(r.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        // The fd that comes over the FUSE socket is the connection held.
+        let attach = |c: &'static str| {
+            let s = fuse_sock.clone();
+            tokio::task::spawn_blocking(move || {
+                tenantd_client::fuse::attach_fuse(&s, "acme", "box", c)
+            })
+        };
+        let fd = attach("s1").await.unwrap().unwrap();
+        let k: tenantd_core::ContainerKey = "acme.box.s1".parse().unwrap();
+        let held = host.fuse.connection(&k).unwrap().unwrap();
+        assert!(tenantd_testkit::same_file(&fd, &held));
+        let e = attach("nope").await.unwrap().unwrap_err();
+        let e = e
+            .into_inner()
+            .unwrap()
+            .downcast::<tenantd_client::fuse::AttachError>()
+            .unwrap();
+        assert_eq!(e.code, "NOT_FOUND");
+        let e = attach("BAD").await.unwrap().unwrap_err();
+        assert!(e.to_string().contains("invalid_argument"), "{e}");
+
+        let c = containers
+            .start_container(r.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(c.state, "running");
+        assert_eq!(
+            volumes
+                .delete_volume(pb::VolumeRef {
+                    tenant: "acme".into(),
+                    id: "ws".into(),
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        containers.delete_container(r).await.unwrap();
+        assert!(!host.fuse.is_mounted(&k));
+        let rep = volumes
+            .prune_volume(pb::PruneVolumeRequest {
+                volume: Some(pb::VolumeRef {
+                    tenant: "acme".into(),
+                    id: "ws".into(),
+                }),
+                path_prefix: "../etc".into(),
+                older_than_secs: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(rep.code(), tonic::Code::InvalidArgument);
+        volumes
+            .delete_volume(pb::VolumeRef {
+                tenant: "acme".into(),
+                id: "ws".into(),
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

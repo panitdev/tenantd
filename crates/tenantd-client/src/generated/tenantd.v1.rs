@@ -146,7 +146,7 @@ pub struct Sandbox {
     #[prost(int64, tag = "13")]
     pub updated_at: i64,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateContainerRequest {
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
@@ -158,6 +158,15 @@ pub struct CreateContainerRequest {
     /// the profile's exec rights and runs as the image user. No shell is implied.
     #[prost(string, repeated, tag = "4")]
     pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Slot name -> volume ID. Slots marked required must be bound.
+    #[prost(map = "string, string", tag = "5")]
+    pub volumes: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+    /// Mount the profile's FUSE slot; the container then waits "created".
+    #[prost(bool, tag = "6")]
+    pub fuse: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContainerRef {
@@ -182,7 +191,7 @@ pub struct ListContainersResponse {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteContainerResponse {}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Container {
     #[prost(string, tag = "1")]
     pub tenant: ::prost::alloc::string::String,
@@ -190,7 +199,7 @@ pub struct Container {
     pub sandbox: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub id: ::prost::alloc::string::String,
-    /// creating | running | exited | destroying
+    /// creating | created | running | exited | destroying
     #[prost(string, tag = "4")]
     pub state: ::prost::alloc::string::String,
     #[prost(int32, optional, tag = "5")]
@@ -202,6 +211,98 @@ pub struct Container {
     /// empty: the image's entrypoint and cmd
     #[prost(string, repeated, tag = "8")]
     pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "9")]
+    pub volumes: ::prost::alloc::vec::Vec<VolumeMount>,
+    /// where its FUSE slot is mounted; "" = none
+    #[prost(string, tag = "10")]
+    pub fuse_path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VolumeMount {
+    #[prost(string, tag = "1")]
+    pub slot: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    /// inside the container
+    #[prost(string, tag = "3")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub read_only: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateVolumeRequest {
+    #[prost(string, tag = "1")]
+    pub tenant: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub id: ::prost::alloc::string::String,
+    /// default 0
+    #[prost(uint32, optional, tag = "3")]
+    pub uid: ::core::option::Option<u32>,
+    /// default 0
+    #[prost(uint32, optional, tag = "4")]
+    pub gid: ::core::option::Option<u32>,
+    /// default 0755
+    #[prost(uint32, optional, tag = "5")]
+    pub mode: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VolumeRef {
+    #[prost(string, tag = "1")]
+    pub tenant: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListVolumesRequest {
+    #[prost(string, tag = "1")]
+    pub tenant: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListVolumesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub volumes: ::prost::alloc::vec::Vec<Volume>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteVolumeResponse {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PruneVolumeRequest {
+    #[prost(message, optional, tag = "1")]
+    pub volume: ::core::option::Option<VolumeRef>,
+    /// relative to the volume; "" = all of it
+    #[prost(string, tag = "2")]
+    pub path_prefix: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub older_than_secs: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PruneVolumeResponse {
+    #[prost(uint64, tag = "1")]
+    pub removed_entries: u64,
+    #[prost(uint64, tag = "2")]
+    pub removed_bytes: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Volume {
+    #[prost(string, tag = "1")]
+    pub tenant: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub id: ::prost::alloc::string::String,
+    /// creating | ready | deleting
+    #[prost(string, tag = "3")]
+    pub state: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "4")]
+    pub uid: u32,
+    #[prost(uint32, tag = "5")]
+    pub gid: u32,
+    #[prost(uint32, tag = "6")]
+    pub mode: u32,
+    /// on the host
+    #[prost(string, tag = "7")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub created_at: i64,
+    #[prost(int64, tag = "9")]
+    pub updated_at: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StartProcessRequest {
@@ -1805,6 +1906,26 @@ pub mod containers_client {
     /// network and limits, so many of them cost one sandbox. A container is never
     /// restarted: it ends "exited" when its init exits or its sandbox stops, and
     /// keeps its root until deleted.
+    ///
+    /// A container mounts the tenant's volumes only through the slots its
+    /// profile declares, bound at create; changing a binding means recreating
+    /// it. A container asking for the profile's FUSE slot gets a FUSE mount
+    /// whose server is the caller: it is created "created" and waits there.
+    /// The caller then takes the mount's /dev/fuse connection over the FUSE
+    /// socket (server.fuse_socket, see below), serves it, and calls
+    /// StartContainer. tenantd never runs filesystem code.
+    ///
+    /// AttachFuse is not a gRPC call, since an fd can't cross HTTP/2. Connect
+    /// to the FUSE socket (same callers as this one), send one line
+    /// attach-fuse <tenant> <sandbox> <container>\\n
+    /// and read one line back: "ok\n" with the fd attached (SCM_RIGHTS), or
+    /// "err <code> <message>\\n" with a gRPC code name such as NOT_FOUND. Each
+    /// attach hands out the same connection, so a server that restarts can
+    /// attach again; it then finds the connection already initialised (no
+    /// FUSE_INIT comes). tenantd keeps the connection open until the container
+    /// ends, so requests queue rather than fail while no server reads them.
+    /// A tenantd restart loses it: a "created" container gets a fresh one, a
+    /// running one must be recreated to get one again.
     #[derive(Debug, Clone)]
     pub struct ContainersClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -1886,7 +2007,7 @@ pub mod containers_client {
             self
         }
         /// Idempotent on (tenant, sandbox, id), like every create. The sandbox
-        /// must be running.
+        /// must be running, and bound volumes ready.
         pub async fn create_container(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateContainerRequest>,
@@ -1906,6 +2027,29 @@ pub mod containers_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("tenantd.v1.Containers", "CreateContainer"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Runs a "created" container, once its FUSE server has attached.
+        /// Starting a running one returns it; an exited one never restarts.
+        pub async fn start_container(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ContainerRef>,
+        ) -> std::result::Result<tonic::Response<super::Container>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Containers/StartContainer",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tenantd.v1.Containers", "StartContainer"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_container(
@@ -1995,10 +2139,16 @@ pub mod containers_server {
     #[async_trait]
     pub trait Containers: std::marker::Send + std::marker::Sync + 'static {
         /// Idempotent on (tenant, sandbox, id), like every create. The sandbox
-        /// must be running.
+        /// must be running, and bound volumes ready.
         async fn create_container(
             &self,
             request: tonic::Request<super::CreateContainerRequest>,
+        ) -> std::result::Result<tonic::Response<super::Container>, tonic::Status>;
+        /// Runs a "created" container, once its FUSE server has attached.
+        /// Starting a running one returns it; an exited one never restarts.
+        async fn start_container(
+            &self,
+            request: tonic::Request<super::ContainerRef>,
         ) -> std::result::Result<tonic::Response<super::Container>, tonic::Status>;
         async fn get_container(
             &self,
@@ -2026,6 +2176,26 @@ pub mod containers_server {
     /// network and limits, so many of them cost one sandbox. A container is never
     /// restarted: it ends "exited" when its init exits or its sandbox stops, and
     /// keeps its root until deleted.
+    ///
+    /// A container mounts the tenant's volumes only through the slots its
+    /// profile declares, bound at create; changing a binding means recreating
+    /// it. A container asking for the profile's FUSE slot gets a FUSE mount
+    /// whose server is the caller: it is created "created" and waits there.
+    /// The caller then takes the mount's /dev/fuse connection over the FUSE
+    /// socket (server.fuse_socket, see below), serves it, and calls
+    /// StartContainer. tenantd never runs filesystem code.
+    ///
+    /// AttachFuse is not a gRPC call, since an fd can't cross HTTP/2. Connect
+    /// to the FUSE socket (same callers as this one), send one line
+    /// attach-fuse <tenant> <sandbox> <container>\\n
+    /// and read one line back: "ok\n" with the fd attached (SCM_RIGHTS), or
+    /// "err <code> <message>\\n" with a gRPC code name such as NOT_FOUND. Each
+    /// attach hands out the same connection, so a server that restarts can
+    /// attach again; it then finds the connection already initialised (no
+    /// FUSE_INIT comes). tenantd keeps the connection open until the container
+    /// ends, so requests queue rather than fail while no server reads them.
+    /// A tenantd restart loses it: a "created" container gets a fresh one, a
+    /// running one must be recreated to get one again.
     #[derive(Debug)]
     pub struct ContainersServer<T> {
         inner: Arc<T>,
@@ -2132,6 +2302,49 @@ pub mod containers_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CreateContainerSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Containers/StartContainer" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartContainerSvc<T: Containers>(pub Arc<T>);
+                    impl<T: Containers> tonic::server::UnaryService<super::ContainerRef>
+                    for StartContainerSvc<T> {
+                        type Response = super::Container;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ContainerRef>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Containers>::start_container(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartContainerSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -3066,6 +3279,615 @@ pub mod processes_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "tenantd.v1.Processes";
     impl<T> tonic::server::NamedService for ProcessesServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod volumes_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// Volumes: durable directories in a tenant's quota, the only state that
+    /// outlives a container. Containers mount them through their profile's
+    /// slots; callers on the host use them at their path.
+    #[derive(Debug, Clone)]
+    pub struct VolumesClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl VolumesClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> VolumesClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> VolumesClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            VolumesClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// Idempotent on (tenant, id), like every create. The owner must be root
+        /// or a caller UID; mode takes permission and sticky bits only.
+        pub async fn create_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateVolumeRequest>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Volumes/CreateVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tenantd.v1.Volumes", "CreateVolume"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::VolumeRef>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Volumes/GetVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tenantd.v1.Volumes", "GetVolume"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_volumes(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListVolumesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListVolumesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Volumes/ListVolumes",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tenantd.v1.Volumes", "ListVolumes"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Removes it and everything in it. Fails while a container (even an
+        /// exited one) binds it.
+        pub async fn delete_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::VolumeRef>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteVolumeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Volumes/DeleteVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tenantd.v1.Volumes", "DeleteVolume"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Removes what is at or below path_prefix and has not been accessed,
+        /// modified or changed for older_than_secs (0: all of it). Directories go
+        /// once empty; the volume itself stays. Symlinks are removed, never
+        /// followed, and mounts are not entered.
+        pub async fn prune_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PruneVolumeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PruneVolumeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Volumes/PruneVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tenantd.v1.Volumes", "PruneVolume"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod volumes_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with VolumesServer.
+    #[async_trait]
+    pub trait Volumes: std::marker::Send + std::marker::Sync + 'static {
+        /// Idempotent on (tenant, id), like every create. The owner must be root
+        /// or a caller UID; mode takes permission and sticky bits only.
+        async fn create_volume(
+            &self,
+            request: tonic::Request<super::CreateVolumeRequest>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status>;
+        async fn get_volume(
+            &self,
+            request: tonic::Request<super::VolumeRef>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status>;
+        async fn list_volumes(
+            &self,
+            request: tonic::Request<super::ListVolumesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListVolumesResponse>,
+            tonic::Status,
+        >;
+        /// Removes it and everything in it. Fails while a container (even an
+        /// exited one) binds it.
+        async fn delete_volume(
+            &self,
+            request: tonic::Request<super::VolumeRef>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteVolumeResponse>,
+            tonic::Status,
+        >;
+        /// Removes what is at or below path_prefix and has not been accessed,
+        /// modified or changed for older_than_secs (0: all of it). Directories go
+        /// once empty; the volume itself stays. Symlinks are removed, never
+        /// followed, and mounts are not entered.
+        async fn prune_volume(
+            &self,
+            request: tonic::Request<super::PruneVolumeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PruneVolumeResponse>,
+            tonic::Status,
+        >;
+    }
+    /// Volumes: durable directories in a tenant's quota, the only state that
+    /// outlives a container. Containers mount them through their profile's
+    /// slots; callers on the host use them at their path.
+    #[derive(Debug)]
+    pub struct VolumesServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> VolumesServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for VolumesServer<T>
+    where
+        T: Volumes,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/tenantd.v1.Volumes/CreateVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateVolumeSvc<T: Volumes>(pub Arc<T>);
+                    impl<
+                        T: Volumes,
+                    > tonic::server::UnaryService<super::CreateVolumeRequest>
+                    for CreateVolumeSvc<T> {
+                        type Response = super::Volume;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateVolumeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Volumes>::create_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Volumes/GetVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetVolumeSvc<T: Volumes>(pub Arc<T>);
+                    impl<T: Volumes> tonic::server::UnaryService<super::VolumeRef>
+                    for GetVolumeSvc<T> {
+                        type Response = super::Volume;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::VolumeRef>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Volumes>::get_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Volumes/ListVolumes" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListVolumesSvc<T: Volumes>(pub Arc<T>);
+                    impl<
+                        T: Volumes,
+                    > tonic::server::UnaryService<super::ListVolumesRequest>
+                    for ListVolumesSvc<T> {
+                        type Response = super::ListVolumesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListVolumesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Volumes>::list_volumes(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListVolumesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Volumes/DeleteVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteVolumeSvc<T: Volumes>(pub Arc<T>);
+                    impl<T: Volumes> tonic::server::UnaryService<super::VolumeRef>
+                    for DeleteVolumeSvc<T> {
+                        type Response = super::DeleteVolumeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::VolumeRef>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Volumes>::delete_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Volumes/PruneVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct PruneVolumeSvc<T: Volumes>(pub Arc<T>);
+                    impl<
+                        T: Volumes,
+                    > tonic::server::UnaryService<super::PruneVolumeRequest>
+                    for PruneVolumeSvc<T> {
+                        type Response = super::PruneVolumeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PruneVolumeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Volumes>::prune_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PruneVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for VolumesServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "tenantd.v1.Volumes";
+    impl<T> tonic::server::NamedService for VolumesServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

@@ -4,8 +4,8 @@
 use crate::backend::LayerTraits;
 use crate::config::{Config, Profile};
 use crate::model::{
-    LayerKind, NetworkMode, Overrides, ProcessLimits, ProcessSpec, ResolvedImage, ResolvedProcess,
-    ResolvedSandbox, SandboxRecord, TenantRecord,
+    ContainerSpec, LayerKind, NetworkMode, Overrides, ProcessLimits, ProcessSpec, ResolvedImage,
+    ResolvedProcess, ResolvedSandbox, SandboxRecord, TenantRecord, VolumeMount, VolumeOwner,
 };
 use crate::{Bytes, Error, ProcessKey, Result, SandboxKey};
 
@@ -228,6 +228,76 @@ pub fn check_container_args(cfg: &Config, sandbox: &SandboxRecord, args: &[Strin
         ));
     }
     Ok(())
+}
+
+/// A volume's root may be owned by root or a caller UID (`server.callers`),
+/// so a volume can be handed to the control plane on the host but never to
+/// an arbitrary host user. No setuid or setgid bits.
+pub fn check_volume_owner(cfg: &Config, o: &VolumeOwner) -> Result<()> {
+    let allowed = |id: u32| id == 0 || cfg.server.callers.iter().any(|c| c.uid == id);
+    if !allowed(o.uid) || !allowed(o.gid) {
+        return Err(Error::denied(
+            "server.callers",
+            format!(
+                "volume owner {}:{} must be root or a caller uid",
+                o.uid, o.gid
+            ),
+        ));
+    }
+    if o.mode & !0o1777 != 0 {
+        return Err(Error::invalid(format!(
+            "volume mode {:o} may only use the permission and sticky bits",
+            o.mode
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a container's slot bindings and FUSE request against its
+/// sandbox's profile in the *current* config. Returns the volume mounts in
+/// slot order and the FUSE mount path, for the container's row.
+pub fn plan_container_mounts(
+    cfg: &Config,
+    sandbox: &SandboxRecord,
+    spec: &ContainerSpec,
+) -> Result<(Vec<VolumeMount>, Option<String>)> {
+    let name = &sandbox.profile;
+    let p = cfg.profile(name)?;
+    let mut mounts = Vec::with_capacity(spec.volumes.len());
+    for (slot, volume) in &spec.volumes {
+        let s = p.volumes.get(slot.as_str()).ok_or_else(|| {
+            Error::denied(
+                format!("profiles.{name}.volumes"),
+                format!("profile has no volume slot {slot:?}"),
+            )
+        })?;
+        mounts.push(VolumeMount {
+            slot: slot.clone(),
+            volume: volume.clone(),
+            path: s.path.clone(),
+            read_only: s.read_only,
+        });
+    }
+    if let Some((slot, _)) = p
+        .volumes
+        .iter()
+        .find(|(slot, s)| s.required && !spec.volumes.keys().any(|k| k.as_str() == *slot))
+    {
+        return Err(Error::invalid(format!(
+            "volume slot {slot:?} of profile {name} must be bound"
+        )));
+    }
+    let fuse = match (&p.fuse, spec.fuse) {
+        (_, false) => None,
+        (Some(f), true) => Some(f.path.clone()),
+        (None, true) => {
+            return Err(Error::denied(
+                format!("profiles.{name}.fuse"),
+                "profile has no FUSE slot",
+            ));
+        }
+    };
+    Ok((mounts, fuse))
 }
 
 /// Resolve a process start against the sandbox and the exec policy of its

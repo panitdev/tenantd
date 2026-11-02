@@ -11,12 +11,12 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use tenantd_core::model::{
     ContainerRecord, ContainerState, Overrides, ProcessIo, ProcessLimits, ProcessRecord,
     ProcessSpec, ProcessState, ProcessTombstone, ResolvedSandbox, SandboxRecord, SandboxState,
-    TenantLimits, TenantRecord, TenantState,
+    TenantLimits, TenantRecord, TenantState, VolumeRecord, VolumeState,
 };
 use tenantd_core::state::StateStore;
 use tenantd_core::{
     ContainerId, ContainerKey, Error, ProcessId, ProcessKey, ProjectId, Result, SandboxId,
-    SandboxKey, TenantId, now,
+    SandboxKey, TenantId, VolumeId, now,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -86,6 +86,18 @@ const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (tenant_id, sandbox_id) REFERENCES sandboxes(tenant_id, id)
     );
     ALTER TABLE processes ADD COLUMN container_id TEXT;",
+    // 4
+    "CREATE TABLE volumes (
+        tenant_id  TEXT NOT NULL REFERENCES tenants(id),
+        id         TEXT NOT NULL,
+        owner      TEXT NOT NULL,
+        state      TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, id)
+    );
+    ALTER TABLE containers ADD COLUMN volumes TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE containers ADD COLUMN fuse TEXT;",
 ];
 
 #[derive(Clone)]
@@ -241,7 +253,7 @@ fn process_row(r: &Row) -> rusqlite::Result<ProcessRecord> {
 }
 
 const CONTAINER_COLS: &str =
-    "tenant_id, sandbox_id, id, args, state, exit_code, created_at, updated_at";
+    "tenant_id, sandbox_id, id, args, state, exit_code, created_at, updated_at, volumes, fuse";
 
 fn container_row(r: &Row) -> rusqlite::Result<ContainerRecord> {
     let state: ContainerState =
@@ -255,6 +267,23 @@ fn container_row(r: &Row) -> rusqlite::Result<ContainerRecord> {
         exit_code: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        volumes: decode(&r.get::<_, String>(8)?)?,
+        fuse: r.get(9)?,
+    })
+}
+
+const VOLUME_COLS: &str = "tenant_id, id, owner, state, created_at, updated_at";
+
+fn volume_row(r: &Row) -> rusqlite::Result<VolumeRecord> {
+    let state: VolumeState =
+        serde_json::from_value(serde_json::Value::String(r.get(3)?)).map_err(conv)?;
+    Ok(VolumeRecord {
+        tenant: TenantId::new(r.get::<_, String>(0)?).map_err(conv)?,
+        id: VolumeId::new(r.get::<_, String>(1)?).map_err(conv)?,
+        owner: decode(&r.get::<_, String>(2)?)?,
+        state,
+        created_at: r.get(4)?,
+        updated_at: r.get(5)?,
     })
 }
 
@@ -397,7 +426,9 @@ impl StateStore for SqliteState {
             c.execute("DELETE FROM tenants WHERE id = ?1", [id.as_str()])
                 .map_err(|e| {
                     if is_constraint(&e) {
-                        Error::FailedPrecondition(format!("tenant {id} still has sandboxes"))
+                        Error::FailedPrecondition(format!(
+                            "tenant {id} still has sandboxes or volumes"
+                        ))
                     } else {
                         db(e)
                     }
@@ -525,12 +556,12 @@ impl StateStore for SqliteState {
 
     async fn insert_container(&self, rec: &ContainerRecord) -> Result<()> {
         let rec = rec.clone();
-        let args = json(&rec.args)?;
+        let (args, volumes) = (json(&rec.args)?, json(&rec.volumes)?);
         self.run(move |c| {
             c.execute(
                 &format!(
                     "INSERT INTO containers ({CONTAINER_COLS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
                 ),
                 params![
                     rec.tenant.as_str(),
@@ -540,7 +571,9 @@ impl StateStore for SqliteState {
                     rec.state.as_str(),
                     rec.exit_code,
                     rec.created_at,
-                    rec.updated_at
+                    rec.updated_at,
+                    volumes,
+                    rec.fuse
                 ],
             )
             .map_err(|e| {
@@ -637,6 +670,112 @@ impl StateStore for SqliteState {
                 k,
             )
             .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn insert_volume(&self, rec: &VolumeRecord) -> Result<()> {
+        let rec = rec.clone();
+        let owner = json(&rec.owner)?;
+        self.run(move |c| {
+            c.execute(
+                &format!("INSERT INTO volumes ({VOLUME_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"),
+                params![
+                    rec.tenant.as_str(),
+                    rec.id.as_str(),
+                    owner,
+                    rec.state.as_str(),
+                    rec.created_at,
+                    rec.updated_at
+                ],
+            )
+            .map_err(|e| {
+                if is_constraint(&e) {
+                    Error::AlreadyExists(format!("volume {}", rec.key()))
+                } else {
+                    db(e)
+                }
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_volume(&self, t: &TenantId, v: &VolumeId) -> Result<Option<VolumeRecord>> {
+        let k = [t.to_string(), v.to_string()];
+        self.run(move |c| {
+            c.query_row(
+                &format!("SELECT {VOLUME_COLS} FROM volumes WHERE tenant_id = ?1 AND id = ?2"),
+                k,
+                volume_row,
+            )
+            .optional()
+            .map_err(db)
+        })
+        .await
+    }
+
+    async fn list_volumes(&self, t: Option<&TenantId>) -> Result<Vec<VolumeRecord>> {
+        let t = t.cloned();
+        self.run(move |c| {
+            let rows = match &t {
+                Some(t) => {
+                    let mut st = c
+                        .prepare(&format!(
+                            "SELECT {VOLUME_COLS} FROM volumes WHERE tenant_id = ?1 ORDER BY id"
+                        ))
+                        .map_err(db)?;
+                    st.query_map([t.as_str()], volume_row)
+                        .map_err(db)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                }
+                None => {
+                    let mut st = c
+                        .prepare(&format!(
+                            "SELECT {VOLUME_COLS} FROM volumes ORDER BY tenant_id, id"
+                        ))
+                        .map_err(db)?;
+                    st.query_map([], volume_row)
+                        .map_err(db)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                }
+            };
+            rows.map_err(db)
+        })
+        .await
+    }
+
+    async fn update_volume(&self, rec: &VolumeRecord) -> Result<()> {
+        let rec = rec.clone();
+        let owner = json(&rec.owner)?;
+        self.run(move |c| {
+            let n = c
+                .execute(
+                    "UPDATE volumes SET owner = ?3, state = ?4, updated_at = ?5
+                     WHERE tenant_id = ?1 AND id = ?2",
+                    params![
+                        rec.tenant.as_str(),
+                        rec.id.as_str(),
+                        owner,
+                        rec.state.as_str(),
+                        rec.updated_at
+                    ],
+                )
+                .map_err(db)?;
+            if n == 0 {
+                return Err(Error::NotFound(format!("volume {}", rec.key())));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_volume(&self, t: &TenantId, v: &VolumeId) -> Result<()> {
+        let k = [t.to_string(), v.to_string()];
+        self.run(move |c| {
+            c.execute("DELETE FROM volumes WHERE tenant_id = ?1 AND id = ?2", k)
+                .map_err(db)?;
             Ok(())
         })
         .await
@@ -1023,6 +1162,13 @@ mod tests {
             sandbox: sb.id.clone(),
             id: ContainerId::new("s1").unwrap(),
             args: vec!["sleep".into(), "infinity".into()],
+            volumes: vec![tenantd_core::model::VolumeMount {
+                slot: "workspace".parse().unwrap(),
+                volume: "ws".parse().unwrap(),
+                path: "/workspace".into(),
+                read_only: false,
+            }],
+            fuse: Some("/mnt".into()),
             state: ContainerState::Creating,
             exit_code: None,
             created_at: 1,
@@ -1082,6 +1228,45 @@ mod tests {
         assert_eq!(p.container_key(), Some(c.key()));
         s.delete_sandbox(&t, &sb.id).await.unwrap();
         assert!(s.list_containers(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn volumes_roundtrip_and_hold_their_tenant() {
+        let s = SqliteState::in_memory().unwrap();
+        let t = TenantId::new("t").unwrap();
+        s.insert_tenant(&t, &limits(), (1, 5), &HashSet::new())
+            .await
+            .unwrap();
+        let mut v = VolumeRecord {
+            tenant: t.clone(),
+            id: VolumeId::new("ws").unwrap(),
+            owner: tenantd_core::model::VolumeOwner {
+                uid: 1000,
+                gid: 1000,
+                mode: 0o1777,
+            },
+            state: VolumeState::Creating,
+            created_at: 1,
+            updated_at: 1,
+        };
+        s.insert_volume(&v).await.unwrap();
+        assert!(matches!(
+            s.insert_volume(&v).await,
+            Err(Error::AlreadyExists(_))
+        ));
+        v.state = VolumeState::Ready;
+        v.updated_at = 2;
+        s.update_volume(&v).await.unwrap();
+        assert_eq!(s.get_volume(&t, &v.id).await.unwrap(), Some(v.clone()));
+        assert_eq!(s.list_volumes(Some(&t)).await.unwrap(), vec![v.clone()]);
+        assert_eq!(s.list_volumes(None).await.unwrap().len(), 1);
+        assert!(matches!(
+            s.delete_tenant(&t).await,
+            Err(Error::FailedPrecondition(_))
+        ));
+        s.delete_volume(&t, &v.id).await.unwrap();
+        assert!(s.get_volume(&t, &v.id).await.unwrap().is_none());
+        s.delete_tenant(&t).await.unwrap();
     }
 
     #[tokio::test]

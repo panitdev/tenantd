@@ -8,7 +8,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 use tenantd_client::pb;
 use tenantd_client::{
-    ContainersClient, ProcessesClient, SandboxesClient, SystemClient, TenantsClient,
+    ContainersClient, ProcessesClient, SandboxesClient, SystemClient, TenantsClient, VolumesClient,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::transport::Channel;
@@ -48,6 +48,13 @@ pub enum ClientCmd {
         conn: Conn,
         #[command(subcommand)]
         cmd: ContainerCmd,
+    },
+    /// Manage tenants' volumes.
+    Volume {
+        #[command(flatten)]
+        conn: Conn,
+        #[command(subcommand)]
+        cmd: VolumeCmd,
     },
     /// Run a command in a running sandbox: start it, stream its output and
     /// exit with its exit code (128+n when signal n killed it).
@@ -169,9 +176,45 @@ pub enum ContainerCmd {
         tenant: String,
         sandbox: String,
         id: String,
+        /// SLOT=VOLUME: mount a volume through one of the profile's slots;
+        /// repeatable.
+        #[arg(long = "volume", short = 'v', value_parser = binding)]
+        volumes: Vec<(String, String)>,
+        /// Mount the profile's FUSE slot. The container then waits
+        /// "created" for its server; see attach-fuse.
+        #[arg(long)]
+        fuse: bool,
         /// Its init and arguments; default: the image's entrypoint and cmd.
         #[arg(last = true)]
         args: Vec<String>,
+    },
+    /// Run a created container, once its FUSE server has attached.
+    Start {
+        tenant: String,
+        sandbox: String,
+        id: String,
+    },
+    /// Take the container's FUSE connection and run its server: the
+    /// command gets the connection as fd 3 (also in TENANTD_FUSE_FD), as
+    /// libfuse servers take `/dev/fd/3` for a mount point. Exits with the
+    /// server's exit code.
+    AttachFuse {
+        tenant: String,
+        sandbox: String,
+        id: String,
+        /// The daemon's FUSE socket.
+        #[arg(
+            long,
+            env = "TENANTD_FUSE_SOCKET",
+            default_value = tenantd_client::fuse::DEFAULT_SOCKET
+        )]
+        fuse_socket: PathBuf,
+        /// Start the container once the server runs.
+        #[arg(long)]
+        start: bool,
+        /// The server and its arguments.
+        #[arg(last = true, required = true)]
+        server: Vec<String>,
     },
     Get {
         tenant: String,
@@ -188,6 +231,56 @@ pub enum ContainerCmd {
         sandbox: String,
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum VolumeCmd {
+    /// Create a volume in the tenant's quota.
+    Create {
+        tenant: String,
+        id: String,
+        /// Owner of its root: root or a caller UID.
+        #[arg(long)]
+        uid: Option<u32>,
+        #[arg(long)]
+        gid: Option<u32>,
+        /// Mode of its root, in octal; default 755.
+        #[arg(long, value_parser = octal)]
+        mode: Option<u32>,
+    },
+    Get {
+        tenant: String,
+        id: String,
+    },
+    List {
+        tenant: String,
+    },
+    /// Remove it and everything in it; refused while a container binds it.
+    Rm {
+        tenant: String,
+        id: String,
+    },
+    /// Remove what is at or below a path and unused for a while.
+    Prune {
+        tenant: String,
+        id: String,
+        /// Relative to the volume; default: all of it.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Seconds without access, modification or change; 0 removes all.
+        #[arg(long, default_value_t = 0)]
+        older_than: u64,
+    },
+}
+
+fn binding(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .ok_or_else(|| format!("{s:?} is not SLOT=VOLUME"))
+}
+
+fn octal(s: &str) -> Result<u32, String> {
+    u32::from_str_radix(s.trim_start_matches("0o"), 8).map_err(|e| format!("{s:?}: {e}"))
 }
 
 #[derive(Args)]
@@ -569,7 +662,85 @@ fn print_container(c: &pb::Container) {
         .exit_code
         .map(|c| format!(" (exit {c})"))
         .unwrap_or_default();
-    println!("{}.{}.{:<20} {}{exit}", c.tenant, c.sandbox, c.id, c.state);
+    let mut mounts: Vec<String> = c
+        .volumes
+        .iter()
+        .map(|m| {
+            let ro = if m.read_only { ":ro" } else { "" };
+            format!("{}={}{ro}", m.path, m.volume)
+        })
+        .collect();
+    if !c.fuse_path.is_empty() {
+        mounts.push(format!("{}=fuse", c.fuse_path));
+    }
+    let mounts = if mounts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", mounts.join(" "))
+    };
+    println!(
+        "{}.{}.{:<20} {}{exit}{mounts}",
+        c.tenant, c.sandbox, c.id, c.state
+    );
+}
+
+fn print_volume(v: &pb::Volume) {
+    println!(
+        "{}.{:<20} {:<9} {}:{} {:04o}  {}",
+        v.tenant, v.id, v.state, v.uid, v.gid, v.mode, v.path
+    );
+}
+
+/// Run `server` with the FUSE connection as fd 3, optionally start the
+/// container, and exit with the server's code.
+async fn attach_fuse(
+    mut k: ContainersClient<Channel>,
+    r: pb::ContainerRef,
+    socket: PathBuf,
+    start: bool,
+    server: Vec<String>,
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let fd = {
+        let (s, t, sb, c) = (
+            socket.clone(),
+            r.tenant.clone(),
+            r.sandbox.clone(),
+            r.id.clone(),
+        );
+        tokio::task::spawn_blocking(move || tenantd_client::fuse::attach_fuse(&s, &t, &sb, &c))
+            .await?
+            .with_context(|| format!("attaching via {}", socket.display()))?
+    };
+    let raw = fd.as_raw_fd();
+    let mut cmd = std::process::Command::new(&server[0]);
+    cmd.args(&server[1..]).env("TENANTD_FUSE_FD", "3");
+    // SAFETY: dup2 is async-signal-safe; it runs between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("running {}", server[0]))?;
+    drop(fd);
+    if start && let Err(e) = k.start_container(r).await {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e.into());
+    }
+    let status = tokio::task::spawn_blocking(move || child.wait()).await??;
+    use std::os::unix::process::ExitStatusExt;
+    std::process::exit(
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+    );
 }
 
 fn event_json(e: pb::Event) -> serde_json::Value {
@@ -610,6 +781,7 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
         ClientCmd::Tenant { conn, .. }
         | ClientCmd::Sandbox { conn, .. }
         | ClientCmd::Container { conn, .. }
+        | ClientCmd::Volume { conn, .. }
         | ClientCmd::Exec { conn, .. }
         | ClientCmd::Process { conn, .. }
         | ClientCmd::Health { conn }
@@ -723,6 +895,8 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                     tenant,
                     sandbox,
                     id,
+                    volumes,
+                    fuse,
                     args,
                 } => {
                     let req = pb::CreateContainerRequest {
@@ -730,9 +904,28 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                         sandbox,
                         id,
                         args,
+                        volumes: volumes.into_iter().collect(),
+                        fuse,
                     };
                     print_container(&k.create_container(req).await?.into_inner())
                 }
+                ContainerCmd::Start {
+                    tenant,
+                    sandbox,
+                    id,
+                } => print_container(
+                    &k.start_container(r(tenant, sandbox, id))
+                        .await?
+                        .into_inner(),
+                ),
+                ContainerCmd::AttachFuse {
+                    tenant,
+                    sandbox,
+                    id,
+                    fuse_socket,
+                    start,
+                    server,
+                } => attach_fuse(k, r(tenant, sandbox, id), fuse_socket, start, server).await?,
                 ContainerCmd::Get {
                     tenant,
                     sandbox,
@@ -753,6 +946,63 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                     k.delete_container(r(tenant.clone(), sandbox.clone(), id.clone()))
                         .await?;
                     println!("deleted {tenant}.{sandbox}.{id}");
+                }
+            }
+        }
+        ClientCmd::Volume { cmd: c, .. } => {
+            let mut v = VolumesClient::new(ch);
+            let r = |tenant, id| pb::VolumeRef { tenant, id };
+            match c {
+                VolumeCmd::Create {
+                    tenant,
+                    id,
+                    uid,
+                    gid,
+                    mode,
+                } => print_volume(
+                    &v.create_volume(pb::CreateVolumeRequest {
+                        tenant,
+                        id,
+                        uid,
+                        gid,
+                        mode,
+                    })
+                    .await?
+                    .into_inner(),
+                ),
+                VolumeCmd::Get { tenant, id } => {
+                    print_volume(&v.get_volume(r(tenant, id)).await?.into_inner())
+                }
+                VolumeCmd::List { tenant } => v
+                    .list_volumes(pb::ListVolumesRequest { tenant })
+                    .await?
+                    .into_inner()
+                    .volumes
+                    .iter()
+                    .for_each(print_volume),
+                VolumeCmd::Rm { tenant, id } => {
+                    v.delete_volume(r(tenant.clone(), id.clone())).await?;
+                    println!("deleted {tenant}.{id}");
+                }
+                VolumeCmd::Prune {
+                    tenant,
+                    id,
+                    prefix,
+                    older_than,
+                } => {
+                    let rep = v
+                        .prune_volume(pb::PruneVolumeRequest {
+                            volume: Some(r(tenant, id)),
+                            path_prefix: prefix,
+                            older_than_secs: older_than,
+                        })
+                        .await?
+                        .into_inner();
+                    println!(
+                        "removed {} entries, {}",
+                        rep.removed_entries,
+                        human(rep.removed_bytes)
+                    );
                 }
             }
         }

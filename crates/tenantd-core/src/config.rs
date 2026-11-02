@@ -37,6 +37,14 @@ pub struct ServerConfig {
     pub socket_gid: Option<u32>,
     #[serde(default)]
     pub callers: Vec<Caller>,
+    /// Side socket that hands FUSE connections (`/dev/fuse` fds) to
+    /// callers. Same mode, group and callers as the API socket.
+    #[serde(default = "default_fuse_socket")]
+    pub fuse_socket: PathBuf,
+}
+
+fn default_fuse_socket() -> PathBuf {
+    "/run/tenantd/fuse.sock".into()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -88,6 +96,13 @@ pub struct RuntimeConfig {
     /// Extra global runsc flags, fixed by the operator (e.g. `--platform=kvm`).
     #[serde(default)]
     pub extra_flags: Vec<String>,
+    /// Host mount points of containers' FUSE connections.
+    #[serde(default = "default_fuse_dir")]
+    pub fuse_dir: PathBuf,
+}
+
+fn default_fuse_dir() -> PathBuf {
+    "/run/tenantd/fuse".into()
 }
 
 fn default_runtime_state_dir() -> PathBuf {
@@ -186,6 +201,66 @@ pub struct Profile {
     /// the sandbox.
     #[serde(default)]
     pub exec: ExecPolicy,
+    /// Mount slots for volumes, by name. A container of the profile mounts
+    /// only these, each bound to a volume of its tenant at create.
+    #[serde(default)]
+    pub volumes: BTreeMap<String, VolumeSlot>,
+    /// A FUSE mount containers of the profile may ask for; its server is
+    /// the caller, handed the connection over `server.fuse_socket`.
+    pub fuse: Option<FuseSlot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeSlot {
+    /// Absolute path inside the container.
+    pub path: String,
+    #[serde(default)]
+    pub read_only: bool,
+    /// A container create must bind it.
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FuseSlot {
+    /// Absolute path inside the container.
+    pub path: String,
+}
+
+/// Paths the runtime itself mounts, which a slot may neither replace nor
+/// sit below. `/tmp` is allowed: a slot there replaces the tmpfs.
+const RESERVED_MOUNTS: &[&str] = &["/proc", "/dev", "/sys", "/etc/hosts", "/etc/resolv.conf"];
+
+/// A slot path: absolute, normalised, not `/`, plain characters only, and
+/// clear of the runtime's own mounts.
+pub fn validate_slot_path(p: &str) -> std::result::Result<(), String> {
+    let normal = p.starts_with('/')
+        && p.len() > 1
+        && p.len() <= 256
+        && !p.ends_with('/')
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b))
+        && p[1..]
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..");
+    if !normal {
+        return Err(format!(
+            "{p:?} must be a normalised absolute path other than / of [A-Za-z0-9._-/]"
+        ));
+    }
+    if let Some(r) = RESERVED_MOUNTS.iter().find(|r| path_within(p, r)) {
+        return Err(format!(
+            "{p:?} is at or below {r}, which the runtime mounts"
+        ));
+    }
+    Ok(())
+}
+
+/// `p` is `base` or below it.
+fn path_within(p: &str, base: &str) -> bool {
+    p == base || p.strip_prefix(base).is_some_and(|r| r.starts_with('/'))
 }
 
 fn default_tmp_size() -> ByteSize {
@@ -395,6 +470,23 @@ impl Config {
             if let Some(u) = e.users.iter().find(|u| !valid_exec_user(u)) {
                 return bad(format!("{}: bad user {u:?}", at("exec.users")));
             }
+            let mut paths: Vec<(String, &str)> = Vec::new();
+            for (slot, v) in &p.volumes {
+                validate_id("slot", slot).or_else(|e| bad(format!("{}: {e}", at("volumes"))))?;
+                paths.push((at(&format!("volumes.{slot}.path")), &v.path));
+            }
+            if let Some(f) = &p.fuse {
+                paths.push((at("fuse.path"), &f.path));
+            }
+            for (i, (key, path)) in paths.iter().enumerate() {
+                validate_slot_path(path).or_else(|e| bad(format!("{key}: {e}")))?;
+                if let Some((other, _)) = paths[..i]
+                    .iter()
+                    .find(|(_, o)| path_within(path, o) || path_within(o, path))
+                {
+                    return bad(format!("{key} overlaps {other}"));
+                }
+            }
         }
         Ok(())
     }
@@ -462,5 +554,47 @@ mod tests {
         assert!(Config::from_toml(&with("max_processes = 16", "max_processes = 0")).is_err());
         assert!(Config::from_toml(&with("\"1000\"]", "\"a/b\"]")).is_err());
         assert!(Config::from_toml(&with("tty = false", "tty = false\nprivileged = true")).is_err());
+    }
+
+    #[test]
+    fn slots() {
+        let cfg = Config::from_toml(EXAMPLE).unwrap();
+        let p = &cfg.profiles["default"];
+        assert_eq!(p.volumes["workspace"].path, "/workspace");
+        assert!(p.volumes["workspace"].required);
+        assert_eq!(p.fuse.as_ref().unwrap().path, "/mnt");
+        assert_eq!(
+            cfg.server.fuse_socket,
+            PathBuf::from("/run/tenantd/fuse.sock")
+        );
+        assert!(cfg.profiles["scratch"].volumes.is_empty());
+
+        let with = |from: &str, to: &str| EXAMPLE.replacen(from, to, 1);
+        for bad in [
+            "/",
+            "rel",
+            "/a/../b",
+            "/a//b",
+            "/a/",
+            "/proc/x",
+            "/dev",
+            "/etc/hosts",
+            "/a b",
+        ] {
+            let cfg = with("path = \"/workspace\"", &format!("path = {bad:?}"));
+            assert!(Config::from_toml(&cfg).is_err(), "{bad}");
+        }
+        // Overlapping slots, and a slot below the FUSE mount.
+        let cfg = with("path = \"/tmp\"", "path = \"/workspace/tmp\"");
+        assert!(Config::from_toml(&cfg).is_err());
+        let cfg = with("path = \"/tmp\"", "path = \"/mnt/tmp\"");
+        assert!(Config::from_toml(&cfg).is_err());
+        let cfg = with(
+            "[profiles.default.volumes.tmp]",
+            "[profiles.default.volumes.Tmp]",
+        );
+        assert!(Config::from_toml(&cfg).is_err());
+        assert!(validate_slot_path("/tmp").is_ok());
+        assert!(validate_slot_path("/devices").is_ok());
     }
 }

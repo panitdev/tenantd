@@ -35,10 +35,33 @@ service Sandboxes {
 // network and limits, so many of them cost one sandbox. A container is never
 // restarted: it ends "exited" when its init exits or its sandbox stops, and
 // keeps its root until deleted.
+//
+// A container mounts the tenant's volumes only through the slots its
+// profile declares, bound at create; changing a binding means recreating
+// it. A container asking for the profile's FUSE slot gets a FUSE mount
+// whose server is the caller: it is created "created" and waits there.
+// The caller then takes the mount's /dev/fuse connection over the FUSE
+// socket (server.fuse_socket, see below), serves it, and calls
+// StartContainer. tenantd never runs filesystem code.
+//
+// AttachFuse is not a gRPC call, since an fd can't cross HTTP/2. Connect
+// to the FUSE socket (same callers as this one), send one line
+//   attach-fuse <tenant> <sandbox> <container>\n
+// and read one line back: "ok\n" with the fd attached (SCM_RIGHTS), or
+// "err <code> <message>\n" with a gRPC code name such as NOT_FOUND. Each
+// attach hands out the same connection, so a server that restarts can
+// attach again; it then finds the connection already initialised (no
+// FUSE_INIT comes). tenantd keeps the connection open until the container
+// ends, so requests queue rather than fail while no server reads them.
+// A tenantd restart loses it: a "created" container gets a fresh one, a
+// running one must be recreated to get one again.
 service Containers {
   // Idempotent on (tenant, sandbox, id), like every create. The sandbox
-  // must be running.
+  // must be running, and bound volumes ready.
   rpc CreateContainer(CreateContainerRequest) returns (Container);
+  // Runs a "created" container, once its FUSE server has attached.
+  // Starting a running one returns it; an exited one never restarts.
+  rpc StartContainer(ContainerRef) returns (Container);
   rpc GetContainer(ContainerRef) returns (Container);
   rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
   // Ends its processes and removes it and its root. Their process rows stay
@@ -63,6 +86,25 @@ service Processes {
   rpc ReadOutput(ReadOutputRequest) returns (stream OutputChunk);
   // Exited processes only, unless force (SIGKILL first).
   rpc DeleteProcess(DeleteProcessRequest) returns (DeleteProcessResponse);
+}
+
+// Volumes: durable directories in a tenant's quota, the only state that
+// outlives a container. Containers mount them through their profile's
+// slots; callers on the host use them at their path.
+service Volumes {
+  // Idempotent on (tenant, id), like every create. The owner must be root
+  // or a caller UID; mode takes permission and sticky bits only.
+  rpc CreateVolume(CreateVolumeRequest) returns (Volume);
+  rpc GetVolume(VolumeRef) returns (Volume);
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  // Removes it and everything in it. Fails while a container (even an
+  // exited one) binds it.
+  rpc DeleteVolume(VolumeRef) returns (DeleteVolumeResponse);
+  // Removes what is at or below path_prefix and has not been accessed,
+  // modified or changed for older_than_secs (0: all of it). Directories go
+  // once empty; the volume itself stays. Symlinks are removed, never
+  // followed, and mounts are not entered.
+  rpc PruneVolume(PruneVolumeRequest) returns (PruneVolumeResponse);
 }
 
 service System {
@@ -175,6 +217,10 @@ message CreateContainerRequest {
   // Its init; empty runs the image's entrypoint and cmd. Anything else needs
   // the profile's exec rights and runs as the image user. No shell is implied.
   repeated string args = 4;
+  // Slot name -> volume ID. Slots marked required must be bound.
+  map<string, string> volumes = 5;
+  // Mount the profile's FUSE slot; the container then waits "created".
+  bool fuse = 6;
 }
 
 message ContainerRef {
@@ -198,11 +244,66 @@ message Container {
   string tenant = 1;
   string sandbox = 2;
   string id = 3;
-  string state = 4;             // creating | running | exited | destroying
+  string state = 4;             // creating | created | running | exited | destroying
   optional int32 exit_code = 5;
   int64 created_at = 6;
   int64 updated_at = 7;
   repeated string args = 8;     // empty: the image's entrypoint and cmd
+  repeated VolumeMount volumes = 9;
+  string fuse_path = 10;        // where its FUSE slot is mounted; "" = none
+}
+
+message VolumeMount {
+  string slot = 1;
+  string volume = 2;
+  string path = 3;              // inside the container
+  bool read_only = 4;
+}
+
+message CreateVolumeRequest {
+  string tenant = 1;
+  string id = 2;
+  optional uint32 uid = 3;      // default 0
+  optional uint32 gid = 4;      // default 0
+  optional uint32 mode = 5;     // default 0755
+}
+
+message VolumeRef {
+  string tenant = 1;
+  string id = 2;
+}
+
+message ListVolumesRequest {
+  string tenant = 1;
+}
+
+message ListVolumesResponse {
+  repeated Volume volumes = 1;
+}
+
+message DeleteVolumeResponse {}
+
+message PruneVolumeRequest {
+  VolumeRef volume = 1;
+  string path_prefix = 2;       // relative to the volume; "" = all of it
+  uint64 older_than_secs = 3;
+}
+
+message PruneVolumeResponse {
+  uint64 removed_entries = 1;
+  uint64 removed_bytes = 2;
+}
+
+message Volume {
+  string tenant = 1;
+  string id = 2;
+  string state = 3;             // creating | ready | deleting
+  uint32 uid = 4;
+  uint32 gid = 5;
+  uint32 mode = 6;
+  string path = 7;              // on the host
+  int64 created_at = 8;
+  int64 updated_at = 9;
 }
 
 message StartProcessRequest {

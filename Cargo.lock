@@ -2257,6 +2257,7 @@ name = "tenantd-client"
 version = "0.1.0"
 dependencies = [
  "hyper-util",
+ "libc",
  "prost",
  "tempfile",
  "tokio",

@@ -3,6 +3,7 @@
 //! simulate crashes.
 
 use std::collections::{HashMap, HashSet};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,12 +16,12 @@ use futures::stream::BoxStream;
 use tenantd_core::backend::*;
 use tenantd_core::config::{Config, RuntimeKind};
 use tenantd_core::model::{
-    ImageConfig, LayerKind, NetworkMode, ProcessIo, ResolvedImage, ResolvedProcess,
-    ResolvedSandbox, Signal, Stream,
+    ImageConfig, LayerKind, NetworkMode, ProcessIo, PruneReport, ResolvedImage, ResolvedProcess,
+    ResolvedSandbox, Signal, Stream, VolumeOwner,
 };
 use tenantd_core::{
     Backends, Bytes, ContainerId, ContainerKey, Error, ProcessId, ProjectId, Result, SandboxId,
-    SandboxKey, TenantId, Tenantd,
+    SandboxKey, TenantId, Tenantd, VolumeId,
 };
 use tenantd_state::SqliteState;
 
@@ -265,12 +266,15 @@ impl WritableLayer for FakeLayer {
     }
 }
 
+/// A container the runtime was asked to create: key, init, root, binds.
+pub type CreatedContainer = (ContainerKey, Vec<String>, RootfsSpec, Vec<BindMount>);
+
 pub struct FakeRuntime {
     pub containers: Mutex<HashMap<RuntimeHandle, RuntimeState>>,
     pub watched: Mutex<HashSet<RuntimeHandle>>,
     pub created_specs: Mutex<Vec<(ResolvedSandbox, RootfsSpec, NetAttachment)>>,
-    /// Containers created in sandboxes, with their init and roots.
-    pub created_containers: Mutex<Vec<(ContainerKey, Vec<String>, RootfsSpec)>>,
+    /// Containers created in sandboxes, with their init, roots and binds.
+    pub created_containers: Mutex<Vec<CreatedContainer>>,
     pub verified: AtomicBool,
     pub faults: Arc<Faults>,
     /// Exec'd processes still alive, by container.
@@ -464,6 +468,7 @@ impl RuntimeBackend for FakeRuntime {
         c: &ContainerKey,
         args: &[String],
         root: &RootfsSpec,
+        mounts: &[BindMount],
         _net: &NetAttachment,
     ) -> Result<RuntimeHandle> {
         self.faults.check("runtime.create_container")?;
@@ -480,10 +485,12 @@ impl RuntimeBackend for FakeRuntime {
             return Err(Error::AlreadyExists(h.0));
         }
         m.insert(h.clone(), RuntimeState::Created);
-        self.created_containers
-            .lock()
-            .unwrap()
-            .push((c.clone(), args.to_vec(), root.clone()));
+        self.created_containers.lock().unwrap().push((
+            c.clone(),
+            args.to_vec(),
+            root.clone(),
+            mounts.to_vec(),
+        ));
         Ok(h)
     }
 
@@ -784,10 +791,194 @@ impl NetworkBackend for FakeNetwork {
     }
 }
 
+/// Volume directories, by (tenant dir, volume), with what each holds.
+#[derive(Default)]
+pub struct FakeVolumes {
+    pub dirs: Mutex<HashMap<(PathBuf, VolumeId), FakeVolume>>,
+    pub faults: Arc<Faults>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FakeVolume {
+    pub owner: Option<VolumeOwner>,
+    /// Relative path -> last used (Unix seconds).
+    pub files: HashMap<PathBuf, i64>,
+}
+
+impl FakeVolumes {
+    /// A container or the host writes a file into a volume.
+    pub fn write(&self, tenant_dir: &Path, v: &VolumeId, path: &str, used: i64) {
+        if let Some(vol) = self
+            .dirs
+            .lock()
+            .unwrap()
+            .get_mut(&(tenant_dir.to_path_buf(), v.clone()))
+        {
+            vol.files.insert(path.into(), used);
+        }
+    }
+
+    pub fn files(&self, tenant_dir: &Path, v: &VolumeId) -> Vec<PathBuf> {
+        let mut f: Vec<PathBuf> = self
+            .dirs
+            .lock()
+            .unwrap()
+            .get(&(tenant_dir.to_path_buf(), v.clone()))
+            .map(|v| v.files.keys().cloned().collect())
+            .unwrap_or_default();
+        f.sort();
+        f
+    }
+}
+
+#[async_trait]
+impl VolumeBackend for FakeVolumes {
+    fn path(&self, tenant_dir: &Path, v: &VolumeId) -> PathBuf {
+        tenant_dir.join("volumes").join(v.as_str())
+    }
+
+    async fn create(&self, tenant_dir: &Path, v: &VolumeId, owner: VolumeOwner) -> Result<PathBuf> {
+        self.faults.check("volumes.create")?;
+        self.dirs
+            .lock()
+            .unwrap()
+            .entry((tenant_dir.to_path_buf(), v.clone()))
+            .or_default()
+            .owner = Some(owner);
+        Ok(self.path(tenant_dir, v))
+    }
+
+    async fn exists(&self, tenant_dir: &Path, v: &VolumeId) -> Result<bool> {
+        Ok(self
+            .dirs
+            .lock()
+            .unwrap()
+            .contains_key(&(tenant_dir.to_path_buf(), v.clone())))
+    }
+
+    async fn delete(&self, tenant_dir: &Path, v: &VolumeId) -> Result<()> {
+        self.faults.check("volumes.delete")?;
+        self.dirs
+            .lock()
+            .unwrap()
+            .remove(&(tenant_dir.to_path_buf(), v.clone()));
+        Ok(())
+    }
+
+    /// Files only; directories are implied by their paths.
+    async fn prune(
+        &self,
+        tenant_dir: &Path,
+        v: &VolumeId,
+        prefix: &Path,
+        cutoff: Option<i64>,
+    ) -> Result<PruneReport> {
+        let mut dirs = self.dirs.lock().unwrap();
+        let Some(vol) = dirs.get_mut(&(tenant_dir.to_path_buf(), v.clone())) else {
+            return Err(Error::Internal(format!("no volume directory {v}")));
+        };
+        let before = vol.files.len();
+        vol.files
+            .retain(|p, used| !(p.starts_with(prefix) && cutoff.is_none_or(|c| *used <= c)));
+        Ok(PruneReport {
+            entries: (before - vol.files.len()) as u64,
+            bytes: 0,
+        })
+    }
+
+    async fn list_owned(&self, tenant_dir: &Path) -> Result<Vec<VolumeId>> {
+        Ok(self
+            .dirs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(d, _)| d == tenant_dir)
+            .map(|(_, v)| v.clone())
+            .collect())
+    }
+}
+
+/// FUSE mounts on the fake host. A connection is a pipe's read end; its
+/// write end stands for the kernel side, so a test can see a handed-out
+/// fd is the held one (same inode).
+#[derive(Default)]
+pub struct FakeFuse {
+    /// Mounted containers, and whether this service instance holds the
+    /// connection (`false` after a restart).
+    pub mounted: Mutex<HashMap<ContainerKey, bool>>,
+    conns: Mutex<HashMap<ContainerKey, (OwnedFd, OwnedFd)>>,
+    pub faults: Arc<Faults>,
+}
+
+impl FakeFuse {
+    /// What a daemon restart does: the fds are gone, the mounts stay.
+    pub fn lose_connections(&self) {
+        self.conns.lock().unwrap().clear();
+        for held in self.mounted.lock().unwrap().values_mut() {
+            *held = false;
+        }
+    }
+
+    pub fn is_mounted(&self, c: &ContainerKey) -> bool {
+        self.mounted.lock().unwrap().contains_key(c)
+    }
+}
+
+pub fn same_file(a: &OwnedFd, b: &OwnedFd) -> bool {
+    use std::os::fd::AsFd;
+    let st = |f: &OwnedFd| {
+        std::fs::File::from(f.as_fd().try_clone_to_owned().unwrap())
+            .metadata()
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                (m.dev(), m.ino())
+            })
+            .unwrap()
+    };
+    st(a) == st(b)
+}
+
+#[async_trait]
+impl FuseBackend for FakeFuse {
+    async fn mount(&self, c: &ContainerKey) -> Result<PathBuf> {
+        self.faults.check("fuse.mount")?;
+        let point = PathBuf::from("/run/fake/fuse").join(c.to_string());
+        let mut conns = self.conns.lock().unwrap();
+        if conns.contains_key(c) {
+            return Ok(point);
+        }
+        let (r, w) = std::io::pipe().map_err(|e| Error::internal("pipe", e))?;
+        conns.insert(c.clone(), (r.into(), w.into()));
+        self.mounted.lock().unwrap().insert(c.clone(), true);
+        Ok(point)
+    }
+
+    fn connection(&self, c: &ContainerKey) -> Result<Option<OwnedFd>> {
+        match self.conns.lock().unwrap().get(c) {
+            Some((r, _)) => Ok(Some(r.try_clone().map_err(|e| Error::internal("dup", e))?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn unmount(&self, c: &ContainerKey) -> Result<()> {
+        self.faults.check("fuse.unmount")?;
+        self.conns.lock().unwrap().remove(c);
+        self.mounted.lock().unwrap().remove(c);
+        Ok(())
+    }
+
+    async fn list_owned(&self) -> Result<Vec<ContainerKey>> {
+        Ok(self.mounted.lock().unwrap().keys().cloned().collect())
+    }
+}
+
 pub const TEST_CONFIG: &str = r#"
 [server]
 socket = "/run/tenantd/api.sock"
 state = "/var/lib/tenantd/state.db"
+
+[[server.callers]]
+uid = 1000
 
 [storage]
 backend = "xfs-project"
@@ -822,6 +1013,31 @@ output_limit = 16
 retention_secs = 60
 tombstone_secs = 120
 
+[profiles.default.volumes.workspace]
+path = "/workspace"
+
+[profiles.default.volumes.tmp]
+path = "/tmp"
+
+[profiles.default.volumes.cache]
+path = "/cache"
+read_only = true
+
+[profiles.default.fuse]
+path = "/mnt"
+
+[profiles.pinned]
+images = ["docker.io/library/*"]
+memory = "1g"
+cpus = 1.0
+pids = 512
+rootfs = "host-overlay"
+network = "none"
+
+[profiles.pinned.volumes.workspace]
+path = "/workspace"
+required = true
+
 [profiles.scratch]
 images = ["docker.io/library/*"]
 memory = "1g"
@@ -840,6 +1056,8 @@ pub struct Host {
     pub images: Arc<FakeImages>,
     pub network: Arc<FakeNetwork>,
     pub output: Arc<FakeOutput>,
+    pub volumes: Arc<FakeVolumes>,
+    pub fuse: Arc<FakeFuse>,
     pub state: SqliteState,
     pub faults: Arc<Faults>,
 }
@@ -867,6 +1085,14 @@ impl Host {
                 ..Default::default()
             }),
             output: Arc::new(FakeOutput {
+                faults: faults.clone(),
+                ..Default::default()
+            }),
+            volumes: Arc::new(FakeVolumes {
+                faults: faults.clone(),
+                ..Default::default()
+            }),
+            fuse: Arc::new(FakeFuse {
                 faults: faults.clone(),
                 ..Default::default()
             }),
@@ -898,6 +1124,8 @@ impl Host {
                 images: self.images.clone(),
                 network: self.network.clone(),
                 output: self.output.clone(),
+                volumes: self.volumes.clone(),
+                fuse: self.fuse.clone(),
                 state: Arc::new(self.state.clone()),
             },
         )
@@ -931,6 +1159,7 @@ impl Env {
     pub async fn restart(&mut self) {
         self.host.runtime.watched_processes.lock().unwrap().clear();
         self.host.output.watched.lock().unwrap().clear();
+        self.host.fuse.lose_connections();
         self.tenantd = self.host.service(TEST_CONFIG);
         self.tenantd.check_health().await;
     }

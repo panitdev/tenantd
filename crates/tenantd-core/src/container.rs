@@ -8,69 +8,110 @@
 //! container is started. A container is never restarted: when its init
 //! exits or its sandbox stops it ends `exited`, and its root stays until
 //! it is deleted.
+//!
+//! Volumes are bind-mounted through the profile's slots, resolved and
+//! checked at create and kept on the row. A container with a FUSE slot
+//! gets a host FUSE mount, bind-mounted like a volume; its row stops at
+//! `created` (root and mount ready, no runtime container yet) until the
+//! caller's FUSE server holds the connection, because anything touching
+//! the mount, runsc included, blocks until a server answers. Then
+//! [`Tenantd::start_container`] runs it.
+
+use std::os::fd::OwnedFd;
 
 use tracing::{info, warn};
 
 use crate::Tenantd;
-use crate::backend::{RuntimeHandle, RuntimeState};
+use crate::backend::{BindMount, RootfsSpec, RuntimeHandle, RuntimeState};
 use crate::events::EventKind;
-use crate::model::{ContainerRecord, ContainerState, ProcessState, SandboxRecord, SandboxState};
-use crate::{ContainerKey, Error, Result, SandboxKey, now, policy};
+use crate::model::{
+    ContainerRecord, ContainerSpec, ContainerState, ProcessState, SandboxRecord, SandboxState,
+    VolumeState,
+};
+use crate::{ContainerKey, Error, Result, SandboxKey, VolumeKey, now, policy};
 
-fn same_container(r: ContainerRecord, args: &[String]) -> Result<ContainerRecord> {
-    if r.args == args {
+fn same_container(r: ContainerRecord, spec: &ContainerSpec) -> Result<ContainerRecord> {
+    if &r.spec() == spec {
         Ok(r)
     } else {
         Err(Error::AlreadyExists(format!(
-            "container {} exists with a different command",
+            "container {} exists with a different command, volumes or FUSE slot",
             r.key()
         )))
     }
 }
 
 impl Tenantd {
-    /// Idempotent on the key: the same `args` return the existing
-    /// container, different ones are `AlreadyExists`. The sandbox must be
-    /// running. `args` is its init; empty runs the image's entrypoint and
-    /// cmd, anything else needs the profile's exec rights.
+    /// Idempotent on the key: the same spec returns the existing container,
+    /// a different one is `AlreadyExists`. The sandbox must be running.
+    /// `args` is its init; empty runs the image's entrypoint and cmd,
+    /// anything else needs the profile's exec rights. Bound volumes must be
+    /// ready. With `fuse`, the container is left `created`; see
+    /// [`Tenantd::attach_fuse`] and [`Tenantd::start_container`].
     pub async fn create_container(
         &self,
         key: ContainerKey,
-        args: Vec<String>,
+        spec: impl Into<ContainerSpec>,
     ) -> Result<ContainerRecord> {
+        let spec = spec.into();
         self.require_enforcement()?;
         self.require_unblocked(&key.tenant)?;
         if let Some(r) = self.existing_container(&key).await? {
-            return same_container(r, &args);
+            return same_container(r, &spec);
         }
 
         let sk = key.sandbox_key();
         let sandbox_lock = self.sandbox_locks.lock(sk.clone()).await;
         let sandbox = self.running_sandbox(&sk).await?;
         if let Some(r) = self.state.get_container(&key).await? {
-            return same_container(r, &args);
+            return same_container(r, &spec);
         }
-        policy::check_container_args(&self.config(), &sandbox, &args)?;
+        let cfg = self.config();
+        policy::check_container_args(&cfg, &sandbox, &spec.args)?;
+        let (volumes, fuse) = policy::plan_container_mounts(&cfg, &sandbox, &spec)?;
+        // Held until the row exists, so none of them is deleted meanwhile.
+        let mut volume_locks = Vec::with_capacity(volumes.len());
+        let mut keys: Vec<VolumeKey> = volumes
+            .iter()
+            .map(|m| VolumeKey::new(key.tenant.clone(), m.volume.clone()))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for vk in keys {
+            volume_locks.push(self.volume_locks.lock(vk.clone()).await);
+            match self.state.get_volume(&vk.tenant, &vk.volume).await? {
+                Some(v) if v.state == VolumeState::Ready => {}
+                Some(v) => {
+                    return Err(Error::FailedPrecondition(format!(
+                        "volume {vk} is {}",
+                        v.state.as_str()
+                    )));
+                }
+                None => return Err(Error::NotFound(format!("volume {vk}"))),
+            }
+        }
         let ts = now();
         let mut rec = ContainerRecord {
             tenant: key.tenant.clone(),
             sandbox: key.sandbox.clone(),
             id: key.id.clone(),
-            args,
+            args: spec.args,
+            volumes,
+            fuse,
             state: ContainerState::Creating,
             exit_code: None,
             created_at: ts,
             updated_at: ts,
         };
         self.state.insert_container(&rec).await?;
+        drop(volume_locks);
         let _c = self.container_locks.lock(key.clone()).await;
         drop(sandbox_lock);
 
         match self.bring_up_container(&sandbox, &rec).await {
-            Ok(()) => {
-                self.set_container_state(&mut rec, ContainerState::Running)
-                    .await?;
-                info!(container = %key, "container running");
+            Ok(state) => {
+                self.set_container_state(&mut rec, state).await?;
+                info!(container = %key, state = state.as_str(), "container created");
                 Ok(rec)
             }
             Err(e) => {
@@ -94,6 +135,92 @@ impl Tenantd {
             return self.state.get_container(key).await;
         }
         Ok(row)
+    }
+
+    /// Run a `created` container: its FUSE server must have attached.
+    /// Starting a running container returns it as is; an exited one is
+    /// never restarted.
+    pub async fn start_container(&self, key: &ContainerKey) -> Result<ContainerRecord> {
+        self.require_enforcement()?;
+        self.require_unblocked(&key.tenant)?;
+        let sk = key.sandbox_key();
+        let sandbox_lock = self.sandbox_locks.lock(sk.clone()).await;
+        let _c = self.container_locks.lock(key.clone()).await;
+        let mut rec = self.get_container(key).await?;
+        match rec.state {
+            ContainerState::Running => return Ok(rec),
+            ContainerState::Created => {}
+            other => {
+                return Err(Error::FailedPrecondition(format!(
+                    "container {key} is {}",
+                    other.as_str()
+                )));
+            }
+        }
+        let sandbox = self.running_sandbox(&sk).await?;
+        drop(sandbox_lock);
+        if rec.fuse.is_some() && !self.fuse_attached.lock().unwrap().contains(key) {
+            return Err(Error::FailedPrecondition(format!(
+                "container {key} waits for its FUSE server: attach it over the FUSE socket first"
+            )));
+        }
+        let res = async {
+            let (root, mounts) = self.prepare_container(&sandbox, &rec).await?;
+            self.run_container(&sandbox, &rec, &root, &mounts).await
+        };
+        if let Err(e) = res.await {
+            warn!(container = %key, error = %e, "container start failed; it stays created");
+            if let Err(e2) = self.remove_runtime_container(key).await {
+                warn!(container = %key, error = %e2, "removing the half-started container failed");
+            }
+            return Err(e);
+        }
+        self.set_container_state(&mut rec, ContainerState::Running)
+            .await?;
+        info!(container = %key, "container running");
+        Ok(rec)
+    }
+
+    /// The container's FUSE connection, for its server. Each call hands out
+    /// a duplicate of the same connection, so a server that restarts can
+    /// attach again; a reattached server finds the connection already
+    /// initialised (no `FUSE_INIT` comes). tenantd loses its connections
+    /// when it restarts: a `created` container gets a fresh one, a running
+    /// one has to be recreated.
+    pub async fn attach_fuse(&self, key: &ContainerKey) -> Result<OwnedFd> {
+        let _c = self.container_locks.lock(key.clone()).await;
+        let rec = self.get_container(key).await?;
+        if rec.fuse.is_none() {
+            return Err(Error::FailedPrecondition(format!(
+                "container {key} has no FUSE slot"
+            )));
+        }
+        let fd = match rec.state {
+            ContainerState::Created => match self.fuse.connection(key)? {
+                Some(fd) => fd,
+                None => {
+                    self.fuse.mount(key).await?;
+                    self.fuse.connection(key)?.ok_or_else(|| {
+                        Error::Internal(format!("FUSE mount of {key} holds no connection"))
+                    })?
+                }
+            },
+            ContainerState::Running => self.fuse.connection(key)?.ok_or_else(|| {
+                Error::FailedPrecondition(format!(
+                    "tenantd lost the FUSE connection of {key} when it restarted; \
+                     recreate the container"
+                ))
+            })?,
+            other => {
+                return Err(Error::FailedPrecondition(format!(
+                    "container {key} is {}",
+                    other.as_str()
+                )));
+            }
+        };
+        self.fuse_attached.lock().unwrap().insert(key.clone());
+        info!(container = %key, "FUSE connection handed to its server");
+        Ok(fd)
     }
 
     pub(crate) async fn running_sandbox(&self, sk: &SandboxKey) -> Result<SandboxRecord> {
@@ -163,19 +290,68 @@ impl Tenantd {
         self.state.update_container(rec).await
     }
 
-    /// Prepare the container's root and create and start it in the
-    /// sandbox. Every step is idempotent, so this both creates and resumes.
+    /// Prepare the container and, unless it waits for a FUSE server, run
+    /// it. Returns the state it reached. Every step is idempotent, so this
+    /// both creates and resumes.
     pub(crate) async fn bring_up_container(
         &self,
         sandbox: &SandboxRecord,
         rec: &ContainerRecord,
-    ) -> Result<()> {
-        let key = rec.key();
+    ) -> Result<ContainerState> {
+        let (root, mounts) = self.prepare_container(sandbox, rec).await?;
+        if rec.fuse.is_some() {
+            return Ok(ContainerState::Created);
+        }
+        self.run_container(sandbox, rec, &root, &mounts).await?;
+        Ok(ContainerState::Running)
+    }
+
+    /// The container's root, its FUSE mount, and the bind mounts of its
+    /// volumes and FUSE slot. Idempotent; a FUSE connection tenantd holds
+    /// is kept, a lost one is replaced.
+    pub(crate) async fn prepare_container(
+        &self,
+        sandbox: &SandboxRecord,
+        rec: &ContainerRecord,
+    ) -> Result<(RootfsSpec, Vec<BindMount>)> {
         let dir = self.storage.tenant_dir(&rec.tenant);
         let root = self
             .layer(sandbox.spec.rootfs)?
             .prepare_container(&sandbox.spec, &rec.id, &dir)
             .await?;
+        let mut mounts = Vec::with_capacity(rec.volumes.len() + 1);
+        for m in &rec.volumes {
+            if !self.volumes.exists(&dir, &m.volume).await? {
+                return Err(Error::FailedPrecondition(format!(
+                    "volume {}.{} has no directory",
+                    rec.tenant, m.volume
+                )));
+            }
+            mounts.push(BindMount {
+                source: self.volumes.path(&dir, &m.volume),
+                destination: m.path.clone(),
+                read_only: m.read_only,
+            });
+        }
+        if let Some(path) = &rec.fuse {
+            mounts.push(BindMount {
+                source: self.fuse.mount(&rec.key()).await?,
+                destination: path.clone(),
+                read_only: false,
+            });
+        }
+        Ok((root, mounts))
+    }
+
+    /// Create and start the prepared container in its sandbox. Idempotent.
+    pub(crate) async fn run_container(
+        &self,
+        sandbox: &SandboxRecord,
+        rec: &ContainerRecord,
+        root: &RootfsSpec,
+        mounts: &[BindMount],
+    ) -> Result<()> {
+        let key = rec.key();
         // Already set up for the running sandbox; this only finds it.
         let net = self
             .network
@@ -190,7 +366,7 @@ impl Tenantd {
                     self.runtime.destroy(&h).await?;
                 }
                 self.runtime
-                    .create_container(&sandbox.spec, &key, &rec.args, &root, &net)
+                    .create_container(&sandbox.spec, &key, &rec.args, root, mounts, &net)
                     .await?;
                 self.runtime.start(&h).await?;
             }
@@ -198,9 +374,22 @@ impl Tenantd {
         self.runtime.watch(&h).await
     }
 
+    /// Stop and remove the runtime container, if there is one.
+    pub(crate) async fn remove_runtime_container(&self, key: &ContainerKey) -> Result<()> {
+        let h = RuntimeHandle::for_container(key);
+        match self.runtime.inspect(&h).await? {
+            RuntimeState::Missing => Ok(()),
+            RuntimeState::Stopped => self.runtime.destroy(&h).await,
+            _ => {
+                self.runtime.stop(&h, self.stop_grace()).await?;
+                self.runtime.destroy(&h).await
+            }
+        }
+    }
+
     /// End the container's processes, stop and remove it from the sandbox,
-    /// and remove its root when `remove_root`. Tries every step and returns
-    /// the first error.
+    /// unmount its FUSE connection, and remove its root when
+    /// `remove_root`. Tries every step and returns the first error.
     pub(crate) async fn tear_down_container(
         &self,
         sandbox: &SandboxRecord,
@@ -208,7 +397,6 @@ impl Tenantd {
         remove_root: bool,
     ) -> Result<()> {
         let key = rec.key();
-        let h = RuntimeHandle::for_container(&key);
         let mut first: Option<Error> = None;
         let mut keep = |r: Result<()>| {
             if let Err(e) = r {
@@ -217,17 +405,11 @@ impl Tenantd {
             }
         };
         keep(self.end_container_processes(&key).await);
-        let runtime = async {
-            match self.runtime.inspect(&h).await? {
-                RuntimeState::Missing => Ok(()),
-                RuntimeState::Stopped => self.runtime.destroy(&h).await,
-                _ => {
-                    self.runtime.stop(&h, self.stop_grace()).await?;
-                    self.runtime.destroy(&h).await
-                }
-            }
-        };
-        keep(runtime.await);
+        keep(self.remove_runtime_container(&key).await);
+        if rec.fuse.is_some() {
+            self.fuse_attached.lock().unwrap().remove(&key);
+            keep(self.fuse.unmount(&key).await);
+        }
         if remove_root {
             let layer = self
                 .layers
@@ -270,7 +452,7 @@ impl Tenantd {
                         self.tear_down_container(sandbox, &rec, true).await?;
                         self.state.delete_container(&rec.key()).await
                     }
-                    ContainerState::Running => {
+                    ContainerState::Created | ContainerState::Running => {
                         self.tear_down_container(sandbox, &rec, remove_roots)
                             .await?;
                         self.set_container_state(&mut rec, ContainerState::Exited)

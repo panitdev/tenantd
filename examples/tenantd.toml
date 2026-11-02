@@ -40,6 +40,26 @@ output_limit = "16m"          # per stream; the head is kept, the rest discarded
 retention_secs = 3600         # exited processes are garbage-collected after this
 tombstone_secs = 86400        # process IDs stay reserved this long after GC
 
+# Volume slots: where a container of this profile may mount volumes of its
+# tenant (CreateContainer binds slot -> volume). Nothing else is mounted.
+[profiles.default.volumes.workspace]
+path = "/workspace"
+required = true               # every container create must bind it
+
+[profiles.default.volumes.tmp]
+path = "/tmp"                 # a bind mount, replacing the read-only root's tmpfs
+
+[profiles.default.volumes.cache]
+path = "/cache"
+read_only = true
+
+# A FUSE mount containers may ask for. tenantd mounts it on the host and
+# hands the /dev/fuse connection to the caller over server.fuse_socket
+# (default /run/tenantd/fuse.sock); the caller serves it, tenantd never
+# runs filesystem code.
+[profiles.default.fuse]
+path = "/mnt"
+
 [profiles.scratch]
 images = ["ghcr.io/example/*"]
 memory = "2g"

@@ -2,6 +2,7 @@
 # Boot a distro cloud image in KVM and run the real install path against it:
 #   install package -> XFS data disk -> enable + start -> tenant + sandbox ->
 #   restart tenantd (sandbox must survive) -> processes -> containers ->
+#   volumes and FUSE ->
 #   reboot (reconcile) -> upgrade from the previous release (if one was
 #   downloaded).
 #
@@ -9,6 +10,7 @@
 set -euo pipefail
 
 distro=$1 dist=$(realpath "$2") prev=$(realpath "$3")
+ci=$(dirname "$(realpath "$0")")
 work=$(mktemp -d)
 cd "$work"
 
@@ -198,6 +200,57 @@ pcheck 'tenantd container create t1 s1 c1 -- sleep infinity
 pcheck 'tenantd container rm t1 s1 c2
         ! test -e /data/tenants/t1/sandboxes/s1/containers/c2
         tenantd container get t1 s1 c1 | grep -q " running"'
+
+# --- Volumes and FUSE: a workspace shared by containers and the host, and a
+# FUSE mount served from the host through the fd tenantd hands out --------
+# Added only now: an older release rejects the unknown slot tables.
+vm 'cat >> /etc/tenantd/tenantd.toml <<EOT
+
+[profiles.ci.volumes.workspace]
+path = "/workspace"
+
+[profiles.ci.fuse]
+path = "/mnt"
+EOT'
+vm tenantd config check
+vm systemctl reload tenantd
+put "$ci/fuse-hello.py"
+pcheck 'tenantd volume create t1 ws --mode 1777
+        for _ in $(seq 10); do
+          if tenantd container create t1 s1 v1 --volume workspace=ws -- sleep infinity; then break; fi
+          sleep 1
+        done
+        tenantd container create t1 s1 v2 --volume workspace=ws -- sleep infinity
+        tenantd exec --container v1 t1 s1 -- sh -c "echo shared > /workspace/note"
+        test "$(tenantd exec --container v2 t1 s1 -- cat /workspace/note)" = shared
+        test "$(cat /data/tenants/t1/volumes/ws/note)" = shared
+        echo host > /data/tenants/t1/volumes/ws/from-host
+        test "$(tenantd exec --container v1 t1 s1 -- cat /workspace/from-host)" = host
+        ! tenantd volume rm t1 ws
+        tenantd volume prune t1 ws --prefix note | grep -q "removed 1 entries"
+        ! test -e /data/tenants/t1/volumes/ws/note
+        ! tenantd exec --container v2 t1 s1 -- cat /workspace/note'
+pcheck 'tenantd container create t1 s1 f1 --fuse -- sleep infinity | grep -q " created"
+        nohup tenantd container attach-fuse t1 s1 f1 --start -- \
+          python3 /tmp/fuse-hello.py "hello from the host" </dev/null >/tmp/fuse.log 2>&1 &
+        for _ in $(seq 30); do
+          if tenantd container get t1 s1 f1 | grep -q " running"; then break; fi
+          sleep 1
+        done
+        cat /tmp/fuse.log
+        test "$(tenantd exec --container f1 t1 s1 -- cat /mnt/hello)" = "hello from the host"
+        tenantd exec --container f1 t1 s1 -- ls /mnt | grep -qx hello
+        tenantd container rm t1 s1 f1
+        for _ in $(seq 10); do
+          if grep -q "connection ended" /tmp/fuse.log; then break; fi
+          sleep 1
+        done
+        grep -q "connection ended" /tmp/fuse.log
+        ! grep -q /run/tenantd/fuse /proc/self/mountinfo
+        tenantd container rm t1 s1 v1
+        tenantd container rm t1 s1 v2
+        tenantd volume rm t1 ws
+        ! test -e /data/tenants/t1/volumes/ws'
 
 # --- Reboot: /run is gone, reconcile must mark exited, start must remount --
 vm 'systemctl reboot' || true

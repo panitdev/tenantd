@@ -2,6 +2,7 @@
 //! writable layer, the runtime, the image cache and the network.
 
 use std::collections::HashSet;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,11 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RuntimeKind;
 use crate::model::{
-    LayerKind, NetworkMode, ProcessIo, ResolvedImage, ResolvedProcess, ResolvedSandbox, Signal,
-    Stream,
+    LayerKind, NetworkMode, ProcessIo, PruneReport, ResolvedImage, ResolvedProcess,
+    ResolvedSandbox, Signal, Stream, VolumeOwner,
 };
 use crate::{
-    Bytes, ContainerId, ContainerKey, ProcessId, ProjectId, Result, SandboxId, SandboxKey, TenantId,
+    Bytes, ContainerId, ContainerKey, ProcessId, ProjectId, Result, SandboxId, SandboxKey,
+    TenantId, VolumeId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +89,16 @@ pub enum RootfsSpec {
     Memory(PathBuf),
     /// A read-only view of the image, used as is.
     ReadOnly(PathBuf),
+}
+
+/// A host directory bind-mounted into a container: a volume or a FUSE
+/// mount. Sources are only ever paths tenantd built itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindMount {
+    pub source: PathBuf,
+    /// Absolute path inside the container.
+    pub destination: String,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,12 +217,14 @@ pub trait RuntimeBackend: Send + Sync {
     /// on `root`, running `args` (empty: the image's entrypoint and cmd),
     /// sharing the sandbox's kernel, network and limits. The handle works
     /// with every other call here.
+    /// `mounts` are bound in after the runtime's own mounts, in order.
     async fn create_container(
         &self,
         s: &ResolvedSandbox,
         c: &ContainerKey,
         args: &[String],
         root: &RootfsSpec,
+        mounts: &[BindMount],
         net: &NetAttachment,
     ) -> Result<RuntimeHandle>;
     async fn start(&self, h: &RuntimeHandle) -> Result<()>;
@@ -291,4 +305,55 @@ pub trait NetworkBackend: Send + Sync {
     /// Detach and remove the namespace. Idempotent.
     async fn teardown(&self, key: &SandboxKey) -> Result<()>;
     async fn list_owned(&self) -> Result<Vec<SandboxKey>>;
+}
+
+/// Volume directories inside tenant directories, so the tenant's quota
+/// counts what is written to them.
+#[async_trait]
+pub trait VolumeBackend: Send + Sync {
+    /// Where volume `v` lives. Pure; touches nothing.
+    fn path(&self, tenant_dir: &Path, v: &VolumeId) -> PathBuf;
+    /// Create the directory with `owner`, or bring an existing one's owner
+    /// and mode back to it. Callers on the host reach the path, so its
+    /// parents are made traversable. Idempotent.
+    async fn create(&self, tenant_dir: &Path, v: &VolumeId, owner: VolumeOwner) -> Result<PathBuf>;
+    /// Whether the directory exists.
+    async fn exists(&self, tenant_dir: &Path, v: &VolumeId) -> Result<bool>;
+    /// Remove the directory and everything in it, never crossing into a
+    /// mount. Idempotent.
+    async fn delete(&self, tenant_dir: &Path, v: &VolumeId) -> Result<()>;
+    /// Remove what is at or below `prefix` (relative to the volume root;
+    /// empty is the whole volume, which itself stays) and was last
+    /// accessed, modified or changed at or before `cutoff` (Unix seconds;
+    /// `None` removes everything). Directories go once empty. Never follows
+    /// symlinks or crosses mounts.
+    async fn prune(
+        &self,
+        tenant_dir: &Path,
+        v: &VolumeId,
+        prefix: &Path,
+        cutoff: Option<i64>,
+    ) -> Result<PruneReport>;
+    /// Volume directories under the tenant dir. For reconcile.
+    async fn list_owned(&self, tenant_dir: &Path) -> Result<Vec<VolumeId>>;
+}
+
+/// Containers' FUSE connections: a host FUSE mount per container, which
+/// the container bind-mounts and whose `/dev/fuse` fd tenantd hands to the
+/// caller, who serves it. tenantd runs no filesystem code; it holds a
+/// duplicate of each fd so that the connection, and the mount, outlive the
+/// caller's server until the container ends.
+#[async_trait]
+pub trait FuseBackend: Send + Sync {
+    /// Mount a fresh connection for `c`, unless one tenantd holds is
+    /// mounted already. Returns the host mount point.
+    async fn mount(&self, c: &ContainerKey) -> Result<PathBuf>;
+    /// A duplicate of the connection's fd, or `None` when tenantd holds no
+    /// connection for `c` (none mounted, or lost with a tenantd restart).
+    fn connection(&self, c: &ContainerKey) -> Result<Option<OwnedFd>>;
+    /// Abort the connection, so blocked callers fail rather than hang,
+    /// unmount it and close tenantd's fd. Idempotent.
+    async fn unmount(&self, c: &ContainerKey) -> Result<()>;
+    /// Containers with a mount point on the host. For reconcile.
+    async fn list_owned(&self) -> Result<Vec<ContainerKey>>;
 }

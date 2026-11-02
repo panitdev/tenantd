@@ -5,6 +5,7 @@
 
 mod api;
 mod cli;
+mod fuse_socket;
 mod metrics;
 mod serve;
 mod service;

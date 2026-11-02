@@ -1,6 +1,6 @@
 [package]
 name = "tenantd-layer"
-description = "host-overlay, memory and read-only writable layers for tenantd"
+description = "Writable layers, volumes and FUSE mounts on the host for tenantd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

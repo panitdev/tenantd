@@ -82,6 +82,8 @@ id_type!(TenantId, "tenant");
 id_type!(SandboxId, "sandbox");
 id_type!(ProcessId, "process");
 id_type!(ContainerId, "container");
+id_type!(VolumeId, "volume");
+id_type!(SlotName, "slot");
 
 /// A sandbox is scoped to its tenant. The key renders as `<tenant>.<sandbox>`;
 /// `.` is outside the ID alphabet, so the split is unambiguous.
@@ -185,6 +187,25 @@ impl FromStr for ContainerKey {
             }),
             _ => Err(Error::invalid(format!("bad container key {s:?}"))),
         }
+    }
+}
+
+/// A volume is scoped to its tenant. Renders as `<tenant>.<volume>`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct VolumeKey {
+    pub tenant: TenantId,
+    pub volume: VolumeId,
+}
+
+impl VolumeKey {
+    pub fn new(tenant: TenantId, volume: VolumeId) -> Self {
+        Self { tenant, volume }
+    }
+}
+
+impl fmt::Display for VolumeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.tenant, self.volume)
     }
 }
 

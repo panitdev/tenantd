@@ -2,11 +2,12 @@
 //! state store before touching the host, and every host step is idempotent,
 //! so a crash at any point leaves something reconcile can finish or undo.
 //!
-//! Locking: one async mutex per tenant, sandbox, container and process,
-//! always taken in that order. Tenant locks cover admission and tenant
-//! lifecycle; sandbox locks cover host work on one sandbox; container locks
-//! cover host work on one container; process locks cover one process's exec
-//! and row.
+//! Locking: one async mutex per tenant, sandbox, volume, container and
+//! process, always taken in that order. Tenant locks cover admission and
+//! tenant lifecycle; sandbox locks cover host work on one sandbox; volume
+//! locks cover one volume's row and directory (and container creates that
+//! bind it); container locks cover host work on one container; process
+//! locks cover one process's exec and row.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -18,8 +19,8 @@ use tokio::sync::{OwnedMutexGuard, broadcast, watch};
 use tracing::{info, warn};
 
 use crate::backend::{
-    ImageStore, NetworkBackend, OutputStore, RuntimeBackend, RuntimeEvent, RuntimeHandle,
-    RuntimeState, StorageBackend, Usage, WritableLayer,
+    FuseBackend, ImageStore, NetworkBackend, OutputStore, RuntimeBackend, RuntimeEvent,
+    RuntimeHandle, RuntimeState, StorageBackend, Usage, VolumeBackend, WritableLayer,
 };
 use crate::config::Config;
 use crate::events::{Event, EventKind};
@@ -29,7 +30,8 @@ use crate::model::{
 use crate::policy;
 use crate::state::StateStore;
 use crate::{
-    ContainerKey, Error, ProcessKey, ProjectId, Result, SandboxId, SandboxKey, TenantId, now,
+    ContainerKey, Error, ProcessKey, ProjectId, Result, SandboxId, SandboxKey, TenantId, VolumeKey,
+    now,
 };
 
 pub struct Backends {
@@ -39,6 +41,8 @@ pub struct Backends {
     pub images: Arc<dyn ImageStore>,
     pub network: Arc<dyn NetworkBackend>,
     pub output: Arc<dyn OutputStore>,
+    pub volumes: Arc<dyn VolumeBackend>,
+    pub fuse: Arc<dyn FuseBackend>,
     pub state: Arc<dyn StateStore>,
 }
 
@@ -64,9 +68,12 @@ pub struct Tenantd {
     pub(crate) images: Arc<dyn ImageStore>,
     pub(crate) network: Arc<dyn NetworkBackend>,
     pub(crate) output: Arc<dyn OutputStore>,
+    pub(crate) volumes: Arc<dyn VolumeBackend>,
+    pub(crate) fuse: Arc<dyn FuseBackend>,
     pub(crate) state: Arc<dyn StateStore>,
     pub(crate) tenant_locks: KeyedLocks<TenantId>,
     pub(crate) sandbox_locks: KeyedLocks<SandboxKey>,
+    pub(crate) volume_locks: KeyedLocks<VolumeKey>,
     pub(crate) container_locks: KeyedLocks<ContainerKey>,
     pub(crate) process_locks: KeyedLocks<ProcessKey>,
     /// Bumped whenever a process row changes state, so waiters and output
@@ -81,6 +88,9 @@ pub struct Tenantd {
     pub(crate) blocked: Mutex<HashMap<TenantId, String>>,
     /// Project IDs found on disk without a row; never handed out.
     pub(crate) reserved_projects: Mutex<HashSet<u32>>,
+    /// Containers whose FUSE connection was handed to a server since it
+    /// was mounted. A FUSE container starts only once it is here.
+    pub(crate) fuse_attached: Mutex<HashSet<ContainerKey>>,
 }
 
 impl Tenantd {
@@ -96,9 +106,12 @@ impl Tenantd {
             images: b.images,
             network: b.network,
             output: b.output,
+            volumes: b.volumes,
+            fuse: b.fuse,
             state: b.state,
             tenant_locks: KeyedLocks::default(),
             sandbox_locks: KeyedLocks::default(),
+            volume_locks: KeyedLocks::default(),
             container_locks: KeyedLocks::default(),
             process_locks: KeyedLocks::default(),
             process_epoch: watch::Sender::new(0),
@@ -107,6 +120,7 @@ impl Tenantd {
             health: Mutex::new(Vec::new()),
             blocked: Mutex::new(HashMap::new()),
             reserved_projects: Mutex::new(HashSet::new()),
+            fuse_attached: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -293,18 +307,20 @@ impl Tenantd {
         self.state.list_tenants().await
     }
 
-    /// Fails while sandboxes exist unless `force`. Deleting a missing tenant
-    /// succeeds.
+    /// Fails while sandboxes or volumes exist unless `force`. Deleting a
+    /// missing tenant succeeds.
     pub async fn delete_tenant(&self, id: &TenantId, force: bool) -> Result<()> {
         let _t = self.tenant_locks.lock(id.clone()).await;
         let Some(mut rec) = self.state.get_tenant(id).await? else {
             return Ok(());
         };
         let sandboxes = self.state.list_sandboxes(Some(id)).await?;
-        if !sandboxes.is_empty() && !force {
+        let volumes = self.state.list_volumes(Some(id)).await?;
+        if (!sandboxes.is_empty() || !volumes.is_empty()) && !force {
             return Err(Error::FailedPrecondition(format!(
-                "tenant {id} has {} sandboxes; destroy them or pass force",
-                sandboxes.len()
+                "tenant {id} has {} sandboxes and {} volumes; delete them or pass force",
+                sandboxes.len(),
+                volumes.len()
             )));
         }
         rec.state = TenantState::Deleting;
@@ -321,6 +337,10 @@ impl Tenantd {
                 self.destroy_locked(s).await?;
             }
         }
+        for v in self.state.list_volumes(Some(&rec.id)).await? {
+            let _v = self.volume_locks.lock(v.key()).await;
+            self.finish_delete_volume(&v).await?;
+        }
         let dir = self.storage.tenant_dir(&rec.id);
         if let Some(layer) = self.layers.values().next() {
             for orphan in layer.list_owned(&dir).await.unwrap_or_default() {
@@ -336,7 +356,7 @@ impl Tenantd {
         Ok(())
     }
 
-    async fn ready_tenant(&self, id: &TenantId) -> Result<TenantRecord> {
+    pub(crate) async fn ready_tenant(&self, id: &TenantId) -> Result<TenantRecord> {
         let rec = self
             .state
             .get_tenant(id)

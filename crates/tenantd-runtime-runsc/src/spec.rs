@@ -10,7 +10,7 @@ use oci_spec::runtime::{
     MountBuilder, PosixRlimitBuilder, PosixRlimitType, Process, ProcessBuilder, RootBuilder, Spec,
     SpecBuilder, UserBuilder,
 };
-use tenantd_core::backend::{NetAttachment, RootfsSpec};
+use tenantd_core::backend::{BindMount, NetAttachment, RootfsSpec};
 use tenantd_core::error::Context;
 use tenantd_core::model::{NetworkMode, ResolvedProcess, ResolvedSandbox};
 use tenantd_core::{Error, Result};
@@ -361,20 +361,49 @@ pub fn build(
 pub const CONTAINER_TYPE: &str = "io.kubernetes.cri.container-type";
 pub const SANDBOX_ID: &str = "io.kubernetes.cri.sandbox-id";
 
+/// Bind mounts of volumes and FUSE mounts: never suid or devices. A bind
+/// at `/tmp` replaces the read-only root's tmpfs there. runsc serves them
+/// through the gofer with its default `--file-access-mounts=shared`, so
+/// writes from the host show up inside and the other way round.
+fn add_binds(spec: &mut Spec, binds: &[BindMount]) -> Result<()> {
+    if binds.is_empty() {
+        return Ok(());
+    }
+    let mut mounts = spec.mounts().clone().unwrap_or_default();
+    mounts.retain(|m| {
+        !binds
+            .iter()
+            .any(|b| Path::new(&b.destination) == m.destination())
+    });
+    for b in binds {
+        let access = if b.read_only { "ro" } else { "rw" };
+        mounts.push(mount(
+            &b.destination,
+            "bind",
+            &b.source.to_string_lossy(),
+            &["rbind", access, "nosuid", "nodev"],
+        )?);
+    }
+    spec.set_mounts(Some(mounts));
+    Ok(())
+}
+
 /// `config.json` for a container in the sandbox `s`, which runs as
 /// `sandbox_id`: the sandbox's process (with `args` in place of the image's
 /// command, unless empty), mounts and namespaces on the container's own
-/// root, and no cgroup or resources of its own, since the sandbox's limits
-/// cover every container in it.
+/// root plus the `binds`, and no cgroup or resources of its own, since the
+/// sandbox's limits cover every container in it.
 pub fn build_container(
     s: &ResolvedSandbox,
     sandbox_id: &str,
     args: &[String],
     root: &RootfsSpec,
+    binds: &[BindMount],
     net: &NetAttachment,
     files: &BundleFiles,
 ) -> Result<Spec> {
     let mut spec = build(s, root, net, files)?;
+    add_binds(&mut spec, binds)?;
     if !args.is_empty()
         && let Some(p) = spec.process_mut()
     {
@@ -485,7 +514,7 @@ mod tests {
             netns: "/run/tenantd/netns/t.s".into(),
         };
         let root = RootfsSpec::Path("/t/sandboxes/s/containers/c/rootfs".into());
-        let spec = build_container(&s, "t.s", &[], &root, &net, &files).unwrap();
+        let spec = build_container(&s, "t.s", &[], &root, &[], &net, &files).unwrap();
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["annotations"][CONTAINER_TYPE], "container");
         assert_eq!(v["annotations"][SANDBOX_ID], "t.s");
@@ -505,10 +534,54 @@ mod tests {
             serde_json::json!(["/bin/sh", "-c", "sleep 1"])
         );
         let args = ["sleep".to_string(), "infinity".to_string()];
-        let spec = build_container(&s, "t.s", &args, &root, &net, &files).unwrap();
+        let spec = build_container(&s, "t.s", &args, &root, &[], &net, &files).unwrap();
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["process"]["args"], serde_json::json!(args));
         assert_eq!(v["process"]["user"]["uid"], 1000);
+    }
+
+    #[test]
+    fn container_binds_volumes_and_fuse_in_place_of_tmpfs() {
+        let s = sandbox(); // read-only root: /tmp is a tmpfs
+        let files = BundleFiles {
+            resolv_conf: None,
+            hosts: "/b/hosts".into(),
+        };
+        let net = NetAttachment {
+            netns: "/run/tenantd/netns/t.s".into(),
+        };
+        let root = RootfsSpec::ReadOnly("/r".into());
+        let bind = |src: &str, dst: &str, ro| BindMount {
+            source: src.into(),
+            destination: dst.into(),
+            read_only: ro,
+        };
+        let binds = [
+            bind("/data/tenants/t/volumes/ws", "/workspace", false),
+            bind("/data/tenants/t/volumes/tmp", "/tmp", false),
+            bind("/data/tenants/t/volumes/c", "/cache", true),
+            bind("/run/tenantd/fuse/t.s.c", "/mnt", false),
+        ];
+        let spec = build_container(&s, "t.s", &[], &root, &binds, &net, &files).unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        let mounts = v["mounts"].as_array().unwrap();
+        let find = |d: &str| -> Vec<&serde_json::Value> {
+            mounts.iter().filter(|m| m["destination"] == d).collect()
+        };
+        let tmp = find("/tmp");
+        assert_eq!(tmp.len(), 1, "the tmpfs is replaced, not shadowed");
+        assert_eq!(tmp[0]["type"], "bind");
+        assert_eq!(tmp[0]["source"], "/data/tenants/t/volumes/tmp");
+        let ws = find("/workspace")[0];
+        assert_eq!(
+            ws["options"],
+            serde_json::json!(["rbind", "rw", "nosuid", "nodev"])
+        );
+        assert_eq!(find("/cache")[0]["options"][1], "ro");
+        assert_eq!(find("/mnt")[0]["source"], "/run/tenantd/fuse/t.s.c");
+        // The runtime's own mounts come first and stay.
+        assert_eq!(mounts[0]["destination"], "/proc");
+        assert_eq!(find("/etc/hosts").len(), 1);
     }
 
     #[test]

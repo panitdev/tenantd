@@ -8,18 +8,18 @@ use std::time::{Duration, Instant};
 use futures::Stream;
 use tenantd_client::pb::{
     self, containers_server::Containers, processes_server::Processes, sandboxes_server::Sandboxes,
-    system_server::System, tenants_server::Tenants,
+    system_server::System, tenants_server::Tenants, volumes_server::Volumes,
 };
 use tenantd_core::events::{Event, EventKind};
 use tenantd_core::model::{
-    ContainerRecord, Overrides, ProcessRecord, ProcessSpec, SandboxRecord, Signal, TenantLimits,
-    TenantRecord,
+    ContainerRecord, ContainerSpec, Overrides, ProcessRecord, ProcessSpec, SandboxRecord, Signal,
+    TenantLimits, TenantRecord, VolumeOwner, VolumeRecord,
 };
 use tenantd_core::process::OutputChunk;
 use tenantd_core::service::TenantInfo;
 use tenantd_core::{
-    ContainerId, ContainerKey, Error, ProcessId, ProcessKey, SandboxId, SandboxKey, TenantId,
-    Tenantd,
+    ContainerId, ContainerKey, Error, ProcessId, ProcessKey, SandboxId, SandboxKey, SlotName,
+    TenantId, Tenantd, VolumeId, VolumeKey,
 };
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -102,6 +102,35 @@ fn pb_container(r: ContainerRecord) -> pb::Container {
         created_at: r.created_at,
         updated_at: r.updated_at,
         args: r.args,
+        volumes: r
+            .volumes
+            .into_iter()
+            .map(|m| pb::VolumeMount {
+                slot: m.slot.into(),
+                volume: m.volume.into(),
+                path: m.path,
+                read_only: m.read_only,
+            })
+            .collect(),
+        fuse_path: r.fuse.unwrap_or_default(),
+    }
+}
+
+fn volume_key(t: &str, v: &str) -> tenantd_core::Result<VolumeKey> {
+    Ok(VolumeKey::new(tenant_id(t)?, VolumeId::new(v)?))
+}
+
+fn pb_volume(t: &Tenantd, r: VolumeRecord) -> pb::Volume {
+    pb::Volume {
+        path: t.volume_path(&r).to_string_lossy().into_owned(),
+        tenant: r.tenant.into(),
+        id: r.id.into(),
+        state: r.state.as_str().into(),
+        uid: r.owner.uid,
+        gid: r.owner.gid,
+        mode: r.owner.mode,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
     }
 }
 
@@ -482,9 +511,30 @@ impl Containers for Api {
         let r = req.into_inner();
         self.timed("CreateContainer", async {
             let key = container_key(&r.tenant, &r.sandbox, &r.id)?;
+            let spec = ContainerSpec {
+                args: r.args,
+                volumes: r
+                    .volumes
+                    .into_iter()
+                    .map(|(slot, v)| Ok((SlotName::new(slot)?, VolumeId::new(v)?)))
+                    .collect::<tenantd_core::Result<_>>()?,
+                fuse: r.fuse,
+            };
             Ok(pb_container(
-                self.tenantd.create_container(key, r.args).await?,
+                self.tenantd.create_container(key, spec).await?,
             ))
+        })
+        .await
+    }
+
+    async fn start_container(
+        &self,
+        req: Request<pb::ContainerRef>,
+    ) -> Result<Response<pb::Container>, Status> {
+        let r = req.into_inner();
+        self.timed("StartContainer", async {
+            let key = container_key(&r.tenant, &r.sandbox, &r.id)?;
+            Ok(pb_container(self.tenantd.start_container(&key).await?))
         })
         .await
     }
@@ -525,6 +575,99 @@ impl Containers for Api {
             let key = container_key(&r.tenant, &r.sandbox, &r.id)?;
             self.tenantd.delete_container(&key).await?;
             Ok(pb::DeleteContainerResponse {})
+        })
+        .await
+    }
+}
+
+#[tonic::async_trait]
+impl Volumes for Api {
+    async fn create_volume(
+        &self,
+        req: Request<pb::CreateVolumeRequest>,
+    ) -> Result<Response<pb::Volume>, Status> {
+        let r = req.into_inner();
+        self.timed("CreateVolume", async {
+            let key = volume_key(&r.tenant, &r.id)?;
+            let d = VolumeOwner::default();
+            let owner = VolumeOwner {
+                uid: r.uid.unwrap_or(d.uid),
+                gid: r.gid.unwrap_or(d.gid),
+                mode: r.mode.unwrap_or(d.mode),
+            };
+            let rec = self.tenantd.create_volume(key, owner).await?;
+            Ok(pb_volume(&self.tenantd, rec))
+        })
+        .await
+    }
+
+    async fn get_volume(
+        &self,
+        req: Request<pb::VolumeRef>,
+    ) -> Result<Response<pb::Volume>, Status> {
+        let r = req.into_inner();
+        self.timed("GetVolume", async {
+            let rec = self
+                .tenantd
+                .get_volume(&volume_key(&r.tenant, &r.id)?)
+                .await?;
+            Ok(pb_volume(&self.tenantd, rec))
+        })
+        .await
+    }
+
+    async fn list_volumes(
+        &self,
+        req: Request<pb::ListVolumesRequest>,
+    ) -> Result<Response<pb::ListVolumesResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("ListVolumes", async {
+            let recs = self.tenantd.list_volumes(&tenant_id(&r.tenant)?).await?;
+            Ok(pb::ListVolumesResponse {
+                volumes: recs
+                    .into_iter()
+                    .map(|v| pb_volume(&self.tenantd, v))
+                    .collect(),
+            })
+        })
+        .await
+    }
+
+    async fn delete_volume(
+        &self,
+        req: Request<pb::VolumeRef>,
+    ) -> Result<Response<pb::DeleteVolumeResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("DeleteVolume", async {
+            self.tenantd
+                .delete_volume(&volume_key(&r.tenant, &r.id)?)
+                .await?;
+            Ok(pb::DeleteVolumeResponse {})
+        })
+        .await
+    }
+
+    async fn prune_volume(
+        &self,
+        req: Request<pb::PruneVolumeRequest>,
+    ) -> Result<Response<pb::PruneVolumeResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("PruneVolume", async {
+            let v = r
+                .volume
+                .ok_or_else(|| Error::invalid("volume is required"))?;
+            let rep = self
+                .tenantd
+                .prune_volume(
+                    &volume_key(&v.tenant, &v.id)?,
+                    &r.path_prefix,
+                    r.older_than_secs,
+                )
+                .await?;
+            Ok(pb::PruneVolumeResponse {
+                removed_entries: rep.entries,
+                removed_bytes: rep.bytes,
+            })
         })
         .await
     }

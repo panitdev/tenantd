@@ -114,7 +114,7 @@ async fn container_lifecycle() {
     );
     // Its own root, inside the sandbox's directory, on the sandbox's layer.
     assert!(has_root(&env, &k));
-    let (created, args, root) = env.host.runtime.created_containers.lock().unwrap()[0].clone();
+    let (created, args, root, _) = env.host.runtime.created_containers.lock().unwrap()[0].clone();
     assert_eq!(created, k);
     assert!(args.is_empty(), "the image's own command");
     assert_eq!(
@@ -385,7 +385,7 @@ async fn roots_go_with_a_layer_that_does_not_survive_stop() {
         .await
         .unwrap();
     assert_eq!(rec.state, ContainerState::Running);
-    let (_, _, root) = env.host.runtime.created_containers.lock().unwrap()[0].clone();
+    let (_, _, root, _) = env.host.runtime.created_containers.lock().unwrap()[0].clone();
     assert!(matches!(root, RootfsSpec::Memory(_)));
     env.tenantd
         .stop_sandbox(&tid("t"), &SandboxId::new("box").unwrap())
@@ -452,6 +452,8 @@ async fn reconcile_keeps_finishes_and_ends_containers() {
             sandbox: SandboxId::new("box").unwrap(),
             id: half.id.clone(),
             args: vec![],
+            volumes: vec![],
+            fuse: None,
             state: ContainerState::Creating,
             exit_code: None,
             created_at: 1,
@@ -579,7 +581,7 @@ async fn an_init_command_needs_exec_rights() {
         .await
         .unwrap();
     assert_eq!(rec.args, sleep());
-    let (_, args, _) = env.host.runtime.created_containers.lock().unwrap()[0].clone();
+    let (_, args, _, _) = env.host.runtime.created_containers.lock().unwrap()[0].clone();
     assert_eq!(args, sleep());
     // Same command: the same container; another: a conflict.
     assert_eq!(

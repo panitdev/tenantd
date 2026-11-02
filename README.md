@@ -96,12 +96,20 @@ tenantd container create acme box1 s1 -- sleep infinity  # own root, same sandbo
 tenantd exec --container s1 acme box1 -- make test
 tenantd process logs acme box1 build1 -f
 
+tenantd volume create acme ws --uid 1000 --gid 1000 --mode 1777
+tenantd container create acme box1 s2 --volume workspace=ws -- sleep infinity
+tenantd volume prune acme ws --prefix s-1 --older-than 0   # drop a session's files
+
+tenantd container create acme box1 s3 --fuse -- sleep infinity    # waits "created"
+tenantd container attach-fuse acme box1 s3 --start -- ./my-fuse-server /dev/fd/3
+
 tenantd sandbox stop acme box1                  # writable layer is kept
 tenantd sandbox start acme box1
 ```
 
 The CLI talks to the running daemon over `/run/tenantd/api.sock` (override
-with `--socket` or `TENANTD_SOCKET`). Any UID listed in the config can use
+with `--socket` or `TENANTD_SOCKET`); `attach-fuse` also uses
+`/run/tenantd/fuse.sock` (`--fuse-socket` or `TENANTD_FUSE_SOCKET`). Any UID listed in the config can use
 it. Run `tenantd --help` for the full command list, including `process ps`,
 `process kill`, `process wait`, `events` and `health`.
 
@@ -119,6 +127,21 @@ it. Run `tenantd --help` for the full command list, including `process ps`,
   sandbox's gVisor kernel, network and limits, so many of them cost one
   sandbox. runsc adds them to the running sandbox; they are never
   restarted, and stopping the sandbox ends them.
+- **Volumes.** A volume is a directory in the tenant's project, so it
+  counts against the same quota, and the only state that outlives a
+  container. A container mounts volumes only through the slots its profile
+  declares (`[profiles.<name>.volumes.<slot>]`), bound when it is created.
+  Callers on the host can use a volume at its path; its root takes the
+  owner (root or a caller UID) and mode it was created with. Prune removes
+  what under a path hasn't been used for a while, never following symlinks.
+- **FUSE.** A container can ask for its profile's FUSE slot. tenantd
+  mounts a FUSE filesystem on the host and bind-mounts it into the
+  container, where gVisor serves it like any host directory. The caller
+  runs the filesystem: it takes the mount's `/dev/fuse` connection from
+  the FUSE socket (`/run/tenantd/fuse.sock`, protocol in
+  [`proto/tenantd.proto`](proto/tenantd.proto)) and then starts the
+  container. tenantd holds on to the connection, so a server that
+  restarts can attach again, but runs no filesystem code itself.
 - **Policy.** Everything a caller can do is defined by a profile in the
   operator's config: allowed images, resources, network and exec rights. A
   denial returns `PERMISSION_DENIED` naming the rule, for example
@@ -146,6 +169,6 @@ cargo test -p tenantd-image -- --ignored pulls_a_real_image   # needs network
 sudo TENANTD_XFS_TEST_ROOT=/mnt/xfs cargo test -p tenantd-storage-xfs -- --ignored
 ```
 
-The ignored tests use real overlay mounts, network namespaces, registries and
-XFS quotas. `crates/tenantd-testkit` runs the whole service against fake
+The ignored tests use real overlay and FUSE mounts, network namespaces,
+registries and XFS quotas. `crates/tenantd-testkit` runs the whole service against fake
 backends, including crash-injection scenarios.

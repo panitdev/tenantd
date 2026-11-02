@@ -10,7 +10,7 @@ use crate::Tenantd;
 use crate::backend::RuntimeHandle;
 use crate::backend::RuntimeState;
 use crate::events::EventKind;
-use crate::model::{ContainerState, ProcessState, SandboxState, TenantState};
+use crate::model::{ContainerState, ProcessState, SandboxState, TenantState, VolumeState};
 use crate::process::handle;
 use crate::{ContainerKey, ProjectId, SandboxKey, TenantId, now};
 
@@ -46,7 +46,9 @@ impl Tenantd {
         self.check_health().await;
         self.reconcile_tenants(&mut rep).await;
         self.reconcile_sandboxes(&mut rep).await;
+        self.reconcile_volumes(&mut rep).await;
         self.reconcile_containers(&mut rep).await;
+        self.reconcile_fuse(&mut rep).await;
         self.reconcile_processes(&mut rep).await;
         self.reconcile_images(&mut rep).await;
         rep
@@ -412,12 +414,12 @@ impl Tenantd {
                                 sandbox.state.as_str()
                             )));
                         }
-                        self.bring_up_container(&sandbox, &rec).await?;
-                        self.set_container_state(&mut rec, ContainerState::Running)
-                            .await
+                        let state = self.bring_up_container(&sandbox, &rec).await?;
+                        self.set_container_state(&mut rec, state).await?;
+                        Ok(state)
                     };
                     match res.await {
-                        Ok(()) => rep.act(self, "finish_create", &target, "running"),
+                        Ok(state) => rep.act(self, "finish_create", &target, state.as_str()),
                         Err(e) => {
                             let undo = async {
                                 self.tear_down_container(&sandbox, &rec, true).await?;
@@ -430,6 +432,46 @@ impl Tenantd {
                                 }
                             }
                         }
+                    }
+                }
+                // Waiting for its FUSE server. A runtime container exists
+                // only if a start was cut short: one that runs is adopted,
+                // anything else removed. A FUSE connection lost with a
+                // restart is replaced, and its server has to attach again.
+                ContainerState::Created => {
+                    if !sandbox_running {
+                        match self.mark_container_exited(&sandbox, &mut rec, None).await {
+                            Ok(()) => rep.act(
+                                self,
+                                "mark_exited",
+                                &target,
+                                format!("sandbox {}", sandbox.state.as_str()),
+                            ),
+                            Err(e) => rep.err(&target, e),
+                        }
+                        continue;
+                    }
+                    let res = async {
+                        match self.runtime.inspect(&h).await? {
+                            RuntimeState::Running => {
+                                self.runtime.watch(&h).await?;
+                                self.set_container_state(&mut rec, ContainerState::Running)
+                                    .await?;
+                                return Ok(Some("adopted a container started before a crash"));
+                            }
+                            RuntimeState::Missing => {}
+                            _ => self.remove_runtime_container(&key).await?,
+                        }
+                        let lost = rec.fuse.is_some() && self.fuse.connection(&key)?.is_none();
+                        self.prepare_container(&sandbox, &rec).await?;
+                        Ok::<_, crate::Error>(
+                            lost.then_some("remounted FUSE; its server must attach again"),
+                        )
+                    };
+                    match res.await {
+                        Ok(Some(what)) => rep.act(self, "resume_created", &target, what),
+                        Ok(None) => {}
+                        Err(e) => rep.err(&target, e),
                     }
                 }
                 ContainerState::Destroying => {
@@ -480,6 +522,131 @@ impl Tenantd {
                     },
                     Err(e) => rep.err(&target, e),
                 },
+            }
+        }
+    }
+
+    /// FUSE mounts on the host whose container has no row, or no longer
+    /// waits for or runs with one, are unmounted.
+    async fn reconcile_fuse(&self, rep: &mut ReconcileReport) {
+        let mounted = match self.fuse.list_owned().await {
+            Ok(v) => v,
+            Err(e) => return rep.err("fuse", e),
+        };
+        for key in mounted {
+            let _c = self.container_locks.lock(key.clone()).await;
+            let keep = match self.state.get_container(&key).await {
+                Ok(Some(c)) => {
+                    c.fuse.is_some()
+                        && matches!(
+                            c.state,
+                            ContainerState::Creating
+                                | ContainerState::Created
+                                | ContainerState::Running
+                        )
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    rep.err(format!("fuse/{key}"), e);
+                    continue;
+                }
+            };
+            if keep {
+                continue;
+            }
+            self.fuse_attached.lock().unwrap().remove(&key);
+            match self.fuse.unmount(&key).await {
+                Ok(()) => rep.act(
+                    self,
+                    "delete_orphan_fuse_mount",
+                    format!("fuse/{key}"),
+                    "unmounted",
+                ),
+                Err(e) => rep.err(format!("fuse/{key}"), e),
+            }
+        }
+    }
+
+    /// Volumes left mid-create or mid-delete are finished; volume
+    /// directories with no row are reported, or removed with
+    /// `reconcile.delete_orphans`; a ready volume whose directory is gone
+    /// is reported.
+    async fn reconcile_volumes(&self, rep: &mut ReconcileReport) {
+        let rows = match self.state.list_volumes(None).await {
+            Ok(r) => r,
+            Err(e) => return rep.err("state", e),
+        };
+        for row in &rows {
+            let key = row.key();
+            let target = format!("volume/{key}");
+            let _v = self.volume_locks.lock(key.clone()).await;
+            let mut rec = match self.state.get_volume(&key.tenant, &key.volume).await {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) => {
+                    rep.err(&target, e);
+                    continue;
+                }
+            };
+            let dir = self.storage.tenant_dir(&rec.tenant);
+            match rec.state {
+                VolumeState::Creating => match self.finish_create_volume(&mut rec).await {
+                    Ok(()) => rep.act(self, "finish_create", &target, "ready"),
+                    Err(e) => rep.act(self, "rollback_create", &target, e),
+                },
+                VolumeState::Deleting => match self.finish_delete_volume(&rec).await {
+                    Ok(()) => rep.act(self, "finish_delete", &target, "deleted"),
+                    Err(e) => rep.err(&target, e),
+                },
+                VolumeState::Ready => match self.volumes.exists(&dir, &rec.id).await {
+                    Ok(true) => {}
+                    Ok(false) => rep.err(&target, "directory missing"),
+                    Err(e) => rep.err(&target, e),
+                },
+            }
+        }
+
+        let known: HashSet<crate::VolumeKey> = rows.iter().map(|r| r.key()).collect();
+        let delete = self.config().reconcile.delete_orphans;
+        let tenants = match self.state.list_tenants().await {
+            Ok(t) => t,
+            Err(e) => return rep.err("state", e),
+        };
+        for t in tenants
+            .into_iter()
+            .filter(|t| t.state == TenantState::Ready)
+        {
+            let dir = self.storage.tenant_dir(&t.id);
+            let owned = match self.volumes.list_owned(&dir).await {
+                Ok(v) => v,
+                Err(e) => {
+                    rep.err(format!("tenant/{}", t.id), e);
+                    continue;
+                }
+            };
+            for v in owned {
+                let key = crate::VolumeKey::new(t.id.clone(), v.clone());
+                if known.contains(&key) {
+                    continue;
+                }
+                let _v = self.volume_locks.lock(key.clone()).await;
+                if matches!(self.state.get_volume(&t.id, &v).await, Ok(Some(_))) {
+                    continue; // created since we listed
+                }
+                let target = format!("volume-dir/{key}");
+                if !delete {
+                    rep.act(
+                        self,
+                        "orphan_volume_dir",
+                        &target,
+                        "no row; kept (reconcile.delete_orphans = false)",
+                    );
+                    continue;
+                }
+                match self.volumes.delete(&dir, &v).await {
+                    Ok(()) => rep.act(self, "delete_orphan_volume_dir", &target, "removed"),
+                    Err(e) => rep.err(&target, e),
+                }
             }
         }
     }

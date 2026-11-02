@@ -86,6 +86,42 @@ fn unescape(s: &str) -> PathBuf {
     PathBuf::from(std::ffi::OsStr::from_bytes(&out))
 }
 
+/// One `/proc/self/mountinfo` line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountEntry {
+    pub point: PathBuf,
+    /// The superblock's device number, `major:minor`.
+    pub dev: (u32, u32),
+    pub fstype: String,
+}
+
+pub fn parse_mountinfo(mountinfo: &str) -> Vec<MountEntry> {
+    mountinfo
+        .lines()
+        .filter_map(|l| {
+            let fields: Vec<&str> = l.split(' ').collect();
+            let (maj, min) = fields.get(2)?.split_once(':')?;
+            let sep = fields.iter().position(|f| *f == "-")?;
+            Some(MountEntry {
+                point: unescape(fields.get(4)?),
+                dev: (maj.parse().ok()?, min.parse().ok()?),
+                fstype: fields.get(sep + 1)?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Mounts at or below `dir`, deepest first.
+pub fn mount_entries_under(dir: &Path) -> io::Result<Vec<MountEntry>> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mut v: Vec<MountEntry> = parse_mountinfo(&info)
+        .into_iter()
+        .filter(|m| m.point.starts_with(dir))
+        .collect();
+    v.sort_by_key(|m| std::cmp::Reverse(m.point.components().count()));
+    Ok(v)
+}
+
 pub fn parse_mountpoints(mountinfo: &str) -> Vec<PathBuf> {
     mountinfo
         .lines()
@@ -118,6 +154,14 @@ mod tests {
     fn parses_mountinfo() {
         let info = "36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw\n\
                     37 35 0:5 / /data/tenants/a/sandboxes/b\\040c/rootfs rw - overlay overlay rw,lowerdir=x\n";
+        assert_eq!(
+            parse_mountinfo(info)[1],
+            MountEntry {
+                point: PathBuf::from("/data/tenants/a/sandboxes/b c/rootfs"),
+                dev: (0, 5),
+                fstype: "overlay".into(),
+            }
+        );
         assert_eq!(
             parse_mountpoints(info),
             vec![

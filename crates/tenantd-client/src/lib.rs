@@ -1,4 +1,5 @@
-//! gRPC types for tenantd plus a Unix-socket connector for control planes.
+//! gRPC types for tenantd plus a Unix-socket connector for control planes,
+//! and [`fuse::attach_fuse`] for taking a container's FUSE connection.
 //!
 //! ```no_run
 //! # async fn f() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,6 +14,8 @@ use std::path::PathBuf;
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 
+pub mod fuse;
+
 pub mod pb {
     // Generated from proto/tenantd.proto; see tests/generated.rs.
     include!("generated/tenantd.v1.rs");
@@ -23,6 +26,7 @@ pub use pb::processes_client::ProcessesClient;
 pub use pb::sandboxes_client::SandboxesClient;
 pub use pb::system_client::SystemClient;
 pub use pb::tenants_client::TenantsClient;
+pub use pb::volumes_client::VolumesClient;
 
 /// Connect to tenantd's Unix socket. The URI is a placeholder; every
 /// connection goes to `path`.

@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Bytes, ContainerId, ContainerKey, ProcessId, ProcessKey, ProjectId, SandboxId, SandboxKey,
-    TenantId,
+    SlotName, TenantId, VolumeId, VolumeKey,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -198,20 +199,24 @@ impl SandboxRecord {
 }
 
 /// The container lifecycle. `Creating` and `Destroying` are intents
-/// recorded before touching the host. A container ends `Exited` when its
-/// init exits or its sandbox stops; it is not restarted.
+/// recorded before touching the host. A container with a FUSE slot waits
+/// in `Created`, its root and FUSE mount ready, until its FUSE server has
+/// attached and it is started. A container ends `Exited` when its init
+/// exits or its sandbox stops; it is not restarted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerState {
     Creating,
+    Created,
     Running,
     Exited,
     Destroying,
 }
 
 impl ContainerState {
-    pub const ALL: [ContainerState; 4] = [
+    pub const ALL: [ContainerState; 5] = [
         Self::Creating,
+        Self::Created,
         Self::Running,
         Self::Exited,
         Self::Destroying,
@@ -220,9 +225,43 @@ impl ContainerState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Creating => "creating",
+            Self::Created => "created",
             Self::Running => "running",
             Self::Exited => "exited",
             Self::Destroying => "destroying",
+        }
+    }
+}
+
+/// A volume bound into a container through one of its profile's slots.
+/// Snapshotted on the container's row at create, so a config reload never
+/// moves a mount under a container.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeMount {
+    pub slot: SlotName,
+    pub volume: VolumeId,
+    /// Where it appears in the container.
+    pub path: String,
+    pub read_only: bool,
+}
+
+/// What a container create asks for, kept to compare a repeated create
+/// with the original.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContainerSpec {
+    /// Its init; empty runs the image's entrypoint and cmd.
+    pub args: Vec<String>,
+    /// Slot -> volume.
+    pub volumes: BTreeMap<SlotName, VolumeId>,
+    /// Mount the profile's FUSE slot.
+    pub fuse: bool,
+}
+
+impl From<Vec<String>> for ContainerSpec {
+    fn from(args: Vec<String>) -> Self {
+        Self {
+            args,
+            ..Default::default()
         }
     }
 }
@@ -237,6 +276,10 @@ pub struct ContainerRecord {
     /// Its init, as the caller asked; empty runs the image's entrypoint
     /// and cmd.
     pub args: Vec<String>,
+    /// Volumes bound into it, by slot name.
+    pub volumes: Vec<VolumeMount>,
+    /// Where its FUSE slot is mounted, when it has one.
+    pub fuse: Option<String>,
     pub state: ContainerState,
     pub exit_code: Option<i32>,
     pub created_at: i64,
@@ -250,6 +293,23 @@ impl ContainerRecord {
             sandbox: self.sandbox.clone(),
             id: self.id.clone(),
         }
+    }
+
+    /// The request this row was created from.
+    pub fn spec(&self) -> ContainerSpec {
+        ContainerSpec {
+            args: self.args.clone(),
+            volumes: self
+                .volumes
+                .iter()
+                .map(|m| (m.slot.clone(), m.volume.clone()))
+                .collect(),
+            fuse: self.fuse.is_some(),
+        }
+    }
+
+    pub fn binds(&self, v: &VolumeId) -> bool {
+        self.volumes.iter().any(|m| &m.volume == v)
     }
 
     pub fn sandbox_key(&self) -> SandboxKey {
@@ -491,4 +551,69 @@ pub struct ProcessTombstone {
     pub key: ProcessKey,
     pub spec_digest: String,
     pub expires_at: i64,
+}
+
+/// The volume lifecycle. `Creating` and `Deleting` are intents recorded
+/// before touching the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeState {
+    Creating,
+    Ready,
+    Deleting,
+}
+
+impl VolumeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Ready => "ready",
+            Self::Deleting => "deleting",
+        }
+    }
+}
+
+/// Owner and permission bits of a volume's root directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeOwner {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+impl Default for VolumeOwner {
+    fn default() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+        }
+    }
+}
+
+/// A durable directory in its tenant's quota: the only state that outlives
+/// a container. Containers mount it through the slots of their profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeRecord {
+    pub tenant: TenantId,
+    pub id: VolumeId,
+    pub owner: VolumeOwner,
+    pub state: VolumeState,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl VolumeRecord {
+    pub fn key(&self) -> VolumeKey {
+        VolumeKey::new(self.tenant.clone(), self.id.clone())
+    }
+}
+
+/// What a prune removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Files, links and directories.
+    pub entries: u64,
+    /// Space they held on disk.
+    pub bytes: Bytes,
 }

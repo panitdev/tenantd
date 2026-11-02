@@ -4,8 +4,9 @@ use async_trait::async_trait;
 
 use crate::model::{
     ContainerRecord, ProcessRecord, ProcessTombstone, SandboxRecord, TenantLimits, TenantRecord,
+    VolumeRecord,
 };
-use crate::{ContainerKey, ProcessKey, Result, SandboxId, SandboxKey, TenantId};
+use crate::{ContainerKey, ProcessKey, Result, SandboxId, SandboxKey, TenantId, VolumeId};
 
 /// Durable records. Each call is atomic.
 #[async_trait]
@@ -40,6 +41,14 @@ pub trait StateStore: Send + Sync {
     async fn list_containers(&self, s: Option<&SandboxKey>) -> Result<Vec<ContainerRecord>>;
     async fn update_container(&self, rec: &ContainerRecord) -> Result<()>;
     async fn delete_container(&self, k: &ContainerKey) -> Result<()>;
+
+    /// `AlreadyExists` if the row exists.
+    async fn insert_volume(&self, rec: &VolumeRecord) -> Result<()>;
+    async fn get_volume(&self, t: &TenantId, v: &VolumeId) -> Result<Option<VolumeRecord>>;
+    async fn list_volumes(&self, t: Option<&TenantId>) -> Result<Vec<VolumeRecord>>;
+    /// Owner and state.
+    async fn update_volume(&self, rec: &VolumeRecord) -> Result<()>;
+    async fn delete_volume(&self, t: &TenantId, v: &VolumeId) -> Result<()>;
 
     /// `AlreadyExists` if the row exists.
     async fn insert_process(&self, rec: &ProcessRecord) -> Result<()>;
