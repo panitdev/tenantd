@@ -71,7 +71,9 @@ jobs:
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # Overlay mounts and netns only need CAP_SYS_ADMIN inside a user+mount
-      # namespace.
+      # namespace. `-n` leaves cargo without network, so build first.
+      - name: Build overlay and netns tests
+        run: cargo test -p tenantd-layer -p tenantd-net --locked --no-run
       - name: Real overlay mounts and netns (user namespace)
         run: unshare -rmn cargo test -p tenantd-layer -p tenantd-net --locked -- --ignored
       - name: Dump quota state on failure
