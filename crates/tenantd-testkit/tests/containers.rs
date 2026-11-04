@@ -469,13 +469,21 @@ async fn reconcile_keeps_finishes_and_ends_containers() {
         .unwrap()
         .remove(&RuntimeHandle::for_container(&gone));
     // One the runtime has with no row.
-    let stray = RuntimeHandle("t.box.stray".into());
+    let stray = RuntimeHandle::for_container(&"t.box.stray".parse().unwrap());
+    // And one named the way releases before the `+` terminator did.
+    let legacy = RuntimeHandle("t.old".into());
     env.host
         .runtime
         .containers
         .lock()
         .unwrap()
         .insert(stray.clone(), RuntimeState::Running);
+    env.host
+        .runtime
+        .containers
+        .lock()
+        .unwrap()
+        .insert(legacy.clone(), RuntimeState::Running);
     env.restart().await;
 
     let rep = env.tenantd.reconcile().await;
@@ -483,8 +491,13 @@ async fn reconcile_keeps_finishes_and_ends_containers() {
     let did = |a: &str, t: &str| rep.actions.iter().any(|x| x.0 == a && x.1 == t);
     assert!(did("finish_create", &format!("container/{half}")));
     assert!(did("mark_exited", &format!("container/{gone}")));
-    assert!(did("delete_orphan_container", "container/t.box.stray"));
-    assert!(!rep.actions.iter().any(|x| x.1.contains("t.box.run")));
+    assert!(did("delete_orphan_container", "container/t.box.stray+"));
+    assert!(did("delete_orphan_container", "container/t.old"));
+    assert!(
+        !rep.actions.iter().any(|x| x.1.contains("t.box.run")),
+        "{:?}",
+        rep.actions
+    );
 
     assert_eq!(
         env.host.runtime.container_state(&running),

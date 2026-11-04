@@ -140,29 +140,36 @@ pub trait WritableLayer: Send + Sync {
     ) -> Result<()>;
 }
 
-/// The runtime's name for a sandbox or a container in one; tenantd uses
-/// the sandbox key (`<tenant>.<sandbox>`) or the container key
-/// (`<tenant>.<sandbox>.<container>`).
+/// The runtime's name for a sandbox or a container in one: the sandbox key
+/// (`<tenant>.<sandbox>+`) or the container key
+/// (`<tenant>.<sandbox>.<container>+`), each ending in [`HANDLE_END`].
+///
+/// runsc resolves every ID by prefix and never prefers an exact match, so
+/// `t.s` would be ambiguous next to `t.s10` or `t.s.c`. IDs can't contain
+/// `+`, so with it at the end no handle is a prefix of another.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RuntimeHandle(pub String);
 
+/// Ends every [`RuntimeHandle`]; see there.
+pub const HANDLE_END: char = '+';
+
 impl RuntimeHandle {
     pub fn for_key(k: &SandboxKey) -> Self {
-        Self(k.to_string())
+        Self(format!("{k}{HANDLE_END}"))
     }
 
     pub fn for_container(k: &ContainerKey) -> Self {
-        Self(k.to_string())
+        Self(format!("{k}{HANDLE_END}"))
     }
 
     /// The sandbox, when this is a sandbox's handle.
     pub fn key(&self) -> Option<SandboxKey> {
-        self.0.parse().ok()
+        self.0.strip_suffix(HANDLE_END)?.parse().ok()
     }
 
     /// The container, when this is a container's handle.
     pub fn container(&self) -> Option<ContainerKey> {
-        self.0.parse().ok()
+        self.0.strip_suffix(HANDLE_END)?.parse().ok()
     }
 }
 
@@ -360,4 +367,33 @@ pub trait FuseBackend: Send + Sync {
     async fn unmount(&self, c: &ContainerKey) -> Result<()>;
     /// Containers with a mount point on the host. For reconcile.
     async fn list_owned(&self) -> Result<Vec<ContainerKey>>;
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    #[test]
+    fn handles_round_trip_and_are_prefix_free() {
+        let s1: SandboxKey = "t.s1".parse().unwrap();
+        let s10: SandboxKey = "t.s10".parse().unwrap();
+        let c: ContainerKey = "t.s1.c".parse().unwrap();
+        let (h1, h10, hc) = (
+            RuntimeHandle::for_key(&s1),
+            RuntimeHandle::for_key(&s10),
+            RuntimeHandle::for_container(&c),
+        );
+        assert_eq!(h1.key(), Some(s1));
+        assert_eq!(hc.container(), Some(c));
+        assert_eq!(hc.key(), None);
+        for (a, b) in [(&h1, &h10), (&h1, &hc), (&h10, &hc)] {
+            assert!(
+                !b.0.starts_with(&a.0) && !a.0.starts_with(&b.0),
+                "{a:?} {b:?}"
+            );
+        }
+        // A handle from before the terminator is nobody's: reconcile
+        // treats it as a stray.
+        assert_eq!(RuntimeHandle("t.s1".into()).key(), None);
+    }
 }
