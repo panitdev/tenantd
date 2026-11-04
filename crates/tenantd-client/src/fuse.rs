@@ -1,239 +1,508 @@
-//! The FUSE socket: how a caller takes a container's `/dev/fuse`
-//! connection, which gRPC can't carry.
+//! Serving a container's FUSE slot.
 //!
-//! One request per connection. The client sends
-//! `attach-fuse <tenant> <sandbox> <container>\n`; tenantd answers `ok\n`
-//! with the fd attached as `SCM_RIGHTS`, or `err <CODE> <message>\n` where
-//! `CODE` is a gRPC code name such as `NOT_FOUND`.
+//! tenantd mounts the filesystem and speaks the kernel protocol; the
+//! caller's server answers path-based operations over
+//! `Containers.ServeFuse`. A server implements [`Filesystem`] (every
+//! operation it leaves out fails with `ENOSYS`) and hands it to [`attach`]:
 //!
 //! ```no_run
-//! # fn f() -> std::io::Result<()> {
-//! let fd = tenantd_client::fuse::attach_fuse(
-//!     tenantd_client::fuse::DEFAULT_SOCKET, "acme", "box1", "s1")?;
-//! // Serve FUSE on `fd`, then call Containers.StartContainer.
+//! # use std::sync::Arc;
+//! # use tenantd_client::fuse::{self, Context, Error, Filesystem, Result};
+//! # use tenantd_client::pb;
+//! struct Empty;
+//! impl Filesystem for Empty {
+//!     async fn stat(&self, _cx: &Context, req: pb::Stat) -> Result<pb::FileAttr> {
+//!         if req.path == "/" {
+//!             Ok(pb::FileAttr {
+//!                 kind: pb::FileKind::Directory as i32,
+//!                 mode: 0o755,
+//!                 nlink: 2,
+//!                 ttl_ms: 1000,
+//!                 ..Default::default()
+//!             })
+//!         } else {
+//!             Err(Error::not_found().cached_for_ms(1000))
+//!         }
+//!     }
+//! }
+//!
+//! # async fn f() -> Result<(), Box<dyn std::error::Error>> {
+//! let ch = tenantd_client::connect("/run/tenantd/api.sock").await?;
+//! let container = pb::ContainerRef { tenant: "acme".into(), sandbox: "box1".into(), id: "s1".into() };
+//! let session = fuse::attach(ch.clone(), container.clone(), Arc::new(Empty), Default::default()).await?;
+//! // The server is attached: the container can start.
+//! tenantd_client::ContainersClient::new(ch).start_container(container).await?;
+//! session.run().await?; // until the container ends or another server replaces this one
 //! # Ok(()) }
 //! ```
+//!
+//! Paths are absolute within the exported tree. Attributes carry a `ttl_ms`
+//! that lets tenantd and the kernel cache them; `0` asks for every access.
+//! A server that finds out its data changed behind tenantd's back tells it
+//! with [`Invalidator`].
 
+use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::time::Duration;
+use std::future::Future;
+use std::sync::Arc;
 
-pub const DEFAULT_SOCKET: &str = "/run/tenantd/fuse.sock";
+use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Status;
+use tonic::transport::Channel;
 
-/// Longest request line tenantd reads.
-pub const MAX_REQUEST: usize = 512;
+use crate::pb::{self, fuse_request::Op, fuse_response::Result as Res};
 
-/// A refusal from tenantd, inside the `io::Error` that
-/// [`attach_fuse`] returns (`io::ErrorKind::Other`).
+/// The protocol version [`attach`] speaks.
+pub const VERSION: u32 = 1;
+
+/// Linux errno values a server commonly answers with.
+pub mod errno {
+    pub const EPERM: i32 = libc::EPERM;
+    pub const ENOENT: i32 = libc::ENOENT;
+    pub const EIO: i32 = libc::EIO;
+    pub const EACCES: i32 = libc::EACCES;
+    pub const EEXIST: i32 = libc::EEXIST;
+    pub const ENOTDIR: i32 = libc::ENOTDIR;
+    pub const EISDIR: i32 = libc::EISDIR;
+    pub const EINVAL: i32 = libc::EINVAL;
+    pub const ENOSPC: i32 = libc::ENOSPC;
+    pub const EROFS: i32 = libc::EROFS;
+    pub const ENOTEMPTY: i32 = libc::ENOTEMPTY;
+    pub const ENOSYS: i32 = libc::ENOSYS;
+}
+
+/// A failed operation: a Linux errno, for the container to see.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttachError {
-    /// A gRPC code name, e.g. `FAILED_PRECONDITION`.
-    pub code: String,
-    pub message: String,
+pub struct Error {
+    pub errno: i32,
+    /// For tenantd's logs; the container never sees it.
+    pub detail: String,
+    /// With `ENOENT`: how long the absence may be cached.
+    pub negative_ttl_ms: u32,
 }
 
-impl fmt::Display for AttachError {
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    pub fn new(errno: i32) -> Self {
+        Self {
+            errno,
+            detail: String::new(),
+            negative_ttl_ms: 0,
+        }
+    }
+
+    pub fn not_found() -> Self {
+        Self::new(errno::ENOENT)
+    }
+
+    pub fn unsupported() -> Self {
+        Self::new(errno::ENOSYS)
+    }
+
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+
+    /// Let the absence be cached for `ms` milliseconds.
+    pub fn cached_for_ms(mut self, ms: u32) -> Self {
+        self.negative_ttl_ms = ms;
+        self
+    }
+}
+
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code.to_lowercase(), self.message)
-    }
-}
-
-impl std::error::Error for AttachError {}
-
-fn plain(s: &str) -> bool {
-    !s.is_empty() && !s.bytes().any(|b| b.is_ascii_whitespace() || b == 0)
-}
-
-/// The request line for a container.
-pub fn request(tenant: &str, sandbox: &str, container: &str) -> io::Result<String> {
-    if ![tenant, sandbox, container].iter().all(|s| plain(s)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "tenant, sandbox and container must be non-empty without whitespace",
-        ));
-    }
-    Ok(format!("attach-fuse {tenant} {sandbox} {container}\n"))
-}
-
-/// Parse a request line (without its newline) into (tenant, sandbox,
-/// container).
-pub fn parse_request(line: &str) -> Option<(&str, &str, &str)> {
-    let mut w = line.split(' ');
-    match (w.next(), w.next(), w.next(), w.next(), w.next()) {
-        (Some("attach-fuse"), Some(t), Some(s), Some(c), None)
-            if [t, s, c].iter().all(|x| plain(x)) =>
-        {
-            Some((t, s, c))
+        write!(f, "{}", std::io::Error::from_raw_os_error(self.errno))?;
+        if !self.detail.is_empty() {
+            write!(f, " ({})", self.detail)?;
         }
-        _ => None,
+        Ok(())
     }
 }
 
-/// Take the FUSE connection of `tenant.sandbox.container` from tenantd's
-/// FUSE socket. Blocking; gives up after 30 seconds.
-pub fn attach_fuse(
-    socket: impl AsRef<Path>,
-    tenant: &str,
-    sandbox: &str,
-    container: &str,
-) -> io::Result<OwnedFd> {
-    let line = request(tenant, sandbox, container)?;
-    let mut s = UnixStream::connect(socket)?;
-    s.set_read_timeout(Some(Duration::from_secs(30)))?;
-    s.set_write_timeout(Some(Duration::from_secs(30)))?;
-    s.write_all(line.as_bytes())?;
-    let (mut reply, fd) = recv_with_fd(&s)?;
-    while !reply.contains(&b'\n') && reply.len() < 4096 {
-        let mut buf = [0u8; 512];
-        match s.read(&mut buf)? {
-            0 => break,
-            n => reply.extend_from_slice(&buf[..n]),
-        }
-    }
-    let text = String::from_utf8_lossy(&reply);
-    let text = text.lines().next().unwrap_or_default();
-    match (text, fd) {
-        ("ok", Some(fd)) => Ok(fd),
-        ("ok", None) => Err(io::Error::other("tenantd replied ok without an fd")),
-        (err, _) => {
-            let rest = err.strip_prefix("err ").unwrap_or(err);
-            let (code, message) = rest.split_once(' ').unwrap_or((rest, ""));
-            Err(io::Error::other(AttachError {
-                code: code.to_string(),
-                message: message.to_string(),
-            }))
-        }
+impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        let errno = e.raw_os_error().unwrap_or(match e.kind() {
+            std::io::ErrorKind::NotFound => errno::ENOENT,
+            std::io::ErrorKind::PermissionDenied => errno::EACCES,
+            std::io::ErrorKind::AlreadyExists => errno::EEXIST,
+            std::io::ErrorKind::InvalidInput => errno::EINVAL,
+            _ => errno::EIO,
+        });
+        Self::new(errno).detail(e.to_string())
     }
 }
 
-/// Space for one fd's control message, aligned for `cmsghdr`.
-#[repr(C, align(8))]
-struct CmsgBuf([u8; 64]);
+/// Whose access a request is, as the kernel reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Context {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+}
 
-/// One `recvmsg`: the bytes read and the fd attached to them, if any.
-fn recv_with_fd(s: &UnixStream) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
-    let mut data = vec![0u8; 512];
-    let mut cbuf = CmsgBuf([0; 64]);
-    let mut iov = libc::iovec {
-        iov_base: data.as_mut_ptr().cast(),
-        iov_len: data.len(),
+/// A filesystem to serve. Operations run concurrently, each on its own
+/// task, so a server must be safe to call from many at once.
+#[allow(unused_variables)]
+pub trait Filesystem: Send + Sync + 'static {
+    fn stat(
+        &self,
+        cx: &Context,
+        req: pb::Stat,
+    ) -> impl Future<Output = Result<pb::FileAttr>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    /// The whole directory with each entry's attributes, without `.` and `..`.
+    fn read_dir(
+        &self,
+        cx: &Context,
+        req: pb::ReadDir,
+    ) -> impl Future<Output = Result<Vec<pb::DirEntry>>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn readlink(
+        &self,
+        cx: &Context,
+        req: pb::Readlink,
+    ) -> impl Future<Output = Result<String>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn open(
+        &self,
+        cx: &Context,
+        req: pb::Open,
+    ) -> impl Future<Output = Result<pb::OpenReply>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    /// A short read ends the file.
+    fn read(&self, cx: &Context, req: pb::Read) -> impl Future<Output = Result<Vec<u8>>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn write(
+        &self,
+        cx: &Context,
+        req: pb::Write,
+    ) -> impl Future<Output = Result<pb::WriteReply>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    /// Every close of a descriptor. Succeeds by default.
+    fn flush(&self, cx: &Context, req: pb::Flush) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// The last close of a handle. Succeeds by default.
+    fn release(&self, cx: &Context, req: pb::Release) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+    fn fsync(&self, cx: &Context, req: pb::Fsync) -> impl Future<Output = Result<()>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    /// Create and open; the reply carries the new file's attributes.
+    fn create(
+        &self,
+        cx: &Context,
+        req: pb::Create,
+    ) -> impl Future<Output = Result<pb::OpenReply>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn mkdir(
+        &self,
+        cx: &Context,
+        req: pb::Mkdir,
+    ) -> impl Future<Output = Result<pb::FileAttr>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn unlink(&self, cx: &Context, req: pb::Unlink) -> impl Future<Output = Result<()>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn rmdir(&self, cx: &Context, req: pb::Rmdir) -> impl Future<Output = Result<()>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn rename(&self, cx: &Context, req: pb::Rename) -> impl Future<Output = Result<()>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn symlink(
+        &self,
+        cx: &Context,
+        req: pb::Symlink,
+    ) -> impl Future<Output = Result<pb::FileAttr>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn set_attr(
+        &self,
+        cx: &Context,
+        req: pb::SetAttr,
+    ) -> impl Future<Output = Result<pb::FileAttr>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+    fn stat_fs(
+        &self,
+        cx: &Context,
+        req: pb::StatFs,
+    ) -> impl Future<Output = Result<pb::StatFsReply>> + Send {
+        async { Err(Error::unsupported()) }
+    }
+}
+
+async fn dispatch<F: Filesystem>(fs: &F, cx: &Context, op: Op) -> Result<Res> {
+    Ok(match op {
+        Op::Stat(r) => Res::Attr(fs.stat(cx, r).await?),
+        Op::ReadDir(r) => Res::Dir(pb::DirListing {
+            entries: fs.read_dir(cx, r).await?,
+        }),
+        Op::Readlink(r) => Res::Target(fs.readlink(cx, r).await?),
+        Op::Open(r) => Res::Open(fs.open(cx, r).await?),
+        Op::Read(r) => Res::Data(fs.read(cx, r).await?),
+        Op::Write(r) => Res::Write(fs.write(cx, r).await?),
+        Op::Flush(r) => ok(fs.flush(cx, r).await?),
+        Op::Release(r) => ok(fs.release(cx, r).await?),
+        Op::Fsync(r) => ok(fs.fsync(cx, r).await?),
+        Op::Create(r) => Res::Open(fs.create(cx, r).await?),
+        Op::Mkdir(r) => Res::Attr(fs.mkdir(cx, r).await?),
+        Op::Unlink(r) => ok(fs.unlink(cx, r).await?),
+        Op::Rmdir(r) => ok(fs.rmdir(cx, r).await?),
+        Op::Rename(r) => ok(fs.rename(cx, r).await?),
+        Op::Symlink(r) => Res::Attr(fs.symlink(cx, r).await?),
+        Op::SetAttr(r) => Res::Attr(fs.set_attr(cx, r).await?),
+        Op::StatFs(r) => Res::Statfs(fs.stat_fs(cx, r).await?),
+    })
+}
+
+fn ok(_: ()) -> Res {
+    Res::Ok(pb::FuseOk {})
+}
+
+async fn answer<F: Filesystem>(fs: &F, req: pb::FuseRequest) -> pb::FuseResponse {
+    let cx = Context {
+        uid: req.uid,
+        gid: req.gid,
+        pid: req.pid,
     };
-    // SAFETY: an all-zero msghdr is valid; the pointers set below outlive
-    // the call.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.0.as_mut_ptr().cast();
-    msg.msg_controllen = cbuf.0.len() as _;
-    let n = loop {
-        // SAFETY: valid socket and msghdr.
-        let n = unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if n >= 0 {
-            break n as usize;
-        }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
+    let res = match req.op {
+        Some(op) => dispatch(fs, &cx, op).await,
+        None => Err(Error::unsupported().detail("request without an operation")),
     };
-    data.truncate(n);
-    let mut fd = None;
-    // SAFETY: msg was filled by recvmsg; the CMSG_* walk stays inside it.
-    unsafe {
-        let mut c = libc::CMSG_FIRSTHDR(&msg);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let payload = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                let first = libc::CMSG_DATA(c).cast::<RawFd>();
-                for i in 0..payload / std::mem::size_of::<RawFd>() {
-                    let got = OwnedFd::from_raw_fd(first.add(i).read_unaligned());
-                    // Keep the first; any extra is closed on drop.
-                    if fd.is_none() {
-                        fd = Some(got);
+    match res {
+        Ok(result) => pb::FuseResponse {
+            id: req.id,
+            result: Some(result),
+            ..Default::default()
+        },
+        Err(e) => pb::FuseResponse {
+            id: req.id,
+            errno: if e.errno > 0 { e.errno } else { errno::EIO },
+            detail: e.detail,
+            negative_ttl_ms: e.negative_ttl_ms,
+            ..Default::default()
+        },
+    }
+}
+
+/// Tell tenantd that what it cached no longer holds.
+#[derive(Clone)]
+pub struct Invalidator {
+    out: mpsc::Sender<pb::FuseServerMessage>,
+}
+
+impl Invalidator {
+    async fn send(&self, target: pb::invalidate::Target, recursive: bool) -> bool {
+        let msg = pb::FuseServerMessage {
+            msg: Some(pb::fuse_server_message::Msg::Invalidate(pb::Invalidate {
+                target: Some(target),
+                recursive,
+            })),
+        };
+        self.out.send(msg).await.is_ok()
+    }
+
+    /// Drop the attributes, listing and absence cached for `path`, and with
+    /// `recursive` everything below it. `false` when the session is over.
+    pub async fn path(&self, path: impl Into<String>, recursive: bool) -> bool {
+        self.send(pb::invalidate::Target::Path(path.into()), recursive)
+            .await
+    }
+
+    /// Drop what is cached for every path of the file with this `object_id`.
+    pub async fn object(&self, object_id: Vec<u8>) -> bool {
+        self.send(pb::invalidate::Target::ObjectId(object_id), false)
+            .await
+    }
+}
+
+/// An attached server. [`Session::run`] serves until the stream ends.
+pub struct Session<F> {
+    fs: Arc<F>,
+    events: tonic::Streaming<pb::FuseServerEvent>,
+    out: mpsc::Sender<pb::FuseServerMessage>,
+    /// Counts attaches to this container's session; the first is 1.
+    pub generation: u64,
+    /// What tenantd and this server agreed on.
+    pub limits: pb::FuseLimits,
+}
+
+/// Attach `fs` as the server of `container`'s FUSE slot, replacing any
+/// server attached before. `limits` are what this server can take; zeroes
+/// accept tenantd's. Once this returns, a `created` container can start.
+pub async fn attach<F: Filesystem>(
+    channel: Channel,
+    container: pb::ContainerRef,
+    fs: Arc<F>,
+    limits: pb::FuseLimits,
+) -> Result<Session<F>, Status> {
+    let (out, rx) = mpsc::channel(64);
+    let hello = pb::FuseServerMessage {
+        msg: Some(pb::fuse_server_message::Msg::Attach(pb::Attach {
+            container: Some(container),
+            version: VERSION,
+            limits: Some(limits),
+        })),
+    };
+    out.send(hello)
+        .await
+        .map_err(|_| Status::internal("outbound stream closed"))?;
+    let mut events = crate::ContainersClient::new(channel)
+        .serve_fuse(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    let first = events
+        .message()
+        .await?
+        .and_then(|e| e.event)
+        .ok_or_else(|| Status::unavailable("tenantd closed the stream before attaching"))?;
+    let pb::fuse_server_event::Event::Attached(a) = first else {
+        return Err(Status::internal("tenantd did not start with attached"));
+    };
+    Ok(Session {
+        fs,
+        events,
+        out,
+        generation: a.generation,
+        limits: a.limits.unwrap_or_default(),
+    })
+}
+
+impl<F: Filesystem> Session<F> {
+    /// A handle for telling tenantd to drop what it cached.
+    pub fn invalidator(&self) -> Invalidator {
+        Invalidator {
+            out: self.out.clone(),
+        }
+    }
+
+    /// Serve requests until the stream ends: `Ok` when the container ended
+    /// or tenantd shut the stream, `Aborted` when another server replaced
+    /// this one.
+    pub async fn run(mut self) -> Result<(), Status> {
+        let mut running: HashMap<u64, AbortHandle> = HashMap::new();
+        let result = loop {
+            let Some(ev) = self.events.message().await?.and_then(|e| e.event) else {
+                break Ok(());
+            };
+            match ev {
+                pb::fuse_server_event::Event::Request(req) => {
+                    let (fs, out, id) = (self.fs.clone(), self.out.clone(), req.id);
+                    if running.len() >= 1024 {
+                        running.retain(|_, h| !h.is_finished());
+                    }
+                    let task = tokio::spawn(async move {
+                        let resp = answer(&*fs, req).await;
+                        let _ = out
+                            .send(pb::FuseServerMessage {
+                                msg: Some(pb::fuse_server_message::Msg::Response(resp)),
+                            })
+                            .await;
+                    });
+                    running.insert(id, task.abort_handle());
+                }
+                pb::fuse_server_event::Event::Cancel(c) => {
+                    if let Some(h) = running.remove(&c.id) {
+                        h.abort();
                     }
                 }
+                pb::fuse_server_event::Event::Attached(_) => {}
             }
-            c = libc::CMSG_NXTHDR(&msg, c);
+        };
+        for h in running.values() {
+            h.abort();
         }
+        result
     }
-    Ok((data, fd))
-}
-
-/// Server side: send `line` with `fd` attached, in one `sendmsg`. Blocking.
-pub fn send_with_fd(s: &UnixStream, line: &[u8], fd: RawFd) -> io::Result<()> {
-    let mut cbuf = CmsgBuf([0; 64]);
-    let mut iov = libc::iovec {
-        iov_base: line.as_ptr() as *mut _,
-        iov_len: line.len(),
-    };
-    // SAFETY: as in `recv_with_fd`.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.0.as_mut_ptr().cast();
-    // SAFETY: CMSG_SPACE is a pure size computation.
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as _;
-    // SAFETY: the buffer holds one control message of CMSG_SPACE(4) bytes.
-    unsafe {
-        let c = libc::CMSG_FIRSTHDR(&msg);
-        (*c).cmsg_level = libc::SOL_SOCKET;
-        (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-        libc::CMSG_DATA(c).cast::<RawFd>().write_unaligned(fd);
-    }
-    let sent = loop {
-        // SAFETY: valid socket and msghdr.
-        let n = unsafe { libc::sendmsg(s.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-        if n >= 0 {
-            break n as usize;
-        }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    };
-    // The fd went with the first byte; the rest needs no ancillary data.
-    let mut s = s;
-    s.write_all(&line[sent..])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn request_lines() {
-        assert_eq!(request("t", "s", "c").unwrap(), "attach-fuse t s c\n");
-        assert!(request("t", "s c", "c").is_err());
-        assert!(request("", "s", "c").is_err());
-        assert_eq!(parse_request("attach-fuse t s c"), Some(("t", "s", "c")));
-        for bad in [
-            "attach-fuse t s",
-            "attach-fuse t s c d",
-            "attach t s c",
-            "attach-fuse t  c",
-        ] {
-            assert_eq!(parse_request(bad), None, "{bad}");
+    struct Fs;
+
+    impl Filesystem for Fs {
+        async fn stat(&self, _cx: &Context, req: pb::Stat) -> Result<pb::FileAttr> {
+            match req.path.as_str() {
+                "/" => Ok(pb::FileAttr::default()),
+                _ => Err(Error::not_found().cached_for_ms(50)),
+            }
+        }
+        async fn read(&self, cx: &Context, req: pb::Read) -> Result<Vec<u8>> {
+            Ok(format!("{}:{}", cx.uid, req.size).into_bytes())
         }
     }
 
+    fn request(op: Op) -> pb::FuseRequest {
+        pb::FuseRequest {
+            id: 9,
+            uid: 1000,
+            op: Some(op),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn operations_dispatch_and_failures_carry_errno() {
+        let r = answer(&Fs, request(Op::Stat(pb::Stat { path: "/".into() }))).await;
+        assert_eq!((r.id, r.errno), (9, 0));
+        assert!(matches!(r.result, Some(Res::Attr(_))));
+
+        let r = answer(&Fs, request(Op::Stat(pb::Stat { path: "/x".into() }))).await;
+        assert_eq!((r.errno, r.negative_ttl_ms), (errno::ENOENT, 50));
+        assert!(r.result.is_none());
+
+        let r = answer(
+            &Fs,
+            request(Op::Read(pb::Read {
+                size: 4,
+                ..Default::default()
+            })),
+        )
+        .await;
+        assert!(matches!(r.result, Some(Res::Data(d)) if d == b"1000:4"));
+
+        // Left out: ENOSYS. Flush and release succeed unasked.
+        let r = answer(&Fs, request(Op::Unlink(pb::Unlink::default()))).await;
+        assert_eq!(r.errno, errno::ENOSYS);
+        let r = answer(&Fs, request(Op::Release(pb::Release::default()))).await;
+        assert!(matches!(r.result, Some(Res::Ok(_))));
+
+        let r = answer(
+            &Fs,
+            pb::FuseRequest {
+                id: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(r.errno, errno::ENOSYS);
+    }
+
     #[test]
-    fn fd_crosses_the_socket() {
-        let (a, b) = UnixStream::pair().unwrap();
-        let (r, mut w) = io::pipe().unwrap();
-        send_with_fd(&a, b"ok\n", r.as_raw_fd()).unwrap();
-        drop(r);
-        let (data, fd) = recv_with_fd(&b).unwrap();
-        assert_eq!(data, b"ok\n");
-        // The received fd is the pipe's read end.
-        w.write_all(b"x").unwrap();
-        let mut got = [0u8; 1];
-        std::fs::File::from(fd.unwrap())
-            .read_exact(&mut got)
-            .unwrap();
-        assert_eq!(&got, b"x");
+    fn io_errors_keep_their_errno() {
+        let e = Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(e.errno, errno::ENOSPC);
+        let e = Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, "x"));
+        assert_eq!(e.errno, errno::ENOENT);
     }
 }

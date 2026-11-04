@@ -242,13 +242,7 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     let listener = bind_socket(&cfg.server.socket, cfg.server.socket_gid)?;
     let allowed: HashSet<u32> = cfg.server.callers.iter().map(|c| c.uid).collect();
-    let fuse_listener = bind_socket(&cfg.server.fuse_socket, cfg.server.socket_gid)?;
-    tokio::spawn(crate::fuse_socket::serve(
-        fuse_listener,
-        Arc::new(allowed.clone()),
-        tenantd.clone(),
-    ));
-    info!(socket = %cfg.server.socket.display(), fuse_socket = %cfg.server.fuse_socket.display(), callers = ?allowed, "tenantd serving");
+    info!(socket = %cfg.server.socket.display(), callers = ?allowed, "tenantd serving");
     let mut term = signal(SignalKind::terminate())?;
     let shutdown = async move {
         tokio::select! {
@@ -259,7 +253,6 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
     };
     serve_api(listener, allowed, Api { tenantd, metrics }, shutdown).await?;
     let _ = std::fs::remove_file(&cfg.server.socket);
-    let _ = std::fs::remove_file(&cfg.server.fuse_socket);
     Ok(())
 }
 
@@ -513,16 +506,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn volumes_and_fuse_over_unix_sockets() {
-        use tenantd_core::backend::FuseBackend;
-        let (d, sock, host, tenantd) = start(HashSet::from([me()])).await;
-        let fuse_sock = d.path().join("fuse.sock");
-        let l = bind_socket(&fuse_sock, None).unwrap();
-        tokio::spawn(crate::fuse_socket::serve(
-            l,
-            Arc::new(HashSet::from([me()])),
-            tenantd,
-        ));
+    async fn volumes_and_fuse_over_the_unix_socket() {
+        use pb::fuse_server_event::Event;
+        use pb::fuse_server_message::Msg;
+        use tenantd_core::fuse::{FuseOp, FuseReply};
+        let (_d, sock, host, _tenantd) = start(HashSet::from([me()])).await;
         let ch = tenantd_client::connect(&sock).await.unwrap();
         tenantd_client::TenantsClient::new(ch.clone())
             .create_tenant(pb::CreateTenantRequest {
@@ -605,26 +593,122 @@ mod tests {
             tonic::Code::FailedPrecondition
         );
 
-        // The fd that comes over the FUSE socket is the connection held.
-        let attach = |c: &'static str| {
-            let s = fuse_sock.clone();
-            tokio::task::spawn_blocking(move || {
-                tenantd_client::fuse::attach_fuse(&s, "acme", "box", c)
-            })
-        };
-        let fd = attach("s1").await.unwrap().unwrap();
+        // A server opens ServeFuse with an attach naming the container.
         let k: tenantd_core::ContainerKey = "acme.box.s1".parse().unwrap();
-        let held = host.fuse.connection(&k).unwrap().unwrap();
-        assert!(tenantd_testkit::same_file(&fd, &held));
-        let e = attach("nope").await.unwrap().unwrap_err();
-        let e = e
-            .into_inner()
-            .unwrap()
-            .downcast::<tenantd_client::fuse::AttachError>()
+        let attach_msg = |tenant: &str, id: &str, version: u32| pb::FuseServerMessage {
+            msg: Some(Msg::Attach(pb::Attach {
+                container: Some(pb::ContainerRef {
+                    tenant: tenant.into(),
+                    sandbox: "box".into(),
+                    id: id.into(),
+                }),
+                version,
+                limits: None,
+            })),
+        };
+        let open = |first: pb::FuseServerMessage| {
+            let mut containers = containers.clone();
+            async move {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tx.send(first).await.unwrap();
+                let events = containers
+                    .serve_fuse(tokio_stream::wrappers::ReceiverStream::new(rx))
+                    .await?
+                    .into_inner();
+                Ok::<_, tonic::Status>((tx, events))
+            }
+        };
+        let refused = |r: Result<_, tonic::Status>| match r {
+            Err(e) => e.code(),
+            Ok(_) => panic!("the attach was accepted"),
+        };
+        assert_eq!(
+            refused(open(attach_msg("acme", "nope", 1)).await),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            refused(open(attach_msg("acme", "BAD", 1)).await),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            refused(open(attach_msg("acme", "s1", 99)).await),
+            tonic::Code::FailedPrecondition
+        );
+        let not_attach = pb::FuseServerMessage {
+            msg: Some(Msg::Invalidate(pb::Invalidate::default())),
+        };
+        assert_eq!(
+            refused(open(not_attach).await),
+            tonic::Code::InvalidArgument
+        );
+        assert!(!host.fuse.has_server(&k));
+
+        let (tx, mut events) = open(attach_msg("acme", "s1", 1)).await.unwrap();
+        let Some(Event::Attached(a)) = events.message().await.unwrap().unwrap().event else {
+            panic!("expected attached first");
+        };
+        assert_eq!(a.generation, 1);
+        assert!(a.limits.unwrap().max_inflight > 0);
+        assert!(host.fuse.has_server(&k));
+
+        // A request reaches the server and its response comes back.
+        let id = host.fuse.inject(&k, FuseOp::StatFs).unwrap();
+        let Some(Event::Request(rq)) = events.message().await.unwrap().unwrap().event else {
+            panic!("expected a request");
+        };
+        assert_eq!(rq.id, id);
+        assert!(matches!(rq.op, Some(pb::fuse_request::Op::StatFs(_))));
+        tx.send(pb::FuseServerMessage {
+            msg: Some(Msg::Response(pb::FuseResponse {
+                id,
+                result: Some(pb::fuse_response::Result::Statfs(pb::StatFsReply {
+                    blocks: 10,
+                    bsize: 4096,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+        })
+        .await
+        .unwrap();
+        let id2 = host
+            .fuse
+            .inject(&k, FuseOp::Stat { path: "/x".into() })
             .unwrap();
-        assert_eq!(e.code, "NOT_FOUND");
-        let e = attach("BAD").await.unwrap().unwrap_err();
-        assert!(e.to_string().contains("invalid_argument"), "{e}");
+        events.message().await.unwrap().unwrap();
+        tx.send(pb::FuseServerMessage {
+            msg: Some(Msg::Response(pb::FuseResponse {
+                id: id2,
+                errno: 2,
+                negative_ttl_ms: 5,
+                ..Default::default()
+            })),
+        })
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if host.fuse.responses(&k).len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let got = host.fuse.responses(&k);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(matches!(&got[0], (i, Ok(FuseReply::StatFs(s))) if *i == id && s.blocks == 10));
+        assert!(
+            matches!(&got[1], (i, Err(e)) if *i == id2 && e.errno == 2 && e.negative_ttl_ms == 5)
+        );
+
+        // A second server replaces the first, which is aborted.
+        let (_tx2, mut events2) = open(attach_msg("acme", "s1", 1)).await.unwrap();
+        let Some(Event::Attached(a2)) = events2.message().await.unwrap().unwrap().event else {
+            panic!("expected attached");
+        };
+        assert_eq!(a2.generation, 2);
+        assert_eq!(
+            events.message().await.unwrap_err().code(),
+            tonic::Code::Aborted
+        );
 
         let c = containers
             .start_container(r.clone())

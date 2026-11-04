@@ -23,7 +23,7 @@ use tenantd_core::{
 };
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::metrics::Metrics;
 
@@ -577,6 +577,47 @@ impl Containers for Api {
             Ok(pb::DeleteContainerResponse {})
         })
         .await
+    }
+
+    type ServeFuseStream =
+        tokio_stream::wrappers::ReceiverStream<Result<pb::FuseServerEvent, Status>>;
+
+    async fn serve_fuse(
+        &self,
+        req: Request<Streaming<pb::FuseServerMessage>>,
+    ) -> Result<Response<Self::ServeFuseStream>, Status> {
+        let mut inbound = req.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .and_then(|m| m.msg)
+            .ok_or_else(|| Status::invalid_argument("expected attach first"))?;
+        let pb::fuse_server_message::Msg::Attach(attach) = first else {
+            return Err(Status::invalid_argument("expected attach first"));
+        };
+        if attach.version != tenantd_core::fuse::PROTOCOL_VERSION {
+            return Err(Status::failed_precondition(format!(
+                "unsupported FUSE protocol version {}; tenantd speaks {}",
+                attach.version,
+                tenantd_core::fuse::PROTOCOL_VERSION
+            )));
+        }
+        let theirs = crate::fuse_api::limits_in(attach.limits);
+        let link = self
+            .timed("ServeFuse", async {
+                let r = attach
+                    .container
+                    .ok_or_else(|| Error::invalid("attach names no container"))?;
+                let key = container_key(&r.tenant, &r.sandbox, &r.id)?;
+                self.tenantd.attach_fuse(&key, theirs).await
+            })
+            .await?
+            .into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(link.limits.max_inflight as usize + 2);
+        tokio::spawn(crate::fuse_api::run(link, inbound, tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }
 

@@ -217,6 +217,423 @@ pub struct Container {
     #[prost(string, tag = "10")]
     pub fuse_path: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FuseServerMessage {
+    #[prost(oneof = "fuse_server_message::Msg", tags = "1, 2, 3")]
+    pub msg: ::core::option::Option<fuse_server_message::Msg>,
+}
+/// Nested message and enum types in `FuseServerMessage`.
+pub mod fuse_server_message {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Msg {
+        /// first message, once
+        #[prost(message, tag = "1")]
+        Attach(super::Attach),
+        #[prost(message, tag = "2")]
+        Response(super::FuseResponse),
+        #[prost(message, tag = "3")]
+        Invalidate(super::Invalidate),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FuseServerEvent {
+    #[prost(oneof = "fuse_server_event::Event", tags = "1, 2, 3")]
+    pub event: ::core::option::Option<fuse_server_event::Event>,
+}
+/// Nested message and enum types in `FuseServerEvent`.
+pub mod fuse_server_event {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Event {
+        /// first event, once
+        #[prost(message, tag = "1")]
+        Attached(super::Attached),
+        #[prost(message, tag = "2")]
+        Request(super::FuseRequest),
+        #[prost(message, tag = "3")]
+        Cancel(super::Cancel),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Attach {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    /// protocol version; 1
+    #[prost(uint32, tag = "2")]
+    pub version: u32,
+    /// what this server can take
+    #[prost(message, optional, tag = "3")]
+    pub limits: ::core::option::Option<FuseLimits>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Attached {
+    /// counts attaches of this container
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+    /// negotiated: the smaller of both sides
+    #[prost(message, optional, tag = "2")]
+    pub limits: ::core::option::Option<FuseLimits>,
+}
+/// Zero means "no preference" from a server; tenantd's answer is never zero.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FuseLimits {
+    /// bytes per Read
+    #[prost(uint32, tag = "1")]
+    pub max_read: u32,
+    /// bytes per Write
+    #[prost(uint32, tag = "2")]
+    pub max_write: u32,
+    /// unanswered requests
+    #[prost(uint32, tag = "3")]
+    pub max_inflight: u32,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Cancel {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Invalidate {
+    /// path only: everything below it as well
+    #[prost(bool, tag = "3")]
+    pub recursive: bool,
+    #[prost(oneof = "invalidate::Target", tags = "1, 2")]
+    pub target: ::core::option::Option<invalidate::Target>,
+}
+/// Nested message and enum types in `Invalidate`.
+pub mod invalidate {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Target {
+        #[prost(string, tag = "1")]
+        Path(::prost::alloc::string::String),
+        /// every path of this object
+        #[prost(bytes, tag = "2")]
+        ObjectId(::prost::alloc::vec::Vec<u8>),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FuseRequest {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    /// Whose access this is, as the kernel reports it.
+    #[prost(uint32, tag = "2")]
+    pub uid: u32,
+    #[prost(uint32, tag = "3")]
+    pub gid: u32,
+    #[prost(uint32, tag = "4")]
+    pub pid: u32,
+    #[prost(
+        oneof = "fuse_request::Op",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
+    )]
+    pub op: ::core::option::Option<fuse_request::Op>,
+}
+/// Nested message and enum types in `FuseRequest`.
+pub mod fuse_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Op {
+        #[prost(message, tag = "10")]
+        Stat(super::Stat),
+        #[prost(message, tag = "11")]
+        ReadDir(super::ReadDir),
+        #[prost(message, tag = "12")]
+        Readlink(super::Readlink),
+        #[prost(message, tag = "13")]
+        Open(super::Open),
+        #[prost(message, tag = "14")]
+        Read(super::Read),
+        #[prost(message, tag = "15")]
+        Write(super::Write),
+        #[prost(message, tag = "16")]
+        Flush(super::Flush),
+        #[prost(message, tag = "17")]
+        Release(super::Release),
+        #[prost(message, tag = "18")]
+        Fsync(super::Fsync),
+        #[prost(message, tag = "19")]
+        Create(super::Create),
+        #[prost(message, tag = "20")]
+        Mkdir(super::Mkdir),
+        #[prost(message, tag = "21")]
+        Unlink(super::Unlink),
+        #[prost(message, tag = "22")]
+        Rmdir(super::Rmdir),
+        #[prost(message, tag = "23")]
+        Rename(super::Rename),
+        #[prost(message, tag = "24")]
+        Symlink(super::Symlink),
+        #[prost(message, tag = "25")]
+        SetAttr(super::SetAttr),
+        #[prost(message, tag = "26")]
+        StatFs(super::StatFs),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Stat {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+}
+/// The whole directory with each entry's attributes, in one round trip.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadDir {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Readlink {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Open {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub flags: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Read {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub handle: u64,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    #[prost(uint32, tag = "4")]
+    pub size: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Write {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub handle: u64,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+/// Every close(2) of a descriptor; Release follows the last one.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Flush {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub handle: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Release {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub handle: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Fsync {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub handle: u64,
+    #[prost(bool, tag = "3")]
+    pub datasync: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Create {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub mode: u32,
+    #[prost(uint32, tag = "3")]
+    pub flags: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Mkdir {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub mode: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Unlink {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Rmdir {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Rename {
+    #[prost(string, tag = "1")]
+    pub from: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub to: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "3")]
+    pub flags: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Symlink {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub target: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetAttr {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    /// set when the call came through an open file
+    #[prost(uint64, optional, tag = "2")]
+    pub handle: ::core::option::Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub mode: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub uid: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub gid: ::core::option::Option<u32>,
+    #[prost(uint64, optional, tag = "6")]
+    pub size: ::core::option::Option<u64>,
+    #[prost(int64, optional, tag = "7")]
+    pub atime_ns: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub mtime_ns: ::core::option::Option<i64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StatFs {}
+/// errno == 0 is success and sets `result` as the request's op calls for:
+/// Stat, Mkdir, Symlink, SetAttr -> attr      Readlink -> target
+/// ReadDir -> dir     Open, Create -> open    Read -> data
+/// Write -> write     StatFs -> statfs
+/// Flush, Release, Fsync, Unlink, Rmdir, Rename -> ok
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FuseResponse {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(int32, tag = "2")]
+    pub errno: i32,
+    /// for logs; never shown to the container
+    #[prost(string, tag = "3")]
+    pub detail: ::prost::alloc::string::String,
+    /// with ENOENT: how long "absent" may be cached
+    #[prost(uint32, tag = "4")]
+    pub negative_ttl_ms: u32,
+    #[prost(oneof = "fuse_response::Result", tags = "10, 11, 12, 13, 14, 15, 16, 17")]
+    pub result: ::core::option::Option<fuse_response::Result>,
+}
+/// Nested message and enum types in `FuseResponse`.
+pub mod fuse_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "10")]
+        Attr(super::FileAttr),
+        #[prost(message, tag = "11")]
+        Dir(super::DirListing),
+        #[prost(message, tag = "12")]
+        Open(super::OpenReply),
+        #[prost(bytes, tag = "13")]
+        Data(::prost::alloc::vec::Vec<u8>),
+        #[prost(message, tag = "14")]
+        Write(super::WriteReply),
+        #[prost(string, tag = "15")]
+        Target(::prost::alloc::string::String),
+        #[prost(message, tag = "16")]
+        Statfs(super::StatFsReply),
+        #[prost(message, tag = "17")]
+        Ok(super::FuseOk),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FuseOk {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileAttr {
+    #[prost(enumeration = "FileKind", tag = "1")]
+    pub kind: i32,
+    /// permission, setuid/setgid and sticky bits
+    #[prost(uint32, tag = "2")]
+    pub mode: u32,
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    #[prost(uint32, tag = "4")]
+    pub uid: u32,
+    #[prost(uint32, tag = "5")]
+    pub gid: u32,
+    #[prost(uint32, tag = "6")]
+    pub nlink: u32,
+    #[prost(int64, tag = "7")]
+    pub atime_ns: i64,
+    #[prost(int64, tag = "8")]
+    pub mtime_ns: i64,
+    #[prost(int64, tag = "9")]
+    pub ctime_ns: i64,
+    #[prost(uint32, tag = "10")]
+    pub rdev: u32,
+    /// how long tenantd and the kernel may cache this
+    #[prost(uint32, tag = "11")]
+    pub ttl_ms: u32,
+    /// Identity of the file itself, equal for its hard links. Lets tenantd give
+    /// them one inode; without it every path is its own file.
+    #[prost(bytes = "vec", optional, tag = "12")]
+    pub object_id: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DirListing {
+    /// without "." and ".."
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<DirEntry>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DirEntry {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub attr: ::core::option::Option<FileAttr>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenReply {
+    /// echoed in Read, Write, Flush, Release, Fsync
+    #[prost(uint64, tag = "1")]
+    pub handle: u64,
+    /// the kernel may keep its page cache
+    #[prost(bool, tag = "2")]
+    pub keep_cache: bool,
+    /// bypass the page cache
+    #[prost(bool, tag = "3")]
+    pub direct_io: bool,
+    /// tenantd may batch writes before sending them
+    #[prost(bool, tag = "4")]
+    pub buffered_writes: bool,
+    /// always set for Create
+    #[prost(message, optional, tag = "5")]
+    pub attr: ::core::option::Option<FileAttr>,
+    /// the file's start, if small: saves the first Read
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub inline_data: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteReply {
+    #[prost(uint32, tag = "1")]
+    pub written: u32,
+    /// after the write
+    #[prost(message, optional, tag = "2")]
+    pub attr: ::core::option::Option<FileAttr>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StatFsReply {
+    #[prost(uint64, tag = "1")]
+    pub blocks: u64,
+    #[prost(uint64, tag = "2")]
+    pub bfree: u64,
+    #[prost(uint64, tag = "3")]
+    pub bavail: u64,
+    #[prost(uint64, tag = "4")]
+    pub files: u64,
+    #[prost(uint64, tag = "5")]
+    pub ffree: u64,
+    #[prost(uint32, tag = "6")]
+    pub bsize: u32,
+    #[prost(uint32, tag = "7")]
+    pub namelen: u32,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VolumeMount {
     #[prost(string, tag = "1")]
@@ -572,6 +989,50 @@ pub struct ProcessExited {
     pub stdout_dropped: u64,
     #[prost(uint64, tag = "7")]
     pub stderr_dropped: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FileKind {
+    Unspecified = 0,
+    File = 1,
+    Directory = 2,
+    Symlink = 3,
+    Fifo = 4,
+    Socket = 5,
+    CharDevice = 6,
+    BlockDevice = 7,
+}
+impl FileKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FILE_KIND_UNSPECIFIED",
+            Self::File => "FILE_KIND_FILE",
+            Self::Directory => "FILE_KIND_DIRECTORY",
+            Self::Symlink => "FILE_KIND_SYMLINK",
+            Self::Fifo => "FILE_KIND_FIFO",
+            Self::Socket => "FILE_KIND_SOCKET",
+            Self::CharDevice => "FILE_KIND_CHAR_DEVICE",
+            Self::BlockDevice => "FILE_KIND_BLOCK_DEVICE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FILE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "FILE_KIND_FILE" => Some(Self::File),
+            "FILE_KIND_DIRECTORY" => Some(Self::Directory),
+            "FILE_KIND_SYMLINK" => Some(Self::Symlink),
+            "FILE_KIND_FIFO" => Some(Self::Fifo),
+            "FILE_KIND_SOCKET" => Some(Self::Socket),
+            "FILE_KIND_CHAR_DEVICE" => Some(Self::CharDevice),
+            "FILE_KIND_BLOCK_DEVICE" => Some(Self::BlockDevice),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1911,21 +2372,10 @@ pub mod containers_client {
     /// profile declares, bound at create; changing a binding means recreating
     /// it. A container asking for the profile's FUSE slot gets a FUSE mount
     /// whose server is the caller: it is created "created" and waits there.
-    /// The caller then takes the mount's /dev/fuse connection over the FUSE
-    /// socket (server.fuse_socket, see below), serves it, and calls
-    /// StartContainer. tenantd never runs filesystem code.
-    ///
-    /// AttachFuse is not a gRPC call, since an fd can't cross HTTP/2. Connect
-    /// to the FUSE socket (same callers as this one), send one line
-    /// attach-fuse <tenant> <sandbox> <container>\\n
-    /// and read one line back: "ok\n" with the fd attached (SCM_RIGHTS), or
-    /// "err <code> <message>\\n" with a gRPC code name such as NOT_FOUND. Each
-    /// attach hands out the same connection, so a server that restarts can
-    /// attach again; it then finds the connection already initialised (no
-    /// FUSE_INIT comes). tenantd keeps the connection open until the container
-    /// ends, so requests queue rather than fail while no server reads them.
-    /// A tenantd restart loses it: a "created" container gets a fresh one, a
-    /// running one must be recreated to get one again.
+    /// The caller then opens ServeFuse, answers the filesystem requests it
+    /// receives, and calls StartContainer. tenantd speaks the kernel FUSE
+    /// protocol itself and never runs filesystem code: the caller sees path-based
+    /// operations (stat, read, write, ...), not kernel messages.
     #[derive(Debug, Clone)]
     pub struct ContainersClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -2029,7 +2479,7 @@ pub mod containers_client {
                 .insert(GrpcMethod::new("tenantd.v1.Containers", "CreateContainer"));
             self.inner.unary(req, path, codec).await
         }
-        /// Runs a "created" container, once its FUSE server has attached.
+        /// Runs a "created" container, once its FUSE server has called ServeFuse.
         /// Starting a running one returns it; an exited one never restarts.
         pub async fn start_container(
             &mut self,
@@ -2123,6 +2573,43 @@ pub mod containers_client {
                 .insert(GrpcMethod::new("tenantd.v1.Containers", "DeleteContainer"));
             self.inner.unary(req, path, codec).await
         }
+        /// Serves the container's FUSE slot. The caller's first message is
+        /// `attach`; tenantd answers with `attached`, then sends `request` events,
+        /// each answered by a `response` with the same id, in any order. `cancel`
+        /// says the kernel gave up on a request (its response is then ignored).
+        /// `invalidate` drops what tenantd cached (attributes, listings, negative
+        /// entries) after the underlying data changed behind its back.
+        ///
+        /// One server per container: a new ServeFuse replaces the old stream, which
+        /// ends ABORTED, and requests it had not answered fail EIO (writes are
+        /// never replayed). While none is attached, requests queue, so container
+        /// I/O waits. Starting a "created" container needs a server to have
+        /// attached. A tenantd restart loses the session: a "created" container
+        /// gets a fresh one, a running one must be recreated.
+        pub async fn serve_fuse(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::FuseServerMessage>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::FuseServerEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Containers/ServeFuse",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tenantd.v1.Containers", "ServeFuse"));
+            self.inner.streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -2144,7 +2631,7 @@ pub mod containers_server {
             &self,
             request: tonic::Request<super::CreateContainerRequest>,
         ) -> std::result::Result<tonic::Response<super::Container>, tonic::Status>;
-        /// Runs a "created" container, once its FUSE server has attached.
+        /// Runs a "created" container, once its FUSE server has called ServeFuse.
         /// Starting a running one returns it; an exited one never restarts.
         async fn start_container(
             &self,
@@ -2170,6 +2657,29 @@ pub mod containers_server {
             tonic::Response<super::DeleteContainerResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the ServeFuse method.
+        type ServeFuseStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::FuseServerEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Serves the container's FUSE slot. The caller's first message is
+        /// `attach`; tenantd answers with `attached`, then sends `request` events,
+        /// each answered by a `response` with the same id, in any order. `cancel`
+        /// says the kernel gave up on a request (its response is then ignored).
+        /// `invalidate` drops what tenantd cached (attributes, listings, negative
+        /// entries) after the underlying data changed behind its back.
+        ///
+        /// One server per container: a new ServeFuse replaces the old stream, which
+        /// ends ABORTED, and requests it had not answered fail EIO (writes are
+        /// never replayed). While none is attached, requests queue, so container
+        /// I/O waits. Starting a "created" container needs a server to have
+        /// attached. A tenantd restart loses the session: a "created" container
+        /// gets a fresh one, a running one must be recreated.
+        async fn serve_fuse(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::FuseServerMessage>>,
+        ) -> std::result::Result<tonic::Response<Self::ServeFuseStream>, tonic::Status>;
     }
     /// Containers inside running sandboxes: the sandbox's image on a writable
     /// root of their own (in the tenant's quota), sharing the sandbox's kernel,
@@ -2181,21 +2691,10 @@ pub mod containers_server {
     /// profile declares, bound at create; changing a binding means recreating
     /// it. A container asking for the profile's FUSE slot gets a FUSE mount
     /// whose server is the caller: it is created "created" and waits there.
-    /// The caller then takes the mount's /dev/fuse connection over the FUSE
-    /// socket (server.fuse_socket, see below), serves it, and calls
-    /// StartContainer. tenantd never runs filesystem code.
-    ///
-    /// AttachFuse is not a gRPC call, since an fd can't cross HTTP/2. Connect
-    /// to the FUSE socket (same callers as this one), send one line
-    /// attach-fuse <tenant> <sandbox> <container>\\n
-    /// and read one line back: "ok\n" with the fd attached (SCM_RIGHTS), or
-    /// "err <code> <message>\\n" with a gRPC code name such as NOT_FOUND. Each
-    /// attach hands out the same connection, so a server that restarts can
-    /// attach again; it then finds the connection already initialised (no
-    /// FUSE_INIT comes). tenantd keeps the connection open until the container
-    /// ends, so requests queue rather than fail while no server reads them.
-    /// A tenantd restart loses it: a "created" container gets a fresh one, a
-    /// running one must be recreated to get one again.
+    /// The caller then opens ServeFuse, answers the filesystem requests it
+    /// receives, and calls StartContainer. tenantd speaks the kernel FUSE
+    /// protocol itself and never runs filesystem code: the caller sees path-based
+    /// operations (stat, read, write, ...), not kernel messages.
     #[derive(Debug)]
     pub struct ContainersServer<T> {
         inner: Arc<T>,
@@ -2487,6 +2986,54 @@ pub mod containers_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Containers/ServeFuse" => {
+                    #[allow(non_camel_case_types)]
+                    struct ServeFuseSvc<T: Containers>(pub Arc<T>);
+                    impl<
+                        T: Containers,
+                    > tonic::server::StreamingService<super::FuseServerMessage>
+                    for ServeFuseSvc<T> {
+                        type Response = super::FuseServerEvent;
+                        type ResponseStream = T::ServeFuseStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::FuseServerMessage>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Containers>::serve_fuse(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ServeFuseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

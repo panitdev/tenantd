@@ -24,6 +24,7 @@ anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4.6", features = ["derive", "env"] }
 flate2 = "1.1"
+fuser = "0.18"
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"

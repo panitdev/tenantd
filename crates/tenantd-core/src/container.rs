@@ -13,17 +13,16 @@
 //! checked at create and kept on the row. A container with a FUSE slot
 //! gets a host FUSE mount, bind-mounted like a volume; its row stops at
 //! `created` (root and mount ready, no runtime container yet) until the
-//! caller's FUSE server holds the connection, because anything touching
-//! the mount, runsc included, blocks until a server answers. Then
+//! caller's FUSE server has attached, because anything touching the
+//! mount, runsc included, blocks until a server answers. Then
 //! [`Tenantd::start_container`] runs it.
-
-use std::os::fd::OwnedFd;
 
 use tracing::{info, warn};
 
 use crate::Tenantd;
 use crate::backend::{BindMount, RootfsSpec, RuntimeHandle, RuntimeState};
 use crate::events::EventKind;
+use crate::fuse::{FuseLimits, FuseLink};
 use crate::model::{
     ContainerRecord, ContainerSpec, ContainerState, ProcessState, SandboxRecord, SandboxState,
     VolumeState,
@@ -161,7 +160,7 @@ impl Tenantd {
         drop(sandbox_lock);
         if rec.fuse.is_some() && !self.fuse_attached.lock().unwrap().contains(key) {
             return Err(Error::FailedPrecondition(format!(
-                "container {key} waits for its FUSE server: attach it over the FUSE socket first"
+                "container {key} waits for its FUSE server: attach it with ServeFuse first"
             )));
         }
         let res = async {
@@ -181,13 +180,12 @@ impl Tenantd {
         Ok(rec)
     }
 
-    /// The container's FUSE connection, for its server. Each call hands out
-    /// a duplicate of the same connection, so a server that restarts can
-    /// attach again; a reattached server finds the connection already
-    /// initialised (no `FUSE_INIT` comes). tenantd loses its connections
-    /// when it restarts: a `created` container gets a fresh one, a running
-    /// one has to be recreated.
-    pub async fn attach_fuse(&self, key: &ContainerKey) -> Result<OwnedFd> {
+    /// Attach a server to the container's FUSE session. A new server
+    /// replaces the old one (whose unanswered requests fail with `EIO`),
+    /// so a server that restarts can attach again. tenantd loses its
+    /// sessions when it restarts: a `created` container gets a fresh one,
+    /// a running one has to be recreated.
+    pub async fn attach_fuse(&self, key: &ContainerKey, theirs: FuseLimits) -> Result<FuseLink> {
         let _c = self.container_locks.lock(key.clone()).await;
         let rec = self.get_container(key).await?;
         if rec.fuse.is_none() {
@@ -195,19 +193,19 @@ impl Tenantd {
                 "container {key} has no FUSE slot"
             )));
         }
-        let fd = match rec.state {
-            ContainerState::Created => match self.fuse.connection(key)? {
-                Some(fd) => fd,
+        let link = match rec.state {
+            ContainerState::Created => match self.fuse.attach(key, theirs)? {
+                Some(l) => l,
                 None => {
                     self.fuse.mount(key).await?;
-                    self.fuse.connection(key)?.ok_or_else(|| {
-                        Error::Internal(format!("FUSE mount of {key} holds no connection"))
+                    self.fuse.attach(key, theirs)?.ok_or_else(|| {
+                        Error::Internal(format!("FUSE mount of {key} holds no session"))
                     })?
                 }
             },
-            ContainerState::Running => self.fuse.connection(key)?.ok_or_else(|| {
+            ContainerState::Running => self.fuse.attach(key, theirs)?.ok_or_else(|| {
                 Error::FailedPrecondition(format!(
-                    "tenantd lost the FUSE connection of {key} when it restarted; \
+                    "tenantd lost the FUSE session of {key} when it restarted; \
                      recreate the container"
                 ))
             })?,
@@ -219,8 +217,8 @@ impl Tenantd {
             }
         };
         self.fuse_attached.lock().unwrap().insert(key.clone());
-        info!(container = %key, "FUSE connection handed to its server");
-        Ok(fd)
+        info!(container = %key, generation = link.generation, "FUSE server attached");
+        Ok(link)
     }
 
     pub(crate) async fn running_sandbox(&self, sk: &SandboxKey) -> Result<SandboxRecord> {
@@ -307,7 +305,7 @@ impl Tenantd {
     }
 
     /// The container's root, its FUSE mount, and the bind mounts of its
-    /// volumes and FUSE slot. Idempotent; a FUSE connection tenantd holds
+    /// volumes and FUSE slot. Idempotent; a FUSE session tenantd holds
     /// is kept, a lost one is replaced.
     pub(crate) async fn prepare_container(
         &self,
@@ -388,7 +386,7 @@ impl Tenantd {
     }
 
     /// End the container's processes, stop and remove it from the sandbox,
-    /// unmount its FUSE connection, and remove its root when
+    /// unmount its FUSE session, and remove its root when
     /// `remove_root`. Tries every step and returns the first error.
     pub(crate) async fn tear_down_container(
         &self,

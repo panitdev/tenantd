@@ -40,26 +40,15 @@ service Sandboxes {
 // profile declares, bound at create; changing a binding means recreating
 // it. A container asking for the profile's FUSE slot gets a FUSE mount
 // whose server is the caller: it is created "created" and waits there.
-// The caller then takes the mount's /dev/fuse connection over the FUSE
-// socket (server.fuse_socket, see below), serves it, and calls
-// StartContainer. tenantd never runs filesystem code.
-//
-// AttachFuse is not a gRPC call, since an fd can't cross HTTP/2. Connect
-// to the FUSE socket (same callers as this one), send one line
-//   attach-fuse <tenant> <sandbox> <container>\n
-// and read one line back: "ok\n" with the fd attached (SCM_RIGHTS), or
-// "err <code> <message>\n" with a gRPC code name such as NOT_FOUND. Each
-// attach hands out the same connection, so a server that restarts can
-// attach again; it then finds the connection already initialised (no
-// FUSE_INIT comes). tenantd keeps the connection open until the container
-// ends, so requests queue rather than fail while no server reads them.
-// A tenantd restart loses it: a "created" container gets a fresh one, a
-// running one must be recreated to get one again.
+// The caller then opens ServeFuse, answers the filesystem requests it
+// receives, and calls StartContainer. tenantd speaks the kernel FUSE
+// protocol itself and never runs filesystem code: the caller sees path-based
+// operations (stat, read, write, ...), not kernel messages.
 service Containers {
   // Idempotent on (tenant, sandbox, id), like every create. The sandbox
   // must be running, and bound volumes ready.
   rpc CreateContainer(CreateContainerRequest) returns (Container);
-  // Runs a "created" container, once its FUSE server has attached.
+  // Runs a "created" container, once its FUSE server has called ServeFuse.
   // Starting a running one returns it; an exited one never restarts.
   rpc StartContainer(ContainerRef) returns (Container);
   rpc GetContainer(ContainerRef) returns (Container);
@@ -67,6 +56,20 @@ service Containers {
   // Ends its processes and removes it and its root. Their process rows stay
   // until their retention passes.
   rpc DeleteContainer(ContainerRef) returns (DeleteContainerResponse);
+  // Serves the container's FUSE slot. The caller's first message is
+  // `attach`; tenantd answers with `attached`, then sends `request` events,
+  // each answered by a `response` with the same id, in any order. `cancel`
+  // says the kernel gave up on a request (its response is then ignored).
+  // `invalidate` drops what tenantd cached (attributes, listings, negative
+  // entries) after the underlying data changed behind its back.
+  //
+  // One server per container: a new ServeFuse replaces the old stream, which
+  // ends ABORTED, and requests it had not answered fail EIO (writes are
+  // never replayed). While none is attached, requests queue, so container
+  // I/O waits. Starting a "created" container needs a server to have
+  // attached. A tenantd restart loses the session: a "created" container
+  // gets a fresh one, a running one must be recreated.
+  rpc ServeFuse(stream FuseServerMessage) returns (stream FuseServerEvent);
 }
 
 // Processes inside running sandboxes. Only processes tenantd started are
@@ -251,6 +254,197 @@ message Container {
   repeated string args = 8;     // empty: the image's entrypoint and cmd
   repeated VolumeMount volumes = 9;
   string fuse_path = 10;        // where its FUSE slot is mounted; "" = none
+}
+
+// ---- ServeFuse ----------------------------------------------------------
+// Paths are absolute within the exported tree ("/" is the root), without
+// "." or ".." parts. errno values are Linux's.
+
+message FuseServerMessage {
+  oneof msg {
+    Attach attach = 1;          // first message, once
+    FuseResponse response = 2;
+    Invalidate invalidate = 3;
+  }
+}
+
+message FuseServerEvent {
+  oneof event {
+    Attached attached = 1;      // first event, once
+    FuseRequest request = 2;
+    Cancel cancel = 3;
+  }
+}
+
+message Attach {
+  ContainerRef container = 1;
+  uint32 version = 2;           // protocol version; 1
+  FuseLimits limits = 3;        // what this server can take
+}
+
+message Attached {
+  uint64 generation = 1;        // counts attaches of this container
+  FuseLimits limits = 2;        // negotiated: the smaller of both sides
+}
+
+// Zero means "no preference" from a server; tenantd's answer is never zero.
+message FuseLimits {
+  uint32 max_read = 1;          // bytes per Read
+  uint32 max_write = 2;         // bytes per Write
+  uint32 max_inflight = 3;      // unanswered requests
+}
+
+message Cancel {
+  uint64 id = 1;
+}
+
+message Invalidate {
+  oneof target {
+    string path = 1;
+    bytes object_id = 2;        // every path of this object
+  }
+  bool recursive = 3;           // path only: everything below it as well
+}
+
+message FuseRequest {
+  uint64 id = 1;
+  // Whose access this is, as the kernel reports it.
+  uint32 uid = 2;
+  uint32 gid = 3;
+  uint32 pid = 4;
+  oneof op {
+    Stat stat = 10;
+    ReadDir read_dir = 11;
+    Readlink readlink = 12;
+    Open open = 13;
+    Read read = 14;
+    Write write = 15;
+    Flush flush = 16;
+    Release release = 17;
+    Fsync fsync = 18;
+    Create create = 19;
+    Mkdir mkdir = 20;
+    Unlink unlink = 21;
+    Rmdir rmdir = 22;
+    Rename rename = 23;
+    Symlink symlink = 24;
+    SetAttr set_attr = 25;
+    StatFs stat_fs = 26;
+  }
+}
+
+message Stat { string path = 1; }
+// The whole directory with each entry's attributes, in one round trip.
+message ReadDir { string path = 1; }
+message Readlink { string path = 1; }
+message Open { string path = 1; uint32 flags = 2; }   // open(2) flags
+message Read { string path = 1; uint64 handle = 2; uint64 offset = 3; uint32 size = 4; }
+message Write { string path = 1; uint64 handle = 2; uint64 offset = 3; bytes data = 4; }
+// Every close(2) of a descriptor; Release follows the last one.
+message Flush { string path = 1; uint64 handle = 2; }
+message Release { string path = 1; uint64 handle = 2; }
+message Fsync { string path = 1; uint64 handle = 2; bool datasync = 3; }
+message Create { string path = 1; uint32 mode = 2; uint32 flags = 3; }
+message Mkdir { string path = 1; uint32 mode = 2; }
+message Unlink { string path = 1; }
+message Rmdir { string path = 1; }
+message Rename { string from = 1; string to = 2; uint32 flags = 3; }  // renameat2 flags
+message Symlink { string path = 1; string target = 2; }
+message SetAttr {
+  string path = 1;
+  optional uint64 handle = 2;   // set when the call came through an open file
+  optional uint32 mode = 3;
+  optional uint32 uid = 4;
+  optional uint32 gid = 5;
+  optional uint64 size = 6;
+  optional int64 atime_ns = 7;
+  optional int64 mtime_ns = 8;
+}
+message StatFs {}
+
+// errno == 0 is success and sets `result` as the request's op calls for:
+//   Stat, Mkdir, Symlink, SetAttr -> attr      Readlink -> target
+//   ReadDir -> dir     Open, Create -> open    Read -> data
+//   Write -> write     StatFs -> statfs
+//   Flush, Release, Fsync, Unlink, Rmdir, Rename -> ok
+message FuseResponse {
+  uint64 id = 1;
+  int32 errno = 2;
+  string detail = 3;            // for logs; never shown to the container
+  uint32 negative_ttl_ms = 4;   // with ENOENT: how long "absent" may be cached
+  oneof result {
+    FileAttr attr = 10;
+    DirListing dir = 11;
+    OpenReply open = 12;
+    bytes data = 13;
+    WriteReply write = 14;
+    string target = 15;
+    StatFsReply statfs = 16;
+    FuseOk ok = 17;
+  }
+}
+
+message FuseOk {}
+
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_FILE = 1;
+  FILE_KIND_DIRECTORY = 2;
+  FILE_KIND_SYMLINK = 3;
+  FILE_KIND_FIFO = 4;
+  FILE_KIND_SOCKET = 5;
+  FILE_KIND_CHAR_DEVICE = 6;
+  FILE_KIND_BLOCK_DEVICE = 7;
+}
+
+message FileAttr {
+  FileKind kind = 1;
+  uint32 mode = 2;              // permission, setuid/setgid and sticky bits
+  uint64 size = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+  uint32 nlink = 6;
+  int64 atime_ns = 7;
+  int64 mtime_ns = 8;
+  int64 ctime_ns = 9;
+  uint32 rdev = 10;
+  uint32 ttl_ms = 11;           // how long tenantd and the kernel may cache this
+  // Identity of the file itself, equal for its hard links. Lets tenantd give
+  // them one inode; without it every path is its own file.
+  optional bytes object_id = 12;
+}
+
+message DirListing {
+  repeated DirEntry entries = 1;    // without "." and ".."
+}
+
+message DirEntry {
+  string name = 1;
+  FileAttr attr = 2;
+}
+
+message OpenReply {
+  uint64 handle = 1;            // echoed in Read, Write, Flush, Release, Fsync
+  bool keep_cache = 2;          // the kernel may keep its page cache
+  bool direct_io = 3;           // bypass the page cache
+  bool buffered_writes = 4;     // tenantd may batch writes before sending them
+  FileAttr attr = 5;            // always set for Create
+  optional bytes inline_data = 6;   // the file's start, if small: saves the first Read
+}
+
+message WriteReply {
+  uint32 written = 1;
+  FileAttr attr = 2;            // after the write
+}
+
+message StatFsReply {
+  uint64 blocks = 1;
+  uint64 bfree = 2;
+  uint64 bavail = 3;
+  uint64 files = 4;
+  uint64 ffree = 5;
+  uint32 bsize = 6;
+  uint32 namelen = 7;
 }
 
 message VolumeMount {

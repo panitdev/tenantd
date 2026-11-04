@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+fuser.workspace = true
 libc.workspace = true
 tenantd-core.workspace = true
 tokio = { workspace = true, features = ["rt"] }

@@ -1,8 +1,11 @@
 //! Operator commands over a running daemon's API socket. These never read
 //! the daemon config, open the state DB or need root; only socket access.
 
+mod passthrough;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Args, Subcommand};
@@ -181,7 +184,7 @@ pub enum ContainerCmd {
         #[arg(long = "volume", short = 'v', value_parser = binding)]
         volumes: Vec<(String, String)>,
         /// Mount the profile's FUSE slot. The container then waits
-        /// "created" for its server; see attach-fuse.
+        /// "created" for its server; see serve-fuse.
         #[arg(long)]
         fuse: bool,
         /// Its init and arguments; default: the image's entrypoint and cmd.
@@ -194,27 +197,27 @@ pub enum ContainerCmd {
         sandbox: String,
         id: String,
     },
-    /// Take the container's FUSE connection and run its server: the
-    /// command gets the connection as fd 3 (also in TENANTD_FUSE_FD), as
-    /// libfuse servers take `/dev/fd/3` for a mount point. Exits with the
-    /// server's exit code.
-    AttachFuse {
+    /// Serve a host directory as the container's FUSE slot, until the
+    /// container ends or another server replaces this one. Every path is
+    /// confined to the directory; files are created as the user running
+    /// this command.
+    ServeFuse {
         tenant: String,
         sandbox: String,
         id: String,
-        /// The daemon's FUSE socket.
-        #[arg(
-            long,
-            env = "TENANTD_FUSE_SOCKET",
-            default_value = tenantd_client::fuse::DEFAULT_SOCKET
-        )]
-        fuse_socket: PathBuf,
-        /// Start the container once the server runs.
+        /// The directory to export.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Refuse every change.
+        #[arg(long)]
+        read_only: bool,
+        /// How long tenantd and the kernel may cache what they learn about
+        /// files, in milliseconds. 0 asks about every access.
+        #[arg(long, default_value_t = 1000)]
+        attr_ttl_ms: u32,
+        /// Start the container once the server is attached.
         #[arg(long)]
         start: bool,
-        /// The server and its arguments.
-        #[arg(last = true, required = true)]
-        server: Vec<String>,
     },
     Get {
         tenant: String,
@@ -691,56 +694,38 @@ fn print_volume(v: &pb::Volume) {
     );
 }
 
-/// Run `server` with the FUSE connection as fd 3, optionally start the
-/// container, and exit with the server's code.
-async fn attach_fuse(
-    mut k: ContainersClient<Channel>,
+/// Serve `dir` as the container's FUSE slot, optionally starting the
+/// container once attached. Returns when the stream ends.
+async fn serve_fuse(
+    ch: Channel,
     r: pb::ContainerRef,
-    socket: PathBuf,
+    dir: PathBuf,
+    read_only: bool,
+    attr_ttl_ms: u32,
     start: bool,
-    server: Vec<String>,
 ) -> anyhow::Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-    let fd = {
-        let (s, t, sb, c) = (
-            socket.clone(),
-            r.tenant.clone(),
-            r.sandbox.clone(),
-            r.id.clone(),
-        );
-        tokio::task::spawn_blocking(move || tenantd_client::fuse::attach_fuse(&s, &t, &sb, &c))
-            .await?
-            .with_context(|| format!("attaching via {}", socket.display()))?
-    };
-    let raw = fd.as_raw_fd();
-    let mut cmd = std::process::Command::new(&server[0]);
-    cmd.args(&server[1..]).env("TENANTD_FUSE_FD", "3");
-    // SAFETY: dup2 is async-signal-safe; it runs between fork and exec.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(raw, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("running {}", server[0]))?;
-    drop(fd);
-    if start && let Err(e) = k.start_container(r).await {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e.into());
-    }
-    let status = tokio::task::spawn_blocking(move || child.wait()).await??;
-    use std::os::unix::process::ExitStatusExt;
-    std::process::exit(
-        status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+    let fs = passthrough::Passthrough::new(&dir, read_only, attr_ttl_ms)
+        .with_context(|| format!("opening {}", dir.display()))?;
+    let session =
+        tenantd_client::fuse::attach(ch.clone(), r.clone(), Arc::new(fs), Default::default())
+            .await
+            .context("attaching the FUSE server")?;
+    eprintln!(
+        "serving {} (attach {}, max read {}, max write {})",
+        dir.display(),
+        session.generation,
+        session.limits.max_read,
+        session.limits.max_write
     );
+    if start {
+        ContainersClient::new(ch)
+            .start_container(r)
+            .await
+            .context("starting the container")?;
+    }
+    session.run().await.context("serving FUSE")?;
+    eprintln!("connection ended");
+    Ok(())
 }
 
 fn event_json(e: pb::Event) -> serde_json::Value {
@@ -884,7 +869,7 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
             }
         }
         ClientCmd::Container { cmd: c, .. } => {
-            let mut k = ContainersClient::new(ch);
+            let mut k = ContainersClient::new(ch.clone());
             let r = |tenant, sandbox, id| pb::ContainerRef {
                 tenant,
                 sandbox,
@@ -918,14 +903,25 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                         .await?
                         .into_inner(),
                 ),
-                ContainerCmd::AttachFuse {
+                ContainerCmd::ServeFuse {
                     tenant,
                     sandbox,
                     id,
-                    fuse_socket,
+                    dir,
+                    read_only,
+                    attr_ttl_ms,
                     start,
-                    server,
-                } => attach_fuse(k, r(tenant, sandbox, id), fuse_socket, start, server).await?,
+                } => {
+                    serve_fuse(
+                        ch.clone(),
+                        r(tenant, sandbox, id),
+                        dir,
+                        read_only,
+                        attr_ttl_ms,
+                        start,
+                    )
+                    .await?
+                }
                 ContainerCmd::Get {
                     tenant,
                     sandbox,

@@ -2,7 +2,6 @@
 //! writable layer, the runtime, the image cache and the network.
 
 use std::collections::HashSet;
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,6 +10,7 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RuntimeKind;
+use crate::fuse::{FuseLimits, FuseLink};
 use crate::model::{
     LayerKind, NetworkMode, ProcessIo, PruneReport, ResolvedImage, ResolvedProcess,
     ResolvedSandbox, Signal, Stream, VolumeOwner,
@@ -338,21 +338,25 @@ pub trait VolumeBackend: Send + Sync {
     async fn list_owned(&self, tenant_dir: &Path) -> Result<Vec<VolumeId>>;
 }
 
-/// Containers' FUSE connections: a host FUSE mount per container, which
-/// the container bind-mounts and whose `/dev/fuse` fd tenantd hands to the
-/// caller, who serves it. tenantd runs no filesystem code; it holds a
-/// duplicate of each fd so that the connection, and the mount, outlive the
-/// caller's server until the container ends.
+/// Containers' FUSE mounts: a host FUSE mount per container, which the
+/// container bind-mounts. The backend runs the kernel side of the session
+/// and hands the caller's server semantic requests through a [`FuseLink`];
+/// tenantd runs no filesystem code. The session, and so the mount, outlive
+/// any one server until the container ends.
 #[async_trait]
 pub trait FuseBackend: Send + Sync {
-    /// Mount a fresh connection for `c`, unless one tenantd holds is
-    /// mounted already. Returns the host mount point.
+    /// Mount a fresh session for `c`, unless one tenantd holds is mounted
+    /// already. Returns the host mount point.
     async fn mount(&self, c: &ContainerKey) -> Result<PathBuf>;
-    /// A duplicate of the connection's fd, or `None` when tenantd holds no
-    /// connection for `c` (none mounted, or lost with a tenantd restart).
-    fn connection(&self, c: &ContainerKey) -> Result<Option<OwnedFd>>;
-    /// Abort the connection, so blocked callers fail rather than hang,
-    /// unmount it and close tenantd's fd. Idempotent.
+    /// Attach a server to `c`'s session, replacing the previous one (which
+    /// gets [`crate::fuse::FuseEvent::Replaced`] and fails its unanswered requests with
+    /// `EIO`). `None` when tenantd holds no session for `c` (none mounted,
+    /// or lost with a tenantd restart). `theirs` are the server's limits.
+    fn attach(&self, c: &ContainerKey, theirs: FuseLimits) -> Result<Option<FuseLink>>;
+    /// Whether tenantd holds a session for `c`.
+    fn has_session(&self, c: &ContainerKey) -> bool;
+    /// Abort the session, so blocked callers fail rather than hang, unmount
+    /// it and drop whatever is queued. Idempotent.
     async fn unmount(&self, c: &ContainerKey) -> Result<()>;
     /// Containers with a mount point on the host. For reconcile.
     async fn list_owned(&self) -> Result<Vec<ContainerKey>>;

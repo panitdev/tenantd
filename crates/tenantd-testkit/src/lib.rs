@@ -3,7 +3,6 @@
 //! simulate crashes.
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +14,9 @@ use futures::channel::mpsc;
 use futures::stream::BoxStream;
 use tenantd_core::backend::*;
 use tenantd_core::config::{Config, RuntimeKind};
+use tenantd_core::fuse::{
+    FuseEvent, FuseLimits, FuseLink, FuseOp, FuseResult, FuseSession, InvalidateTarget,
+};
 use tenantd_core::model::{
     ImageConfig, LayerKind, NetworkMode, ProcessIo, PruneReport, ResolvedImage, ResolvedProcess,
     ResolvedSandbox, Signal, Stream, VolumeOwner,
@@ -898,22 +900,63 @@ impl VolumeBackend for FakeVolumes {
     }
 }
 
-/// FUSE mounts on the fake host. A connection is a pipe's read end; its
-/// write end stands for the kernel side, so a test can see a handed-out
-/// fd is the held one (same inode).
+/// FUSE mounts on the fake host. A session stands in for the kernel side
+/// of a mount: a test pushes requests at the attached server with
+/// [`FakeFuse::inject`] and reads what it answered with
+/// [`FakeFuse::responses`].
 #[derive(Default)]
 pub struct FakeFuse {
     /// Mounted containers, and whether this service instance holds the
-    /// connection (`false` after a restart).
+    /// session (`false` after a restart).
     pub mounted: Mutex<HashMap<ContainerKey, bool>>,
-    conns: Mutex<HashMap<ContainerKey, (OwnedFd, OwnedFd)>>,
+    sessions: Mutex<HashMap<ContainerKey, Arc<FakeSession>>>,
     pub faults: Arc<Faults>,
 }
 
+#[derive(Default)]
+struct FakeSessionInner {
+    generation: u64,
+    events: Option<tokio::sync::mpsc::Sender<FuseEvent>>,
+    next_id: u64,
+    responses: Vec<(u64, FuseResult)>,
+    invalidations: Vec<InvalidateTarget>,
+    /// Servers that went away, by generation.
+    detached: Vec<u64>,
+}
+
+#[derive(Default)]
+struct FakeSession {
+    inner: Mutex<FakeSessionInner>,
+}
+
+impl FuseSession for FakeSession {
+    fn respond(&self, generation: u64, id: u64, result: FuseResult) {
+        let mut g = self.inner.lock().unwrap();
+        if g.generation == generation {
+            g.responses.push((id, result));
+        }
+    }
+
+    fn invalidate(&self, generation: u64, target: InvalidateTarget) {
+        let mut g = self.inner.lock().unwrap();
+        if g.generation == generation {
+            g.invalidations.push(target);
+        }
+    }
+
+    fn detach(&self, generation: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.detached.push(generation);
+        if g.generation == generation {
+            g.events = None;
+        }
+    }
+}
+
 impl FakeFuse {
-    /// What a daemon restart does: the fds are gone, the mounts stay.
-    pub fn lose_connections(&self) {
-        self.conns.lock().unwrap().clear();
+    /// What a daemon restart does: the sessions are gone, the mounts stay.
+    pub fn lose_sessions(&self) {
+        self.sessions.lock().unwrap().clear();
         for held in self.mounted.lock().unwrap().values_mut() {
             *held = false;
         }
@@ -922,20 +965,53 @@ impl FakeFuse {
     pub fn is_mounted(&self, c: &ContainerKey) -> bool {
         self.mounted.lock().unwrap().contains_key(c)
     }
-}
 
-pub fn same_file(a: &OwnedFd, b: &OwnedFd) -> bool {
-    use std::os::fd::AsFd;
-    let st = |f: &OwnedFd| {
-        std::fs::File::from(f.as_fd().try_clone_to_owned().unwrap())
-            .metadata()
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                (m.dev(), m.ino())
-            })
-            .unwrap()
-    };
-    st(a) == st(b)
+    fn session(&self, c: &ContainerKey) -> Option<Arc<FakeSession>> {
+        self.sessions.lock().unwrap().get(c).cloned()
+    }
+
+    /// Send a request to `c`'s attached server, as the kernel would.
+    /// Returns its id, or `None` with no server attached.
+    pub fn inject(&self, c: &ContainerKey, op: FuseOp) -> Option<u64> {
+        let s = self.session(c)?;
+        let mut g = s.inner.lock().unwrap();
+        g.next_id += 1;
+        let id = g.next_id;
+        let tx = g.events.as_ref()?;
+        tx.try_send(FuseEvent::Request {
+            id,
+            caller: Default::default(),
+            op,
+        })
+        .ok()?;
+        Some(id)
+    }
+
+    /// What the current server answered, in order.
+    pub fn responses(&self, c: &ContainerKey) -> Vec<(u64, FuseResult)> {
+        self.session(c)
+            .map(|s| s.inner.lock().unwrap().responses.clone())
+            .unwrap_or_default()
+    }
+
+    /// What the current server asked to invalidate.
+    pub fn invalidations(&self, c: &ContainerKey) -> Vec<InvalidateTarget> {
+        self.session(c)
+            .map(|s| s.inner.lock().unwrap().invalidations.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether a server is attached to `c` now.
+    pub fn has_server(&self, c: &ContainerKey) -> bool {
+        self.session(c)
+            .is_some_and(|s| s.inner.lock().unwrap().events.is_some())
+    }
+
+    /// How many servers have attached to `c` over its session.
+    pub fn attaches(&self, c: &ContainerKey) -> u64 {
+        self.session(c)
+            .map_or(0, |s| s.inner.lock().unwrap().generation)
+    }
 }
 
 #[async_trait]
@@ -943,26 +1019,40 @@ impl FuseBackend for FakeFuse {
     async fn mount(&self, c: &ContainerKey) -> Result<PathBuf> {
         self.faults.check("fuse.mount")?;
         let point = PathBuf::from("/run/fake/fuse").join(c.to_string());
-        let mut conns = self.conns.lock().unwrap();
-        if conns.contains_key(c) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.contains_key(c) {
             return Ok(point);
         }
-        let (r, w) = std::io::pipe().map_err(|e| Error::internal("pipe", e))?;
-        conns.insert(c.clone(), (r.into(), w.into()));
+        sessions.insert(c.clone(), Arc::new(FakeSession::default()));
         self.mounted.lock().unwrap().insert(c.clone(), true);
         Ok(point)
     }
 
-    fn connection(&self, c: &ContainerKey) -> Result<Option<OwnedFd>> {
-        match self.conns.lock().unwrap().get(c) {
-            Some((r, _)) => Ok(Some(r.try_clone().map_err(|e| Error::internal("dup", e))?)),
-            None => Ok(None),
+    fn attach(&self, c: &ContainerKey, theirs: FuseLimits) -> Result<Option<FuseLink>> {
+        let Some(s) = self.session(c) else {
+            return Ok(None);
+        };
+        let limits = FuseLimits::SERVER.negotiate(theirs);
+        let (tx, rx) = tokio::sync::mpsc::channel(limits.max_inflight as usize + 1);
+        let mut g = s.inner.lock().unwrap();
+        if let Some(old) = g.events.replace(tx) {
+            let _ = old.try_send(FuseEvent::Replaced);
         }
+        g.generation += 1;
+        g.responses.clear();
+        g.invalidations.clear();
+        let generation = g.generation;
+        drop(g);
+        Ok(Some(FuseLink::new(generation, limits, rx, s)))
+    }
+
+    fn has_session(&self, c: &ContainerKey) -> bool {
+        self.sessions.lock().unwrap().contains_key(c)
     }
 
     async fn unmount(&self, c: &ContainerKey) -> Result<()> {
         self.faults.check("fuse.unmount")?;
-        self.conns.lock().unwrap().remove(c);
+        self.sessions.lock().unwrap().remove(c);
         self.mounted.lock().unwrap().remove(c);
         Ok(())
     }
@@ -1159,7 +1249,7 @@ impl Env {
     pub async fn restart(&mut self) {
         self.host.runtime.watched_processes.lock().unwrap().clear();
         self.host.output.watched.lock().unwrap().clear();
-        self.host.fuse.lose_connections();
+        self.host.fuse.lose_sessions();
         self.tenantd = self.host.service(TEST_CONFIG);
         self.tenantd.check_health().await;
     }

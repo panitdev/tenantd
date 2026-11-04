@@ -53,10 +53,9 @@ path = "/tmp"                 # a bind mount, replacing the read-only root's tmp
 path = "/cache"
 read_only = true
 
-# A FUSE mount containers may ask for. tenantd mounts it on the host and
-# hands the /dev/fuse connection to the caller over server.fuse_socket
-# (default /run/tenantd/fuse.sock); the caller serves it, tenantd never
-# runs filesystem code.
+# A FUSE mount containers may ask for. tenantd mounts it on the host; the
+# caller serves it over the API (Containers.ServeFuse), tenantd never runs
+# filesystem code.
 [profiles.default.fuse]
 path = "/mnt"
 

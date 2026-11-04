@@ -436,7 +436,7 @@ impl Tenantd {
                 }
                 // Waiting for its FUSE server. A runtime container exists
                 // only if a start was cut short: one that runs is adopted,
-                // anything else removed. A FUSE connection lost with a
+                // anything else removed. A FUSE session lost with a
                 // restart is replaced, and its server has to attach again.
                 ContainerState::Created => {
                     if !sandbox_running {
@@ -462,7 +462,7 @@ impl Tenantd {
                             RuntimeState::Missing => {}
                             _ => self.remove_runtime_container(&key).await?,
                         }
-                        let lost = rec.fuse.is_some() && self.fuse.connection(&key)?.is_none();
+                        let lost = rec.fuse.is_some() && !self.fuse.has_session(&key);
                         self.prepare_container(&sandbox, &rec).await?;
                         Ok::<_, crate::Error>(
                             lost.then_some("remounted FUSE; its server must attach again"),

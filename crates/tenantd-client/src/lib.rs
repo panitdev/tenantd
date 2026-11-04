@@ -1,5 +1,5 @@
 //! gRPC types for tenantd plus a Unix-socket connector for control planes,
-//! and [`fuse::attach_fuse`] for taking a container's FUSE connection.
+//! and [`fuse`] for serving a container's FUSE slot.
 //!
 //! ```no_run
 //! # async fn f() -> Result<(), Box<dyn std::error::Error>> {

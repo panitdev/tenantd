@@ -37,14 +37,6 @@ pub struct ServerConfig {
     pub socket_gid: Option<u32>,
     #[serde(default)]
     pub callers: Vec<Caller>,
-    /// Side socket that hands FUSE connections (`/dev/fuse` fds) to
-    /// callers. Same mode, group and callers as the API socket.
-    #[serde(default = "default_fuse_socket")]
-    pub fuse_socket: PathBuf,
-}
-
-fn default_fuse_socket() -> PathBuf {
-    "/run/tenantd/fuse.sock".into()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -96,7 +88,7 @@ pub struct RuntimeConfig {
     /// Extra global runsc flags, fixed by the operator (e.g. `--platform=kvm`).
     #[serde(default)]
     pub extra_flags: Vec<String>,
-    /// Host mount points of containers' FUSE connections.
+    /// Host mount points of containers' FUSE sessions.
     #[serde(default = "default_fuse_dir")]
     pub fuse_dir: PathBuf,
 }
@@ -206,7 +198,7 @@ pub struct Profile {
     #[serde(default)]
     pub volumes: BTreeMap<String, VolumeSlot>,
     /// A FUSE mount containers of the profile may ask for; its server is
-    /// the caller, handed the connection over `server.fuse_socket`.
+    /// the caller, which serves it over `Containers.ServeFuse`.
     pub fuse: Option<FuseSlot>,
 }
 
@@ -563,10 +555,6 @@ mod tests {
         assert_eq!(p.volumes["workspace"].path, "/workspace");
         assert!(p.volumes["workspace"].required);
         assert_eq!(p.fuse.as_ref().unwrap().path, "/mnt");
-        assert_eq!(
-            cfg.server.fuse_socket,
-            PathBuf::from("/run/tenantd/fuse.sock")
-        );
         assert!(cfg.profiles["scratch"].volumes.is_empty());
 
         let with = |from: &str, to: &str| EXAMPLE.replacen(from, to, 1);

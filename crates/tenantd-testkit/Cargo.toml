@@ -11,6 +11,4 @@ async-trait.workspace = true
 futures.workspace = true
 tenantd-core.workspace = true
 tenantd-state.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true

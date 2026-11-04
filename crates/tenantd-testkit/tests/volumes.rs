@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tenantd_core::backend::{BindMount, FuseBackend, RuntimeBackend, RuntimeHandle, RuntimeState};
+use tenantd_core::fuse::{FuseEvent, FuseLimits, FuseOp, FuseReply};
 use tenantd_core::model::{
     ContainerSpec, ContainerState, Overrides, ProcessSpec, TenantLimits, VolumeOwner, VolumeRecord,
     VolumeState,
@@ -13,7 +14,7 @@ use tenantd_core::{
     ContainerId, ContainerKey, Error, ProcessId, ProcessKey, SandboxId, SandboxKey, TenantId,
     VolumeId, VolumeKey,
 };
-use tenantd_testkit::{Env, same_file};
+use tenantd_testkit::Env;
 
 fn tid(s: &str) -> TenantId {
     TenantId::new(s).unwrap()
@@ -450,11 +451,19 @@ async fn fuse_container_waits_for_its_server() {
         Err(Error::FailedPrecondition(_))
     ));
 
-    // Every attach hands out the connection tenantd holds.
-    let fd = t.attach_fuse(&k).await.unwrap();
-    let held = env.host.fuse.connection(&k).unwrap().unwrap();
-    assert!(same_file(&fd, &held));
-    assert!(same_file(&t.attach_fuse(&k).await.unwrap(), &held));
+    // The server attaches; requests reach it and its answers come back.
+    assert!(!env.host.fuse.has_server(&k));
+    let mut one = t.attach_fuse(&k, FuseLimits::ANY).await.unwrap();
+    assert_eq!(env.host.fuse.attaches(&k), 1);
+    let id = env.host.fuse.inject(&k, FuseOp::StatFs).unwrap();
+    match one.events.recv().await {
+        Some(FuseEvent::Request { id: got, op, .. }) => {
+            assert_eq!((got, op), (id, FuseOp::StatFs));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    one.respond(id, Ok(FuseReply::Ok));
+    assert_eq!(env.host.fuse.responses(&k), vec![(id, Ok(FuseReply::Ok))]);
 
     let rec = t.start_container(&k).await.unwrap();
     assert_eq!(rec.state, ContainerState::Running);
@@ -467,12 +476,19 @@ async fn fuse_container_waits_for_its_server() {
     }));
     assert!(binds.iter().any(|b| b.destination == "/workspace"));
     t.start_process(p, ps, Some(k.id.clone())).await.unwrap();
-    // A server that restarts attaches again to the same connection.
-    assert!(same_file(&t.attach_fuse(&k).await.unwrap(), &held));
+    // A server that restarts attaches again, to the same session; the old
+    // one is told it was replaced.
+    let _two = t.attach_fuse(&k, FuseLimits::ANY).await.unwrap();
+    assert_eq!(env.host.fuse.attaches(&k), 2);
+    assert!(matches!(one.events.recv().await, Some(FuseEvent::Replaced)));
+    assert!(env.host.fuse.has_server(&k));
 
     t.delete_container(&k).await.unwrap();
     assert!(!env.host.fuse.is_mounted(&k));
-    assert!(matches!(t.attach_fuse(&k).await, Err(Error::NotFound(_))));
+    assert!(matches!(
+        t.attach_fuse(&k, FuseLimits::ANY).await,
+        Err(Error::NotFound(_))
+    ));
 }
 
 #[tokio::test]
@@ -482,20 +498,20 @@ async fn fuse_needs_a_slot_and_a_failed_start_can_be_retried() {
     let plain = ck("box", "plain");
     t.create_container(plain.clone(), vec![]).await.unwrap();
     assert!(matches!(
-        t.attach_fuse(&plain).await,
+        t.attach_fuse(&plain, FuseLimits::ANY).await,
         Err(Error::FailedPrecondition(_))
     ));
 
     let k = ck("box", "s1");
     t.create_container(k.clone(), with_fuse()).await.unwrap();
-    t.attach_fuse(&k).await.unwrap();
+    t.attach_fuse(&k, FuseLimits::ANY).await.unwrap();
     env.host.faults.fail("runtime.start");
     assert!(t.start_container(&k).await.is_err());
     assert_eq!(
         t.get_container(&k).await.unwrap().state,
         ContainerState::Created
     );
-    assert!(env.host.fuse.is_mounted(&k), "the connection is kept");
+    assert!(env.host.fuse.is_mounted(&k), "the session is kept");
     assert_eq!(
         env.host
             .runtime
@@ -513,7 +529,7 @@ async fn stopping_the_sandbox_ends_waiting_fuse_containers() {
     let t = &env.tenantd;
     let k = ck("box", "s1");
     t.create_container(k.clone(), with_fuse()).await.unwrap();
-    t.attach_fuse(&k).await.unwrap();
+    t.attach_fuse(&k, FuseLimits::ANY).await.unwrap();
     t.stop_sandbox(&tid("t"), &SandboxId::new("box").unwrap())
         .await
         .unwrap();
@@ -527,7 +543,7 @@ async fn stopping_the_sandbox_ends_waiting_fuse_containers() {
         Err(Error::FailedPrecondition(_))
     ));
     assert!(matches!(
-        t.attach_fuse(&k).await,
+        t.attach_fuse(&k, FuseLimits::ANY).await,
         Err(Error::FailedPrecondition(_))
     ));
 }
@@ -541,7 +557,7 @@ async fn fuse_connections_after_a_restart() {
             .create_container(k.clone(), with_fuse())
             .await
             .unwrap();
-        env.tenantd.attach_fuse(k).await.unwrap();
+        env.tenantd.attach_fuse(k, FuseLimits::ANY).await.unwrap();
     }
     env.tenantd.start_container(&running).await.unwrap();
     // A FUSE mount whose container is gone.
@@ -562,23 +578,26 @@ async fn fuse_connections_after_a_restart() {
     );
     assert!(!env.host.fuse.is_mounted(&stray));
 
-    // The waiting one has a fresh connection; its server attaches again
+    // The waiting one has a fresh session; its server attaches again
     // before it can start.
     assert!(matches!(
         env.tenantd.start_container(&waiting).await,
         Err(Error::FailedPrecondition(_))
     ));
-    env.tenantd.attach_fuse(&waiting).await.unwrap();
+    env.tenantd
+        .attach_fuse(&waiting, FuseLimits::ANY)
+        .await
+        .unwrap();
     env.tenantd.start_container(&waiting).await.unwrap();
 
-    // The running one keeps running on the connection its server holds,
-    // but tenantd can't hand that out again.
+    // The running one keeps running on the session its server held,
+    // but tenantd lost it and can't attach a server to it again.
     assert_eq!(
         env.tenantd.get_container(&running).await.unwrap().state,
         ContainerState::Running
     );
     assert!(matches!(
-        env.tenantd.attach_fuse(&running).await,
+        env.tenantd.attach_fuse(&running, FuseLimits::ANY).await,
         Err(Error::FailedPrecondition(m)) if m.contains("recreate")
     ));
     assert!(rep.errors.is_empty(), "{:?}", rep.errors);

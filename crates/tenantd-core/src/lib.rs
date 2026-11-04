@@ -11,6 +11,7 @@ pub mod container;
 pub mod error;
 pub mod events;
 pub mod fsutil;
+pub mod fuse;
 pub mod id;
 pub mod model;
 pub mod policy;

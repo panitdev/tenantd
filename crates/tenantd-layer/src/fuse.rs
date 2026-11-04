@@ -1,16 +1,24 @@
-//! Containers' FUSE connections, mounted on the host.
+//! Containers' FUSE mounts, on the host.
 //!
 //! gVisor's own FUSE lives in its Sentry, out of reach of a server outside
 //! the sandbox. So tenantd mounts a host FUSE filesystem per container at
 //! `<fuse dir>/<tenant>.<sandbox>.<container>` and the container
 //! bind-mounts it like a volume; runsc's gofer serves it from the host.
-//! The `/dev/fuse` fd behind the mount goes to the caller, who runs the
-//! server. tenantd keeps a duplicate, so the connection survives the
-//! server's restarts, and drops it when the container ends.
+//!
+//! tenantd also runs the kernel side of the mount. Its session turns
+//! kernel requests into the path-based operations of
+//! [`tenantd_core::fuse`], which go to whichever caller's server is
+//! attached (see [`pathfs`] for what it answers itself, [`router`] for
+//! queueing). The session outlives any one server, so a server may restart
+//! or move; it ends with the container. Nothing here stats the mount: with
+//! no server attached, that would hang.
 //!
 //! The mount is `allow_other` (runsc's gofer reaches it, not tenantd) and
-//! without `default_permissions`: the server decides every access. Nothing
-//! here stats the mount: with no server answering, that would hang.
+//! `default_permissions`: the kernel checks mode bits against the
+//! attributes the server reports, so permission checks cost no round trips.
+
+mod pathfs;
+mod router;
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -22,10 +30,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use fuser::{Config, Session, SessionACL};
 use tenantd_core::backend::FuseBackend;
 use tenantd_core::error::Context;
+use tenantd_core::fuse::{FuseLimits, FuseLink};
 use tenantd_core::{ContainerKey, Error, Result};
 use tracing::{info, warn};
+
+use self::pathfs::PathFs;
+use self::router::Router;
 
 use crate::blocking;
 use crate::mount::{self, mount_entries_under};
@@ -34,14 +47,14 @@ const FSTYPE: &str = "fuse.tenantd";
 
 pub struct HostFuse {
     dir: PathBuf,
-    conns: Arc<Mutex<HashMap<ContainerKey, OwnedFd>>>,
+    sessions: Arc<Mutex<HashMap<ContainerKey, Arc<Router>>>>,
 }
 
 impl HostFuse {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            conns: Arc::default(),
+            sessions: Arc::default(),
         }
     }
 
@@ -99,7 +112,7 @@ fn mount_fresh(point: &Path) -> io::Result<OwnedFd> {
     // SAFETY: no preconditions.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     let data = format!(
-        "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other",
+        "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other,default_permissions",
         fd.as_raw_fd()
     );
     mount::mount(
@@ -112,22 +125,57 @@ fn mount_fresh(point: &Path) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Mount a fresh session on `point` and run it on its own thread, which
+/// ends when the connection does. The returned router is how requests
+/// reach servers.
+fn start_session(key: &ContainerKey, point: &Path) -> io::Result<Arc<Router>> {
+    let fd = mount_fresh(point)?;
+    let router = Router::new();
+    let fs = PathFs::new(router.clone());
+    let mut config = Config::default();
+    config.acl = SessionACL::All;
+    let session = match Session::from_fd(fs.clone(), fd, SessionACL::All, config) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = release(point);
+            return Err(e);
+        }
+    };
+    fs.set_notifier(session.notifier());
+    let (r, name) = (router.clone(), key.to_string());
+    std::thread::Builder::new()
+        .name(format!("fuse-{name}"))
+        .spawn(move || {
+            if let Err(e) = session.run() {
+                warn!(container = name, error = %e, "FUSE session ended with an error");
+            }
+            // Whoever still waits on the mount fails instead of hanging.
+            r.close();
+        })
+        .inspect_err(|_| {
+            let _ = release(point);
+        })?;
+    Ok(router)
+}
+
 #[async_trait]
 impl FuseBackend for HostFuse {
     async fn mount(&self, c: &ContainerKey) -> Result<PathBuf> {
-        let (dir, point, conns, key) = (
+        let (dir, point, sessions, key) = (
             self.dir.clone(),
             self.point(c),
-            self.conns.clone(),
+            self.sessions.clone(),
             c.clone(),
         );
         blocking(move || {
-            let held = conns.lock().unwrap().contains_key(&key);
+            let held = sessions.lock().unwrap().contains_key(&key);
             if held && mount::is_mountpoint(&point)? {
                 return Ok(point);
             }
-            // Whatever is there is no connection tenantd can hand out.
-            conns.lock().unwrap().remove(&key);
+            // Whatever is there is no session tenantd can serve.
+            if let Some(old) = sessions.lock().unwrap().remove(&key) {
+                old.close();
+            }
             release(&point).context(format!("releasing {}", point.display()))?;
             fs::DirBuilder::new()
                 .mode(0o700)
@@ -138,28 +186,31 @@ impl FuseBackend for HostFuse {
                 .mode(0o700)
                 .create(&point)
                 .context(format!("creating {}", point.display()))?;
-            let fd =
-                mount_fresh(&point).context(format!("mounting FUSE on {}", point.display()))?;
-            conns.lock().unwrap().insert(key.clone(), fd);
-            info!(container = %key, point = %point.display(), "FUSE connection mounted");
+            let router = start_session(&key, &point)
+                .context(format!("mounting FUSE on {}", point.display()))?;
+            sessions.lock().unwrap().insert(key.clone(), router);
+            info!(container = %key, point = %point.display(), "FUSE session mounted");
             Ok(point)
         })
         .await
     }
 
-    fn connection(&self, c: &ContainerKey) -> Result<Option<OwnedFd>> {
-        match self.conns.lock().unwrap().get(c) {
-            Some(fd) => Ok(Some(fd.try_clone().context("duplicating the FUSE fd")?)),
-            None => Ok(None),
-        }
+    fn attach(&self, c: &ContainerKey, theirs: FuseLimits) -> Result<Option<FuseLink>> {
+        let router = self.sessions.lock().unwrap().get(c).cloned();
+        Ok(router.and_then(|r| r.attach(theirs)))
+    }
+
+    fn has_session(&self, c: &ContainerKey) -> bool {
+        self.sessions.lock().unwrap().contains_key(c)
     }
 
     async fn unmount(&self, c: &ContainerKey) -> Result<()> {
-        let (point, conns, key) = (self.point(c), self.conns.clone(), c.clone());
+        let (point, sessions, key) = (self.point(c), self.sessions.clone(), c.clone());
         blocking(move || {
             release(&point).context(format!("releasing {}", point.display()))?;
-            if conns.lock().unwrap().remove(&key).is_some() {
-                info!(container = %key, "FUSE connection released");
+            if let Some(router) = sessions.lock().unwrap().remove(&key) {
+                router.close();
+                info!(container = %key, "FUSE session released");
             }
             Ok(())
         })
@@ -200,134 +251,343 @@ impl FuseBackend for HostFuse {
     }
 }
 
-/// A minimal FUSE server for tests: one read-only file, `hello`.
-#[cfg(test)]
-pub(crate) mod hello {
-    use std::io::{Read, Write};
-    use std::os::fd::OwnedFd;
-
-    pub const CONTENT: &[u8] = b"hello from fuse\n";
-
-    fn attr(ino: u64) -> Vec<u8> {
-        let (mode, size, nlink) = if ino == 1 {
-            (0o040755u32, 0u64, 2u32)
-        } else {
-            (0o100444, CONTENT.len() as u64, 1)
-        };
-        let mut a = Vec::with_capacity(88);
-        for v in [ino, size, 1, 0, 0, 0] {
-            a.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in [0u32, 0, 0, mode, nlink, 0, 0, 0, 4096, 0] {
-            a.extend_from_slice(&v.to_le_bytes());
-        }
-        a
-    }
-
-    fn u32_at(b: &[u8], o: usize) -> u32 {
-        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
-    }
-
-    fn u64_at(b: &[u8], o: usize) -> u64 {
-        u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
-    }
-
-    /// Serve until the connection ends. Returns how many requests came.
-    pub fn serve(fd: OwnedFd) -> usize {
-        let mut dev = std::fs::File::from(fd);
-        let mut buf = vec![0u8; 1 << 20];
-        let mut served = 0;
-        loop {
-            let n = match dev.read(&mut buf) {
-                Ok(n) => n,
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                Err(_) => return served, // ENODEV: aborted or unmounted
-            };
-            served += 1;
-            let req = &buf[..n];
-            let (op, unique, node) = (u32_at(req, 4), u64_at(req, 8), u64_at(req, 16));
-            let body = &req[40..];
-            let reply: Option<std::result::Result<Vec<u8>, i32>> = match op {
-                26 => {
-                    // INIT
-                    let mut out = Vec::new();
-                    for v in [7u32, 31, u32_at(body, 8), 0] {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                    out.extend_from_slice(&16u16.to_le_bytes());
-                    out.extend_from_slice(&12u16.to_le_bytes());
-                    out.extend_from_slice(&(128u32 << 10).to_le_bytes());
-                    out.extend_from_slice(&1u32.to_le_bytes());
-                    out.resize(64, 0);
-                    Some(Ok(out))
-                }
-                3 => {
-                    // GETATTR
-                    let mut out = vec![0u8; 16];
-                    out.extend(attr(node));
-                    Some(Ok(out))
-                }
-                1 => {
-                    // LOOKUP
-                    let name = body.split(|&b| b == 0).next().unwrap_or_default();
-                    if node == 1 && name == b"hello" {
-                        let mut out = Vec::new();
-                        for v in [2u64, 0, 0, 0] {
-                            out.extend_from_slice(&v.to_le_bytes());
-                        }
-                        out.extend_from_slice(&[0u8; 8]);
-                        out.extend(attr(2));
-                        Some(Ok(out))
-                    } else {
-                        Some(Err(libc::ENOENT))
-                    }
-                }
-                14 | 27 => Some(Ok(vec![0u8; 16])), // OPEN, OPENDIR
-                15 => {
-                    // READ
-                    let (off, size) = (u64_at(body, 8) as usize, u32_at(body, 16) as usize);
-                    let start = off.min(CONTENT.len());
-                    Some(Ok(
-                        CONTENT[start..(start + size).min(CONTENT.len())].to_vec()
-                    ))
-                }
-                28 => {
-                    // READDIR: just `hello`, once
-                    let mut out = Vec::new();
-                    if u64_at(body, 8) == 0 {
-                        out.extend_from_slice(&2u64.to_le_bytes());
-                        out.extend_from_slice(&1u64.to_le_bytes());
-                        out.extend_from_slice(&5u32.to_le_bytes());
-                        out.extend_from_slice(&8u32.to_le_bytes());
-                        out.extend_from_slice(b"hello\0\0\0");
-                    }
-                    Some(Ok(out))
-                }
-                18 | 25 | 29 => Some(Ok(Vec::new())), // RELEASE, FLUSH, RELEASEDIR
-                2 | 36 | 42 => None,                  // FORGET, INTERRUPT, BATCH_FORGET
-                _ => Some(Err(libc::ENOSYS)),
-            };
-            let Some(reply) = reply else { continue };
-            let (err, data) = match reply {
-                Ok(d) => (0i32, d),
-                Err(e) => (-e, Vec::new()),
-            };
-            let mut out = Vec::with_capacity(16 + data.len());
-            out.extend_from_slice(&((16 + data.len()) as u32).to_le_bytes());
-            out.extend_from_slice(&err.to_le_bytes());
-            out.extend_from_slice(&unique.to_le_bytes());
-            out.extend(data);
-            if dev.write_all(&out).is_err() {
-                return served;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tenantd_core::fuse::{
+        DirEntry, FileAttr, FileKind, FuseError, FuseEvent, FuseOp, FuseReply, FuseResult,
+        OpenReply,
+    };
+
+    const CONTENT: &[u8] = b"hello from fuse\n";
+
+    fn attr(kind: FileKind, size: u64) -> FileAttr {
+        FileAttr {
+            kind,
+            mode: if kind == FileKind::Directory {
+                0o755
+            } else {
+                0o444
+            },
+            size,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            rdev: 0,
+            ttl_ms: 1000,
+            object_id: None,
+        }
+    }
+
+    fn answer(op: FuseOp) -> FuseResult {
+        let file = || attr(FileKind::File, CONTENT.len() as u64);
+        match op {
+            FuseOp::Stat { path } if path == "/" => {
+                Ok(FuseReply::Attr(attr(FileKind::Directory, 0)))
+            }
+            FuseOp::Stat { path } if path == "/hello" => Ok(FuseReply::Attr(file())),
+            FuseOp::Stat { .. } => Err(FuseError::new(libc::ENOENT)),
+            FuseOp::ReadDir { path } if path == "/" => Ok(FuseReply::Dir(vec![DirEntry {
+                name: "hello".into(),
+                attr: file(),
+            }])),
+            FuseOp::Open { .. } => Ok(FuseReply::Open(OpenReply {
+                handle: 7,
+                keep_cache: false,
+                direct_io: false,
+                buffered_writes: false,
+                attr: Some(file()),
+                inline_data: None,
+            })),
+            FuseOp::Read { offset, size, .. } => {
+                let start = (offset as usize).min(CONTENT.len());
+                let end = (start + size as usize).min(CONTENT.len());
+                Ok(FuseReply::Data(CONTENT[start..end].to_vec()))
+            }
+            FuseOp::Release { .. } | FuseOp::Flush { .. } => Ok(FuseReply::Ok),
+            _ => Err(FuseError::new(libc::ENOSYS)),
+        }
+    }
+
+    /// A server of one read-only file, `hello`. Returns how many requests
+    /// it answered once its link ends.
+    async fn serve_hello(mut link: FuseLink) -> usize {
+        let mut served = 0;
+        while let Some(ev) = link.events.recv().await {
+            match ev {
+                FuseEvent::Request { id, op, .. } => {
+                    served += 1;
+                    link.respond(id, answer(op));
+                }
+                FuseEvent::Replaced => break,
+                FuseEvent::Cancel { .. } => {}
+            }
+        }
+        served
+    }
+
+    /// kind, bytes or link target, mode
+    type MemNode = (FileKind, Vec<u8>, u32);
+
+    /// A writable in-memory tree, answering in the way a real server would.
+    #[derive(Default)]
+    struct MemFs {
+        nodes: std::sync::Mutex<std::collections::BTreeMap<String, MemNode>>,
+        next_handle: std::sync::atomic::AtomicU64,
+    }
+
+    impl MemFs {
+        fn attr(kind: FileKind, data: &[u8], mode: u32) -> FileAttr {
+            FileAttr {
+                kind,
+                mode,
+                size: data.len() as u64,
+                nlink: 1,
+                ttl_ms: 1000,
+                ..attr(kind, 0)
+            }
+        }
+
+        fn answer(&self, op: FuseOp) -> FuseResult {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut n = self.nodes.lock().unwrap();
+            let parent = |p: &str| {
+                p.rsplit_once('/')
+                    .map_or("/", |(d, _)| if d.is_empty() { "/" } else { d })
+                    .to_string()
+            };
+            let get = |n: &std::collections::BTreeMap<_, (FileKind, Vec<u8>, u32)>, p: &str| {
+                if p == "/" {
+                    return Some(Self::attr(FileKind::Directory, &[], 0o755));
+                }
+                n.get(p).map(|(k, d, m)| Self::attr(*k, d, *m))
+            };
+            let enoent = || Err(FuseError::new(libc::ENOENT));
+            match op {
+                FuseOp::Stat { path } => {
+                    get(&n, &path).map_or_else(enoent, |a| Ok(FuseReply::Attr(a)))
+                }
+                FuseOp::ReadDir { path } => Ok(FuseReply::Dir(
+                    n.iter()
+                        .filter(|(p, _)| parent(p) == path)
+                        .map(|(p, (k, d, m))| DirEntry {
+                            name: p.rsplit('/').next().unwrap().to_string(),
+                            attr: Self::attr(*k, d, *m),
+                        })
+                        .collect(),
+                )),
+                FuseOp::Create { path, mode, .. } => {
+                    n.insert(path.clone(), (FileKind::File, vec![], mode & 0o7777));
+                    Ok(FuseReply::Open(OpenReply {
+                        handle: self.next_handle.fetch_add(1, Relaxed) + 1,
+                        keep_cache: false,
+                        direct_io: false,
+                        buffered_writes: false,
+                        attr: get(&n, &path),
+                        inline_data: None,
+                    }))
+                }
+                FuseOp::Open { path, .. } => {
+                    if !n.contains_key(&path) {
+                        return enoent();
+                    }
+                    Ok(FuseReply::Open(OpenReply {
+                        handle: self.next_handle.fetch_add(1, Relaxed) + 1,
+                        keep_cache: false,
+                        direct_io: false,
+                        buffered_writes: false,
+                        attr: get(&n, &path),
+                        inline_data: None,
+                    }))
+                }
+                FuseOp::Write {
+                    path, offset, data, ..
+                } => {
+                    let Some((_, bytes, _)) = n.get_mut(&path) else {
+                        return enoent();
+                    };
+                    let end = offset as usize + data.len();
+                    if bytes.len() < end {
+                        bytes.resize(end, 0);
+                    }
+                    bytes[offset as usize..end].copy_from_slice(&data);
+                    Ok(FuseReply::Written {
+                        written: data.len() as u32,
+                        attr: get(&n, &path),
+                    })
+                }
+                FuseOp::Read {
+                    path, offset, size, ..
+                } => {
+                    let Some((_, bytes, _)) = n.get(&path) else {
+                        return enoent();
+                    };
+                    let start = (offset as usize).min(bytes.len());
+                    Ok(FuseReply::Data(
+                        bytes[start..(start + size as usize).min(bytes.len())].to_vec(),
+                    ))
+                }
+                FuseOp::Mkdir { path, mode } => {
+                    n.insert(path.clone(), (FileKind::Directory, vec![], mode));
+                    Ok(FuseReply::Attr(get(&n, &path).unwrap()))
+                }
+                FuseOp::Symlink { path, target } => {
+                    n.insert(
+                        path.clone(),
+                        (FileKind::Symlink, target.into_bytes(), 0o777),
+                    );
+                    Ok(FuseReply::Attr(get(&n, &path).unwrap()))
+                }
+                FuseOp::Readlink { path } => match n.get(&path) {
+                    Some((_, t, _)) => Ok(FuseReply::Target(String::from_utf8(t.clone()).unwrap())),
+                    None => enoent(),
+                },
+                FuseOp::Unlink { path } | FuseOp::Rmdir { path } => {
+                    n.remove(&path).map_or_else(enoent, |_| Ok(FuseReply::Ok))
+                }
+                FuseOp::Rename { from, to, .. } => {
+                    let moved: Vec<_> = n
+                        .keys()
+                        .filter(|k| **k == from || k.starts_with(&format!("{from}/")))
+                        .cloned()
+                        .collect();
+                    if moved.is_empty() {
+                        return enoent();
+                    }
+                    for k in moved {
+                        let v = n.remove(&k).unwrap();
+                        n.insert(format!("{to}{}", &k[from.len()..]), v);
+                    }
+                    Ok(FuseReply::Ok)
+                }
+                FuseOp::SetAttr { path, set } => {
+                    let Some((_, bytes, mode)) = n.get_mut(&path) else {
+                        return enoent();
+                    };
+                    if let Some(size) = set.size {
+                        bytes.resize(size as usize, 0);
+                    }
+                    if let Some(m) = set.mode {
+                        *mode = m & 0o7777;
+                    }
+                    Ok(FuseReply::Attr(get(&n, &path).unwrap()))
+                }
+                FuseOp::Release { .. } | FuseOp::Flush { .. } | FuseOp::Fsync { .. } => {
+                    Ok(FuseReply::Ok)
+                }
+                FuseOp::StatFs => Err(FuseError::new(libc::ENOSYS)),
+            }
+        }
+    }
+
+    /// Needs to mount FUSE; see the test below.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn host_fuse_writes_and_renames_through_a_server() {
+        let d = tempfile::tempdir().unwrap();
+        let fuse = HostFuse::new(d.path().join("fuse"));
+        let c: ContainerKey = "t.s.c".parse().unwrap();
+        let point = fuse.mount(&c).await.unwrap();
+        let fs = std::sync::Arc::new(MemFs::default());
+        let mut link = fuse.attach(&c, FuseLimits::SERVER).unwrap().unwrap();
+        let served = fs.clone();
+        let server = tokio::spawn(async move {
+            while let Some(ev) = link.events.recv().await {
+                if let FuseEvent::Request { id, op, .. } = ev {
+                    link.respond(id, served.answer(op));
+                }
+            }
+        });
+
+        let p = point.clone();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Seek, SeekFrom, Write};
+                std::fs::create_dir(p.join("dir")).unwrap();
+                std::fs::write(p.join("dir/a"), b"hello world").unwrap();
+                assert_eq!(std::fs::read(p.join("dir/a")).unwrap(), b"hello world");
+
+                // Rewrite in place, append and read back through one handle.
+                let mut f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(p.join("dir/a"))
+                    .unwrap();
+                f.seek(SeekFrom::Start(6)).unwrap();
+                f.write_all(b"FUSE!").unwrap();
+                f.seek(SeekFrom::End(0)).unwrap();
+                f.write_all(b" more").unwrap();
+                f.seek(SeekFrom::Start(0)).unwrap();
+                let mut s = String::new();
+                f.read_to_string(&mut s).unwrap();
+                assert_eq!(s, "hello FUSE! more");
+                drop(f);
+
+                // Big writes cross the request size limit in pieces.
+                let big = vec![7u8; 3 << 20];
+                std::fs::write(p.join("big"), &big).unwrap();
+                assert_eq!(std::fs::read(p.join("big")).unwrap(), big);
+
+                // Truncate, chmod, listing sees sizes and modes.
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p.join("dir/a"))
+                    .unwrap();
+                f.set_len(5).unwrap();
+                drop(f);
+                std::fs::set_permissions(
+                    p.join("dir/a"),
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )
+                .unwrap();
+                let m = std::fs::metadata(p.join("dir/a")).unwrap();
+                assert_eq!(m.len(), 5);
+                assert_eq!(
+                    std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777,
+                    0o600
+                );
+
+                // Rename a directory with a file inside; old names vanish.
+                std::fs::rename(p.join("dir"), p.join("moved")).unwrap();
+                assert!(std::fs::metadata(p.join("dir/a")).is_err());
+                assert_eq!(std::fs::read(p.join("moved/a")).unwrap(), b"hello");
+
+                std::os::unix::fs::symlink("moved/a", p.join("link")).unwrap();
+                assert_eq!(
+                    std::fs::read_link(p.join("link")).unwrap().to_str(),
+                    Some("moved/a")
+                );
+                assert_eq!(std::fs::read(p.join("link")).unwrap(), b"hello");
+
+                let mut names: Vec<_> = std::fs::read_dir(&p)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect();
+                names.sort();
+                assert_eq!(names, ["big", "link", "moved"]);
+
+                std::fs::remove_file(p.join("moved/a")).unwrap();
+                assert!(std::fs::metadata(p.join("moved/a")).is_err());
+                std::fs::remove_dir(p.join("moved")).unwrap();
+                assert!(
+                    std::fs::read_dir(&p)
+                        .unwrap()
+                        .all(|e| e.unwrap().file_name() != "moved")
+                );
+            }),
+        )
+        .await
+        .expect("operations through FUSE hung")
+        .unwrap();
+
+        fuse.unmount(&c).await.unwrap();
+        server.abort();
+    }
 
     #[test]
     fn connection_ids() {
@@ -339,21 +599,21 @@ mod tests {
     /// `unshare -rm cargo test -p tenantd-layer -- --ignored`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn host_fuse_mounts_hands_out_and_releases() {
+    async fn host_fuse_mounts_serves_and_releases() {
         let d = tempfile::tempdir().unwrap();
         let fuse = HostFuse::new(d.path().join("fuse"));
         let c: ContainerKey = "t.s.c".parse().unwrap();
-        assert!(fuse.connection(&c).unwrap().is_none());
+        assert!(fuse.attach(&c, FuseLimits::SERVER).unwrap().is_none());
+        assert!(!fuse.has_session(&c));
         let point = fuse.mount(&c).await.unwrap();
         assert_eq!(point, d.path().join("fuse/t.s.c"));
         assert_eq!(fuse.mount(&c).await.unwrap(), point, "kept while held");
         assert_eq!(fuse.list_owned().await.unwrap(), vec![c.clone()]);
 
-        // The server gets a duplicate; reads through the mount reach it.
-        let server = std::thread::spawn({
-            let fd = fuse.connection(&c).unwrap().unwrap();
-            move || hello::serve(fd)
-        });
+        // Reads through the mount reach the attached server.
+        let server = tokio::spawn(serve_hello(
+            fuse.attach(&c, FuseLimits::SERVER).unwrap().unwrap(),
+        ));
         let p = point.clone();
         let read = tokio::task::spawn_blocking(move || std::fs::read(p.join("hello")));
         let got = tokio::time::timeout(Duration::from_secs(10), read)
@@ -361,20 +621,42 @@ mod tests {
             .expect("read through FUSE hung")
             .unwrap()
             .unwrap();
-        assert_eq!(got, hello::CONTENT);
+        assert_eq!(got, CONTENT);
         let names: Vec<_> = std::fs::read_dir(&point)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec!["hello"]);
+        assert!(std::fs::metadata(point.join("absent")).is_err());
+        // Writes are refused by this server, and say so.
+        let e = std::fs::write(point.join("new"), b"x").unwrap_err();
+        assert!(
+            matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EACCES)),
+            "{e}"
+        );
 
-        // Releasing ends the server's connection too.
+        // A second server replaces the first, which is told.
+        let second = tokio::spawn(serve_hello(
+            fuse.attach(&c, FuseLimits::SERVER).unwrap().unwrap(),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("the replaced server was not told")
+                .unwrap()
+                > 0
+        );
+
+        // Releasing ends the session and its server.
         fuse.unmount(&c).await.unwrap();
         fuse.unmount(&c).await.unwrap();
-        assert!(server.join().unwrap() > 0);
+        tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the server outlived the mount")
+            .unwrap();
         assert!(!point.exists());
         assert!(fuse.list_owned().await.unwrap().is_empty());
-        assert!(fuse.connection(&c).unwrap().is_none());
+        assert!(!fuse.has_session(&c));
 
         // With no server, a reader blocks; releasing fails it, not hangs.
         let point = fuse.mount(&c).await.unwrap();
@@ -394,7 +676,7 @@ mod tests {
         let fresh = HostFuse::new(d.path().join("fuse"));
         assert_eq!(fresh.list_owned().await.unwrap(), vec![c.clone()]);
         fresh.mount(&c).await.unwrap();
-        assert!(fresh.connection(&c).unwrap().is_some());
+        assert!(fresh.has_session(&c));
         fresh.unmount(&c).await.unwrap();
         fuse.unmount(&c).await.unwrap();
     }
