@@ -1,5 +1,6 @@
-//! Operator commands over a running daemon's API socket. These never read
-//! the daemon config, open the state DB or need root; only socket access.
+//! Operator commands over a running daemon's API socket, or its mTLS
+//! listener with `--endpoint`. These never read the daemon config, open the
+//! state DB or need root; only API access.
 
 mod passthrough;
 
@@ -27,6 +28,48 @@ pub struct Conn {
         default_value = "/run/tenantd/api.sock"
     )]
     socket: PathBuf,
+    #[command(flatten)]
+    net: Box<NetArgs>,
+}
+
+/// Network mode: the daemon's mTLS listener instead of its socket.
+#[derive(Args)]
+struct NetArgs {
+    /// Connect to `host:port` over mTLS (the daemon's `[server.tls]`)
+    /// instead of the socket. Needs --tls-ca, --tls-cert and --tls-key.
+    #[arg(long, global = true, env = "TENANTD_ENDPOINT")]
+    endpoint: Option<String>,
+    /// PEM CA certificates the daemon's certificate must chain to.
+    #[arg(long, global = true, env = "TENANTD_TLS_CA")]
+    tls_ca: Option<PathBuf>,
+    /// PEM client certificate chain presented to the daemon.
+    #[arg(long, global = true, env = "TENANTD_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for --tls-cert.
+    #[arg(long, global = true, env = "TENANTD_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+    /// Name the daemon's certificate must carry. Defaults to the
+    /// --endpoint host.
+    #[arg(long, global = true, env = "TENANTD_TLS_SERVER_NAME")]
+    tls_server_name: Option<String>,
+}
+
+impl Conn {
+    async fn channel(&self) -> anyhow::Result<Channel> {
+        let n = &self.net;
+        let Some(endpoint) = &n.endpoint else {
+            return tenantd_client::connect(&self.socket)
+                .await
+                .with_context(|| format!("connecting to {}", self.socket.display()));
+        };
+        let (Some(ca), Some(cert), Some(key)) = (&n.tls_ca, &n.tls_cert, &n.tls_key) else {
+            anyhow::bail!("--endpoint needs --tls-ca, --tls-cert and --tls-key");
+        };
+        let tls = tenantd_client::tls::ClientTls::from_pem_files(ca, cert, key)?;
+        tenantd_client::tls::connect(endpoint, n.tls_server_name.as_deref(), &tls)
+            .await
+            .with_context(|| format!("connecting to {endpoint}"))
+    }
 }
 
 #[derive(Subcommand)]
@@ -762,7 +805,7 @@ fn event_json(e: pb::Event) -> serde_json::Value {
 }
 
 pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
-    let socket = match &cmd {
+    let conn = match &cmd {
         ClientCmd::Tenant { conn, .. }
         | ClientCmd::Sandbox { conn, .. }
         | ClientCmd::Container { conn, .. }
@@ -770,11 +813,9 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
         | ClientCmd::Exec { conn, .. }
         | ClientCmd::Process { conn, .. }
         | ClientCmd::Health { conn }
-        | ClientCmd::Events { conn } => &conn.socket,
+        | ClientCmd::Events { conn } => conn,
     };
-    let ch = tenantd_client::connect(socket)
-        .await
-        .with_context(|| format!("connecting to {}", socket.display()))?;
+    let ch = conn.channel().await?;
     match cmd {
         ClientCmd::Tenant { cmd: c, .. } => {
             let mut t = TenantsClient::new(ch);

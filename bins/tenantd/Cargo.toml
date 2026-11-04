@@ -1,6 +1,6 @@
 [package]
 name = "tenantd"
-description = "Holds a host's root-level sandbox powers and exposes a fixed set of operations over a Unix socket"
+description = "Holds a host's root-level sandbox powers and exposes a fixed set of operations over a Unix socket or mTLS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,8 +12,9 @@ clap.workspace = true
 futures.workspace = true
 libc.workspace = true
 prometheus-client.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
-tenantd-client.workspace = true
+tenantd-client = { workspace = true, features = ["tls"] }
 tenantd-core.workspace = true
 tenantd-image.workspace = true
 tenantd-layer.workspace = true
@@ -23,11 +24,13 @@ tenantd-runtime-runsc.workspace = true
 tenantd-state.workspace = true
 tenantd-storage-xfs.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
+tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true
 tenantd-testkit.workspace = true

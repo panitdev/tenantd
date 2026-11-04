@@ -19,14 +19,15 @@ use tenantd_client::pb::{
 use tenantd_core::config::{Config, RuntimeKind, StorageKind};
 use tenantd_core::state::StateStore;
 use tenantd_core::{Backends, Tenantd};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnixListenerStream;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 use crate::api::Api;
 use crate::metrics::{self, Metrics};
+use crate::tls::{self, Conn, NetListener, TlsReload};
 
 #[derive(Args)]
 pub struct ConfigPath {
@@ -62,6 +63,9 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(path)?;
     let state = Arc::new(tenantd_state::SqliteState::in_memory()?);
     Tenantd::new(cfg.clone(), build_backends(&cfg, state)?)?;
+    if let Some(t) = &cfg.server.tls {
+        tls::server_config(t)?;
+    }
     println!("{}: ok", path.display());
     Ok(())
 }
@@ -133,24 +137,51 @@ pub fn peer_allowed(s: &UnixStream, allowed: &HashSet<u32>) -> bool {
     }
 }
 
-/// Accepted connections whose peer is allowed. Everything else is dropped
-/// before a byte is read.
-fn authorized(
+/// Accept socket connections whose peer is allowed. Everything else is
+/// dropped before a byte is read.
+async fn accept_unix(
     l: UnixListener,
-    allowed: Arc<HashSet<u32>>,
-) -> impl Stream<Item = std::io::Result<UnixStream>> {
-    UnixListenerStream::new(l).filter_map(move |conn| match conn {
-        Ok(s) => peer_allowed(&s, &allowed).then_some(Ok(s)),
-        Err(e) => {
-            warn!(error = %e, "accept failed");
-            None
+    allowed: HashSet<u32>,
+    tx: mpsc::Sender<std::io::Result<Conn>>,
+) {
+    loop {
+        tokio::select! {
+            _ = tx.closed() => return,
+            r = l.accept() => match r {
+                Ok((s, _)) if peer_allowed(&s, &allowed) => {
+                    if tx.send(Ok(Conn::Unix(s))).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
         }
-    })
+    }
+}
+
+/// Authorized connections from the socket and, in network mode, finished
+/// mTLS handshakes.
+fn authorized(
+    unix: UnixListener,
+    allowed: HashSet<u32>,
+    net: Option<NetListener>,
+) -> impl Stream<Item = std::io::Result<Conn>> {
+    let (tx, rx) = mpsc::channel(64);
+    if let Some(net) = net {
+        tokio::spawn(tls::accept_tls(net, tx.clone()));
+    }
+    tokio::spawn(accept_unix(unix, allowed, tx));
+    ReceiverStream::new(rx)
 }
 
 async fn serve_api(
     l: UnixListener,
     allowed: HashSet<u32>,
+    net: Option<NetListener>,
     api: Api,
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
@@ -161,7 +192,7 @@ async fn serve_api(
         .add_service(VolumesServer::new(api.clone()))
         .add_service(ProcessesServer::new(api.clone()))
         .add_service(SystemServer::new(api))
-        .serve_with_incoming_shutdown(authorized(l, Arc::new(allowed)), shutdown)
+        .serve_with_incoming_shutdown(authorized(l, allowed, net), shutdown)
         .await?;
     Ok(())
 }
@@ -187,6 +218,13 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .verify()
         .await
         .context("runtime check failed")?;
+    // Read the TLS files before anything starts, so a bad one fails closed.
+    let tls_reload = cfg
+        .server
+        .tls
+        .as_ref()
+        .map(|t| TlsReload::new(t).map(Arc::new))
+        .transpose()?;
     let tenantd = Tenantd::new(cfg.clone(), backends)?;
     tenantd.check_health().await;
     tenantd.spawn_event_pump();
@@ -219,12 +257,27 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
     {
         let (t, path) = (tenantd.clone(), args.config.config.clone());
+        let tls_reload = tls_reload.clone();
         let mut hup = signal(SignalKind::hangup())?;
         tokio::spawn(async move {
             while hup.recv().await.is_some() {
-                match Config::load(&path).and_then(|c| t.reload_config(c)) {
-                    Ok(()) => info!(config = %path.display(), "config reloaded"),
-                    Err(e) => error!(error = %e, "config reload rejected; keeping the old config"),
+                let new = Config::load(&path);
+                let new_tls = new.as_ref().ok().and_then(|c| c.server.tls.clone());
+                if let Err(e) = new.and_then(|c| t.reload_config(c)) {
+                    error!(error = %e, "config reload rejected; keeping the old config");
+                    continue;
+                }
+                info!(config = %path.display(), "config reloaded");
+                match (&tls_reload, &new_tls) {
+                    (Some(r), new) => {
+                        if let Err(e) = r.reload(new.as_ref()) {
+                            error!(error = %format!("{e:#}"), "TLS reload rejected; keeping the old TLS config");
+                        }
+                    }
+                    (None, Some(_)) => {
+                        warn!("server.tls was added; restart tenantd to start listening")
+                    }
+                    (None, None) => {}
                 }
             }
         });
@@ -242,6 +295,16 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
     let listener = bind_socket(&cfg.server.socket, cfg.server.socket_gid)?;
     let allowed: HashSet<u32> = cfg.server.callers.iter().map(|c| c.uid).collect();
+    let net = match (&cfg.server.tls, tls_reload) {
+        (Some(t), Some(tls)) => {
+            let tcp = TcpListener::bind(t.listen)
+                .await
+                .with_context(|| format!("binding server.tls.listen {}", t.listen))?;
+            info!(listen = %t.listen, clients = ?t.clients, "tenantd serving over mTLS");
+            Some(NetListener { tcp, tls })
+        }
+        _ => None,
+    };
     info!(socket = %cfg.server.socket.display(), callers = ?allowed, "tenantd serving");
     let mut term = signal(SignalKind::terminate())?;
     let shutdown = async move {
@@ -251,7 +314,7 @@ async fn run(args: ServeArgs) -> anyhow::Result<()> {
         }
         info!("shutting down; sandboxes keep running and are re-attached on start");
     };
-    serve_api(listener, allowed, Api { tenantd, metrics }, shutdown).await?;
+    serve_api(listener, allowed, net, Api { tenantd, metrics }, shutdown).await?;
     let _ = std::fs::remove_file(&cfg.server.socket);
     Ok(())
 }
@@ -285,7 +348,7 @@ mod tests {
             tenantd: tenantd.clone(),
             metrics: Arc::new(Metrics::new()),
         };
-        tokio::spawn(serve_api(l, allowed, api, std::future::pending()));
+        tokio::spawn(serve_api(l, allowed, None, api, std::future::pending()));
         (dir, sock, host, tenantd)
     }
 
@@ -1076,6 +1139,236 @@ mod tests {
         let ch = tenantd_client::connect(&sock).await.unwrap();
         let mut system = tenantd_client::SystemClient::new(ch);
         assert!(system.health(pb::HealthRequest {}).await.is_err());
+    }
+
+    /// A CA, a server certificate for localhost and 127.0.0.1, and client
+    /// certificates, as PEM files.
+    struct Pki {
+        dir: tempfile::TempDir,
+        ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+    }
+
+    impl Pki {
+        fn new() -> Self {
+            let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            p.distinguished_name
+                .push(rcgen::DnType::CommonName, "tenantd test CA");
+            let ca = rcgen::CertifiedIssuer::self_signed(p, rcgen::KeyPair::generate().unwrap())
+                .unwrap();
+            let pki = Self {
+                dir: tempfile::tempdir().unwrap(),
+                ca,
+            };
+            std::fs::write(pki.path("ca.pem"), pki.ca.pem()).unwrap();
+            pki.leaf("server", &["localhost", "127.0.0.1"]);
+            pki
+        }
+
+        fn path(&self, f: &str) -> PathBuf {
+            self.dir.path().join(f)
+        }
+
+        /// `<name>.pem` and `<name>.key`, signed by this CA.
+        fn leaf(&self, name: &str, sans: &[&str]) {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let sans: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+            let cert = rcgen::CertificateParams::new(sans)
+                .unwrap()
+                .signed_by(&key, &self.ca)
+                .unwrap();
+            std::fs::write(self.path(&format!("{name}.pem")), cert.pem()).unwrap();
+            std::fs::write(self.path(&format!("{name}.key")), key.serialize_pem()).unwrap();
+        }
+
+        fn listener(&self, listen: std::net::SocketAddr, clients: &[&str]) -> TlsListener {
+            TlsListener {
+                listen,
+                cert: self.path("server.pem"),
+                key: self.path("server.key"),
+                client_ca: self.path("ca.pem"),
+                clients: clients.iter().map(|c| c.to_string()).collect(),
+            }
+        }
+
+        /// A client trusting this CA for the server, presenting `name`
+        /// (from this PKI or `from`'s).
+        fn client(&self, from: &Pki, name: &str) -> tenantd_client::tls::ClientTls {
+            tenantd_client::tls::ClientTls::from_pem_files(
+                self.path("ca.pem"),
+                from.path(&format!("{name}.pem")),
+                from.path(&format!("{name}.key")),
+            )
+            .unwrap()
+        }
+    }
+
+    use tenantd_core::config::TlsListener;
+
+    async fn start_tls(
+        pki: &Pki,
+        clients: &[&str],
+    ) -> (tempfile::TempDir, PathBuf, String, Arc<TlsReload>, Host) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("api.sock");
+        let host = Host::new();
+        let tenantd = host.service(TEST_CONFIG);
+        tenantd.check_health().await;
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let tls = Arc::new(TlsReload::new(&pki.listener(addr, clients)).unwrap());
+        let net = NetListener {
+            tcp,
+            tls: tls.clone(),
+        };
+        let api = Api {
+            tenantd,
+            metrics: Arc::new(Metrics::new()),
+        };
+        let l = bind_socket(&sock, None).unwrap();
+        tokio::spawn(serve_api(
+            l,
+            HashSet::from([me()]),
+            Some(net),
+            api,
+            std::future::pending(),
+        ));
+        (dir, sock, addr.to_string(), tls, host)
+    }
+
+    async fn healthy(ch: Result<tonic::transport::Channel, tonic::transport::Error>) -> bool {
+        match ch {
+            Ok(ch) => tenantd_client::SystemClient::new(ch)
+                .health(pb::HealthRequest {})
+                .await
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_over_mtls() {
+        let pki = Pki::new();
+        pki.leaf("cp", &["cp.test"]);
+        let (_d, sock, addr, _tls, _host) = start_tls(&pki, &["cp.test"]).await;
+        let tls = pki.client(&pki, "cp");
+
+        // By IP SAN, and by DNS SAN with an explicit server name.
+        let ch = tenantd_client::tls::connect(&addr, None, &tls)
+            .await
+            .unwrap();
+        let mut tenants = tenantd_client::TenantsClient::new(ch);
+        tenants
+            .create_tenant(pb::CreateTenantRequest {
+                id: "acme".into(),
+                limits: Some(pb::TenantLimits {
+                    storage_bytes: 1 << 30,
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        let ch = tenantd_client::tls::connect(&addr, Some("localhost"), &tls).await;
+        assert!(healthy(ch).await);
+
+        // The socket keeps working next to the TLS listener and sees the
+        // same daemon.
+        let ch = tenantd_client::connect(&sock).await.unwrap();
+        let t = tenantd_client::TenantsClient::new(ch)
+            .get_tenant(pb::GetTenantRequest { id: "acme".into() })
+            .await
+            .unwrap();
+        assert_eq!(t.into_inner().id, "acme");
+    }
+
+    #[tokio::test]
+    async fn mtls_refuses_unlisted_untrusted_and_anonymous_clients() {
+        let pki = Pki::new();
+        pki.leaf("cp", &["cp.test"]);
+        pki.leaf("other", &["other.test"]);
+        let rogue = Pki::new();
+        rogue.leaf("cp", &["cp.test"]);
+        let (_d, _sock, addr, _tls, _host) = start_tls(&pki, &["cp.test"]).await;
+
+        // Right CA, name not listed.
+        let ch = tenantd_client::tls::connect(&addr, None, &pki.client(&pki, "other")).await;
+        assert!(!healthy(ch).await);
+        // Listed name, wrong CA.
+        let ch = tenantd_client::tls::connect(&addr, None, &pki.client(&rogue, "cp")).await;
+        assert!(!healthy(ch).await);
+        // The server's name is checked too.
+        let ch =
+            tenantd_client::tls::connect(&addr, Some("cp.test"), &pki.client(&pki, "cp")).await;
+        assert!(!healthy(ch).await);
+        // Plaintext h2.
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await;
+        assert!(!healthy(ch).await);
+        // TLS without a client certificate.
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                tenantd_client::tls::read_certs(&pki.path("ca.pem"))
+                    .unwrap()
+                    .remove(0),
+            )
+            .unwrap();
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut s = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .unwrap(); // TLS 1.3: the client finishes before the server decides
+        let mut buf = [0u8; 1];
+        use tokio::io::AsyncReadExt;
+        assert!(!matches!(s.read(&mut buf).await, Ok(1..)));
+
+        // The listener survives all of that.
+        let ch = tenantd_client::tls::connect(&addr, None, &pki.client(&pki, "cp")).await;
+        assert!(healthy(ch).await);
+    }
+
+    #[tokio::test]
+    async fn mtls_reload_applies_to_new_connections() {
+        let pki = Pki::new();
+        pki.leaf("cp", &["cp.test"]);
+        pki.leaf("cp2", &["cp2.test"]);
+        let (_d, _sock, addr, tls, _host) = start_tls(&pki, &["cp.test"]).await;
+        let bound = addr.parse().unwrap();
+        let (cp, cp2) = (pki.client(&pki, "cp"), pki.client(&pki, "cp2"));
+        assert!(healthy(tenantd_client::tls::connect(&addr, None, &cp).await).await);
+
+        tls.reload(Some(&pki.listener(bound, &["cp2.test"])))
+            .unwrap();
+        assert!(!healthy(tenantd_client::tls::connect(&addr, None, &cp).await).await);
+        assert!(healthy(tenantd_client::tls::connect(&addr, None, &cp2).await).await);
+
+        // Rotated server certificate, picked up by the same reload.
+        pki.leaf("server", &["localhost"]);
+        tls.reload(Some(&pki.listener(bound, &["cp2.test"])))
+            .unwrap();
+        assert!(!healthy(tenantd_client::tls::connect(&addr, None, &cp2).await).await);
+        let ch = tenantd_client::tls::connect(&addr, Some("localhost"), &cp2).await;
+        assert!(healthy(ch).await);
+
+        // Moving or dropping the listener needs a restart; a broken file
+        // keeps the old config.
+        let moved = pki.listener("127.0.0.1:1".parse().unwrap(), &["cp2.test"]);
+        assert!(tls.reload(Some(&moved)).is_err());
+        assert!(tls.reload(None).is_err());
+        let mut broken = pki.listener(bound, &["cp.test"]);
+        broken.key = pki.path("missing.key");
+        assert!(tls.reload(Some(&broken)).is_err());
+        let ch = tenantd_client::tls::connect(&addr, Some("localhost"), &cp2).await;
+        assert!(healthy(ch).await);
     }
 
     #[test]

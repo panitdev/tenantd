@@ -9,6 +9,7 @@ mod fuse_api;
 mod metrics;
 mod serve;
 mod service;
+mod tls;
 
 use std::process::ExitCode;
 
@@ -103,6 +104,24 @@ mod tests {
                 parse(args).unwrap().cmd,
                 Cmd::Client(cli::ClientCmd::Sandbox { .. })
             ));
+        }
+        // Network mode flags are global too.
+        match parse(&[
+            "health",
+            "--endpoint",
+            "tenantd-1:7443",
+            "--tls-ca",
+            "ca.pem",
+            "--tls-cert",
+            "c.pem",
+            "--tls-key",
+            "c.key",
+        ]) {
+            Ok(Cli {
+                cmd: Cmd::Client(cli::ClientCmd::Health { .. }),
+                ..
+            }) => {}
+            _ => panic!(),
         }
         match parse(&[
             "exec",

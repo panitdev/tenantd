@@ -32,7 +32,9 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 oci-spec = { version = "0.10", default-features = false, features = ["runtime"] }
 prometheus-client = "0.25"
 prost = "0.14"
+rcgen = "0.14"
 rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -40,6 +42,7 @@ tar = "0.4"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "process", "fs", "net", "io-util", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 toml = "0.9"
 tonic = "0.14"

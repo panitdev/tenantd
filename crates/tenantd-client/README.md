@@ -2,7 +2,8 @@
 
 Rust gRPC client for [tenantd](https://github.com/panitdev/tenantd), a per-host
 daemon that runs multi-tenant sandboxes on gVisor. It connects over tenantd's
-Unix socket and exposes the generated `tenantd.v1` types and service clients.
+Unix socket, or over the network with mutual TLS, and exposes the generated
+`tenantd.v1` types and service clients.
 
 ```rust,no_run
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,6 +13,14 @@ let t = tenants
     .get_tenant(tenantd_client::pb::GetTenantRequest { id: "acme".into() })
     .await?;
 # Ok(()) }
+```
+
+With the `tls` feature, connect to a daemon's `[server.tls]` listener:
+
+```rust,ignore
+use tenantd_client::tls::ClientTls;
+let tls = ClientTls::from_pem_files("ca.pem", "client.pem", "client.key")?;
+let ch = tenantd_client::tls::connect("tenantd-1.internal:7443", None, &tls).await?;
 ```
 
 The client and daemon share one version; use the client release that matches

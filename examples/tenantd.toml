@@ -6,6 +6,16 @@ state = "/var/lib/tenantd/state.db"
 [[server.callers]]
 uid = 1000                    # checked with SO_PEERCRED
 
+# Network mode: also serve the API over TCP with mutual TLS. A client's
+# certificate must chain to client_ca and carry one of `clients` as a DNS or
+# IP subjectAltName (exact match). SIGHUP re-reads the files and the list.
+# [server.tls]
+# listen = "0.0.0.0:7443"
+# cert = "/etc/tenantd/tls/server.pem"          # chain, leaf first
+# key = "/etc/tenantd/tls/server.key"
+# client_ca = "/etc/tenantd/tls/clients-ca.pem" # a CA only for tenantd clients
+# clients = ["cp-1.internal"]
+
 [storage]
 backend = "xfs-project"       # xfs-project | ext4-project | zfs (later)
 root = "/data"

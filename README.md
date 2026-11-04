@@ -4,7 +4,8 @@ A per-host daemon that runs multi-tenant sandboxes on gVisor with exact,
 aggregate storage quotas.
 
 tenantd holds the root-level permissions a sandbox platform needs and exposes
-only a fixed set of operations over a Unix socket. Callers create tenants,
+only a fixed set of operations over a Unix socket, and optionally over the
+network with mutual TLS. Callers create tenants,
 start sandboxes from operator-defined profiles, and run commands inside them.
 They never pass mounts, capabilities, host paths or raw runtime options.
 
@@ -111,6 +112,39 @@ The CLI talks to the running daemon over `/run/tenantd/api.sock` (override
 with `--socket` or `TENANTD_SOCKET`). Any UID listed in the config can use
 it. Run `tenantd --help` for the full command list, including `process ps`,
 `process kill`, `process wait`, `events` and `health`.
+
+### Network mode (mTLS)
+
+To reach tenantd from another machine, such as a control plane or a FUSE
+server, add a `[server.tls]` listener. It serves the same API as the socket,
+which keeps working next to it:
+
+```toml
+[server.tls]
+listen = "0.0.0.0:7443"
+cert = "/etc/tenantd/tls/server.pem"         # chain, leaf first
+key = "/etc/tenantd/tls/server.key"
+client_ca = "/etc/tenantd/tls/clients-ca.pem"
+clients = ["cp-1.internal", "cp-2.internal"]  # client subjectAltNames
+```
+
+Every connection must present a client certificate that chains to
+`client_ca` *and* carries one of `clients` as a DNS or IP subjectAltName.
+Both checks happen during the handshake, so other peers never reach the
+API. Use a CA that issues only tenantd clients. Sessions are never resumed,
+so each connection is checked against the current list. `SIGHUP` re-reads
+the certificates, key, CA and `clients` for new connections; open
+connections are kept. Changing `listen` needs a restart.
+
+```sh
+tenantd health --endpoint tenantd-1.internal:7443 \
+  --tls-ca ca.pem --tls-cert cp-1.pem --tls-key cp-1.key
+```
+
+The flags also read `TENANTD_ENDPOINT`, `TENANTD_TLS_CA`, `TENANTD_TLS_CERT`
+and `TENANTD_TLS_KEY`. `--tls-server-name` sets the name the daemon's
+certificate must carry when it isn't the endpoint's host. In Rust, enable
+the `tls` feature of `tenantd-client` and use `tenantd_client::tls::connect`.
 
 ## How it works
 

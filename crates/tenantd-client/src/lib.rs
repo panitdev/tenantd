@@ -1,5 +1,6 @@
 //! gRPC types for tenantd plus a Unix-socket connector for control planes,
-//! and [`fuse`] for serving a container's FUSE slot.
+//! an mTLS connector for network mode ([`tls`], feature `tls`), and [`fuse`]
+//! for serving a container's FUSE slot.
 //!
 //! ```no_run
 //! # async fn f() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,6 +16,8 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 
 pub mod fuse;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub mod pb {
     // Generated from proto/tenantd.proto; see tests/generated.rs.

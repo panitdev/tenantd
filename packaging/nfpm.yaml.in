@@ -11,7 +11,7 @@ priority: optional
 maintainer: Geon Choi <interiormut@panit.dev>
 description: |
   Per-host sandbox daemon: per-tenant storage quota and gVisor sandboxes
-  behind a fixed gRPC API on a Unix socket.
+  behind a fixed gRPC API on a Unix socket or over mTLS.
 license: Apache-2.0
 
 depends:

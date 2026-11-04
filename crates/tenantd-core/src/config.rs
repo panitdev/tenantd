@@ -37,6 +37,28 @@ pub struct ServerConfig {
     pub socket_gid: Option<u32>,
     #[serde(default)]
     pub callers: Vec<Caller>,
+    /// Network mode: also serve the API over TCP with mutual TLS.
+    pub tls: Option<TlsListener>,
+}
+
+/// `[server.tls]`. Every connection must present a client certificate that
+/// chains to `client_ca` and names one of `clients`; anything else fails the
+/// handshake. Network callers get the same API as socket callers.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsListener {
+    /// `ip:port` to listen on.
+    pub listen: std::net::SocketAddr,
+    /// PEM server certificate chain, leaf first.
+    pub cert: PathBuf,
+    /// PEM private key for `cert` (PKCS#8, PKCS#1 or SEC1).
+    pub key: PathBuf,
+    /// PEM CA certificates that client certificates must chain to. Use a CA
+    /// that issues only tenantd clients.
+    pub client_ca: PathBuf,
+    /// DNS names or IP addresses, matched against the client certificate's
+    /// subjectAltName (exactly; no wildcards). At least one.
+    pub clients: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -250,6 +272,21 @@ pub fn validate_slot_path(p: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// A literal DNS name or IP address, as a subjectAltName would carry it.
+fn valid_client_name(n: &str) -> bool {
+    if n.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    n.len() <= 253
+        && n.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
 /// `p` is `base` or below it.
 fn path_within(p: &str, base: &str) -> bool {
     p == base || p.strip_prefix(base).is_some_and(|r| r.starts_with('/'))
@@ -394,6 +431,16 @@ impl Config {
     /// (layer support, size caps) happen in [`crate::Tenantd::new`].
     pub fn validate(&self) -> Result<()> {
         let bad = |m: String| Err(Error::invalid(format!("config: {m}")));
+        if let Some(t) = &self.server.tls {
+            if t.clients.is_empty() {
+                return bad("server.tls.clients must list at least one client name".into());
+            }
+            if let Some(c) = t.clients.iter().find(|c| !valid_client_name(c)) {
+                return bad(format!(
+                    "server.tls.clients: {c:?} is not a DNS name or IP address"
+                ));
+            }
+        }
         let [lo, hi] = self.storage.project_id_range;
         if lo == 0 || lo > hi {
             return bad(format!(
@@ -546,6 +593,40 @@ mod tests {
         assert!(Config::from_toml(&with("max_processes = 16", "max_processes = 0")).is_err());
         assert!(Config::from_toml(&with("\"1000\"]", "\"a/b\"]")).is_err());
         assert!(Config::from_toml(&with("tty = false", "tty = false\nprivileged = true")).is_err());
+    }
+
+    #[test]
+    fn tls_listener() {
+        assert!(Config::from_toml(EXAMPLE).unwrap().server.tls.is_none());
+        let tls = |body: &str| {
+            Config::from_toml(&EXAMPLE.replacen(
+                "[storage]",
+                &format!("[server.tls]\n{body}\n\n[storage]"),
+                1,
+            ))
+        };
+        let ok = "listen = \"0.0.0.0:7443\"\ncert = \"/c\"\nkey = \"/k\"\nclient_ca = \"/ca\"\n";
+        let cfg = tls(&format!("{ok}clients = [\"cp.example\", \"10.0.0.5\"]")).unwrap();
+        let t = cfg.server.tls.unwrap();
+        assert_eq!(t.listen.port(), 7443);
+        assert_eq!(t.clients, ["cp.example", "10.0.0.5"]);
+        for bad in [
+            "[]",
+            "[\"*.example\"]",
+            "[\"a b\"]",
+            "[\"-a.example\"]",
+            "[\"\"]",
+        ] {
+            assert!(tls(&format!("{ok}clients = {bad}")).is_err(), "{bad}");
+        }
+        assert!(tls(&format!("{ok}clients = [\"a\"]\nverify = false")).is_err());
+        assert!(
+            tls(&format!(
+                "{}clients = [\"a\"]",
+                ok.replace("0.0.0.0:7443", "localhost:7443")
+            ))
+            .is_err()
+        );
     }
 
     #[test]
