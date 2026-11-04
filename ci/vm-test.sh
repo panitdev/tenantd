@@ -40,7 +40,12 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys: ["$(cat key.pub)"]
 EOF
-cloud-localds seed.img user-data
+if command -v cloud-localds >/dev/null; then
+  cloud-localds seed.img user-data
+else  # e.g. Arch: build the NoCloud seed ISO by hand
+  echo "instance-id: vm-test" > meta-data
+  xorriso -as mkisofs -quiet -o seed.img -V cidata -J -r user-data meta-data
+fi
 
 qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 4096 -display none \
   -drive file=root.qcow2,if=virtio -drive file=data.qcow2,if=virtio \
@@ -48,7 +53,7 @@ qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 4096 -display none \
   -netdev user,id=n0,hostfwd=tcp::2222-:22 -device virtio-net,netdev=n0 \
   -serial file:console.log -daemonize -pidfile qemu.pid
 
-common=(-i key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+common=(-i "$work/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 # Commands go over stdin so quoting inside them never fights the ssh layer.
 # Each one gets VM_TIMEOUT seconds: a hung step fails here, with pcheck's
 # diagnostics, instead of eating the job's timeout and showing "cancelled".
@@ -87,12 +92,22 @@ expect_state() {
   vm "out=\$(tenantd sandbox get t1 s1)
       echo \"\$out\"
       if ! grep -q $1 <<<\"\$out\"; then
-        tail -n 50 /var/lib/tenantd/runtime/logs/t1.s1.* || true
+        tail -n 50 /var/lib/tenantd/runtime/logs/t1.s1+.* || true
         journalctl --no-pager -u tenantd -n 100 || true
         exit 1
       fi"
 }
-trap 'kill "$(cat qemu.pid)" 2>/dev/null || true' EXIT
+# VM_KEEP=1 leaves the VM running on exit so you can ssh in and look.
+on_exit() {
+  if [ "${VM_KEEP:-0}" = 1 ]; then
+    echo "VM kept: ssh ${common[*]} -p 2222 ci@127.0.0.1" >&2
+    echo "stop it: kill $(cat "$work/qemu.pid")" >&2
+  else
+    kill "$(cat "$work/qemu.pid")" 2>/dev/null || true
+    cd / && rm -rf "$work"
+  fi
+}
+trap on_exit EXIT
 wait_ssh
 vm cloud-init status --wait >/dev/null || true
 
@@ -149,6 +164,13 @@ if [ -n "$old_pkg" ]; then
   put "$new_pkg"; vm "$install /tmp/$(basename "$new_pkg")"
   vm systemctl is-active tenantd
   wait_api
+  # Breaking change while on edge: runtime handles gained a "+" terminator
+  # (runsc resolves IDs by prefix), so reconcile can't own a sandbox the old
+  # release started. It marks it exited and removes the old runsc container.
+  # TODO: back to `expect_state running` once the previous release has "+".
+  expect_state exited
+  vm '! /usr/lib/tenantd/runsc/*/runsc --root /run/tenantd/runsc list | awk "{print \$1}" | grep -qx t1.s1'
+  vm tenantd sandbox start t1 s1
   expect_state running
 fi
 
@@ -206,7 +228,7 @@ pcheck 'tenantd container create t1 s1 c1 -- sleep infinity
         ! tenantd exec --container c2 t1 s1 -- cat /mine
         ! tenantd exec t1 s1 -- cat /mine
         test "$(cat /data/tenants/t1/sandboxes/s1/containers/c1/upper/mine)" = a
-        test "$(pgrep -c -x runsc-sandbox)" = 1'
+        test "$(pgrep -c -f "^runsc-sandbox ")" = 1'
 pcheck 'tenantd container rm t1 s1 c2
         ! test -e /data/tenants/t1/sandboxes/s1/containers/c2
         tenantd container get t1 s1 c1 | grep -q " running"'

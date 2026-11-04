@@ -147,6 +147,10 @@ and nothing else tells you.
   behind.
 - **Run the audit before pushing a lockfile change.** If `cargo-audit` is
   installed, run `cargo audit`: `ci` fails on any RUSTSEC advisory.
+- **Run the VM test locally before pushing runtime, FUSE or packaging
+  changes:** `ci/vm-test-local.sh` (about 2 minutes, KVM). It builds the
+  `.deb` the way edge does and runs `ci/vm-test.sh`. `VM_KEEP=1` leaves the
+  VM up on failure so you can ssh in.
 - **The git pre-push hook** (`ci/pre-push.sh`, called from
   `.beads/hooks/pre-push`) runs `cargo fmt --check` and `cargo audit` (seconds; `TENANTD_PREPUSH_FULL=1` adds clippy and tests). Bypass it once
   with `git push --no-verify` only when you know CI will still pass.
