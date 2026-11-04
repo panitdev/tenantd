@@ -125,3 +125,29 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+## CI and releases
+
+Pushing to `main` runs two workflows: `ci` (check, dependency audit,
+integration) and `edge` (build, then `vm-test` installs the real package in
+KVM, then publish). The `edge` GitHub release only moves when the whole
+`edge` run succeeds. A failed or cancelled run leaves it on an older commit,
+and nothing else tells you.
+
+- **A push isn't done until CI is green.** Find the runs for the pushed SHA
+  (`gh run list --commit <sha>`). When they finish, check each one with
+  `gh run view <id> --json conclusion,jobs`. Only `success` counts.
+  `gh run watch` can exit 0 on a cancelled run, so don't rely on its exit
+  code.
+- **Cancelled means it hung or timed out, not that it was skipped.** Read
+  the log (`gh run view <id> --log`) and find the last command that ran.
+- **Before installing "latest", compare `edge` to `main`.**
+  `gh release view edge --json targetCommitish` must match `main`'s SHA. If
+  it doesn't, say which build would really be installed and why edge is
+  behind.
+- **Run the audit before pushing a lockfile change.** If `cargo-audit` is
+  installed, run `cargo audit`: `ci` fails on any RUSTSEC advisory.
+- **The git pre-push hook** (`ci/pre-push.sh`, called from
+  `.beads/hooks/pre-push`) runs `cargo fmt --check` and `cargo audit` (seconds; `TENANTD_PREPUSH_FULL=1` adds clippy and tests). Bypass it once
+  with `git push --no-verify` only when you know CI will still pass.
+
