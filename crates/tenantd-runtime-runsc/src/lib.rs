@@ -45,6 +45,9 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `runsc start` may take.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// In a bundle: the runsc flags `create` used, one per line, for `start`.
+const START_FLAGS: &str = "runsc.flags";
+
 /// The raw exit code of a `runsc exec` child, once it exits.
 type ExecExit = oneshot::Receiver<Option<i32>>;
 
@@ -281,11 +284,17 @@ impl RunscRuntime {
         let stdout = self.open_log(&logs.join(format!("{id}.out")))?;
         let stderr = self.open_log(&logs.join(format!("{id}.err")))?;
         let runsc_log = logs.join(format!("{id}.runsc.log"));
-        let flags: Vec<OsString> = vec![
-            format!("--overlay2={}", spec::overlay_flag(root)).into(),
-            "--network=sandbox".into(),
-            flag_path("--log=", &runsc_log),
+        // `runsc start` needs these too: it sets up a joining container's
+        // root, and without them it uses runsc's default overlay, a
+        // filestore in the upper dir that the host never sees. Kept in the
+        // bundle so a start after a daemon restart still has them.
+        let runtime_flags = [
+            format!("--overlay2={}", spec::overlay_flag(root)),
+            "--network=sandbox".to_string(),
         ];
+        tokio::fs::write(bundle.join(START_FLAGS), runtime_flags.join("\n")).await?;
+        let mut flags: Vec<OsString> = runtime_flags.iter().map(OsString::from).collect();
+        flags.push(flag_path("--log=", &runsc_log));
         let status = self
             .command(
                 &flags,
@@ -422,8 +431,15 @@ impl RuntimeBackend for RunscRuntime {
         let stdout = self.open_log(&logs.join(format!("{id}.out")))?;
         let stderr = self.open_log(&logs.join(format!("{id}.err")))?;
         let runsc_log = logs.join(format!("{id}.runsc.log"));
+        let mut flags: Vec<OsString> =
+            match tokio::fs::read_to_string(self.bundle_dir(id).join(START_FLAGS)).await {
+                Ok(s) => s.lines().map(OsString::from).collect(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(e.into()),
+            };
+        flags.push(flag_path("--log=", &runsc_log));
         let run = self
-            .command(&[flag_path("--log=", &runsc_log)], &["start", id])
+            .command(&flags, &["start", id])
             .stdout(stdout)
             .stderr(stderr)
             .status();
