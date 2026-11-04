@@ -760,13 +760,24 @@ async fn serve_fuse(
         session.limits.max_read,
         session.limits.max_write
     );
+    // Serve while the start is in flight: runsc touches the FUSE mount while
+    // it starts the container, and nobody else answers those requests.
+    let run = session.run();
+    tokio::pin!(run);
     if start {
-        ContainersClient::new(ch)
-            .start_container(r)
-            .await
-            .context("starting the container")?;
+        let mut client = ContainersClient::new(ch);
+        let starting = client.start_container(r);
+        tokio::select! {
+            res = &mut run => {
+                res.context("serving FUSE")?;
+                anyhow::bail!("the FUSE stream ended before the container started");
+            }
+            res = starting => {
+                res.context("starting the container")?;
+            }
+        }
     }
-    session.run().await.context("serving FUSE")?;
+    run.await.context("serving FUSE")?;
     eprintln!("connection ended");
     Ok(())
 }

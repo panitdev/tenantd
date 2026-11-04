@@ -1141,7 +1141,11 @@ impl fuser::Filesystem for PathFs {
             Ok(p) => p,
             Err(e) => return reply.error(e),
         };
-        if let Some(list) = st.t.lock().unwrap().fresh_listing(&path) {
+        // Bind first: in an `if let` the guard would live through the body,
+        // and opened_dir takes the same lock (a self-deadlock on the second
+        // opendir of a directory, which hung every later request).
+        let cached = st.t.lock().unwrap().fresh_listing(&path);
+        if let Some(list) = cached {
             return st.opened_dir(ino.0, &path, &list, reply);
         }
         let st2 = st.clone();
