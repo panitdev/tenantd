@@ -50,7 +50,17 @@ qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 4096 -display none \
 
 common=(-i key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 # Commands go over stdin so quoting inside them never fights the ssh layer.
-vm()  { ssh "${common[@]}" -p 2222 ci@127.0.0.1 'sudo bash -euxo pipefail' <<<"$*"; }
+# Each one gets VM_TIMEOUT seconds: a hung step fails here, with pcheck's
+# diagnostics, instead of eating the job's timeout and showing "cancelled".
+vm() {
+  local rc=0
+  timeout "${VM_TIMEOUT:-300}" ssh "${common[@]}" -p 2222 ci@127.0.0.1 \
+    'sudo bash -euxo pipefail' <<<"$*" || rc=$?
+  if [ "$rc" = 124 ]; then
+    echo "vm: timed out after ${VM_TIMEOUT:-300}s: $*" >&2
+  fi
+  return "$rc"
+}
 put() { scp "${common[@]}" -P 2222 "$@" ci@127.0.0.1:/tmp/; }
 wait_ssh() {
   for _ in $(seq 90); do

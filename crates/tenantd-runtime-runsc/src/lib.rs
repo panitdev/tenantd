@@ -42,6 +42,9 @@ pub use spec::{build as build_spec, exec_process, resolve_user, resolve_user_in_
 /// How long `runsc exec` may take to start a process.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long `runsc start` may take.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The raw exit code of a `runsc exec` child, once it exits.
 type ExecExit = oneshot::Receiver<Option<i32>>;
 
@@ -410,9 +413,30 @@ impl RuntimeBackend for RunscRuntime {
     }
 
     async fn start(&self, h: &RuntimeHandle) -> Result<()> {
-        self.run(&["start", &h.0])
+        // A container joining a sandbox takes `runsc start`'s stdio as its
+        // own, and the sandbox holds those fds for the container's life. A
+        // pipe here would never reach EOF, so give it the container's logs,
+        // as `create_from` does, and read errors from runsc's own log.
+        let id = h.0.as_str();
+        let logs = self.log_dir();
+        let stdout = self.open_log(&logs.join(format!("{id}.out")))?;
+        let stderr = self.open_log(&logs.join(format!("{id}.err")))?;
+        let runsc_log = logs.join(format!("{id}.runsc.log"));
+        let run = self
+            .command(&[flag_path("--log=", &runsc_log)], &["start", id])
+            .stdout(stdout)
+            .stderr(stderr)
+            .status();
+        let status = tokio::time::timeout(START_TIMEOUT, run)
             .await
-            .map_err(|e| Error::Internal(format!("runsc start {}: {e}", h.0)))?;
+            .map_err(|_| Error::Internal(format!("runsc start {id} timed out")))?
+            .context("running runsc start")?;
+        if !status.success() {
+            return Err(Error::Internal(format!(
+                "runsc start {id} failed ({status}): {}",
+                log_tail(&runsc_log)
+            )));
+        }
         Ok(())
     }
 
