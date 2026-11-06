@@ -16,7 +16,7 @@ exclude = ["/tests"]
 hyper-util.workspace = true
 libc.workspace = true
 prost.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "sync"] }
+tokio = { workspace = true, features = ["net", "rt", "sync", "io-util", "macros"] }
 tokio-stream.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }

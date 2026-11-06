@@ -10,6 +10,7 @@ pub mod config;
 pub mod container;
 pub mod error;
 pub mod events;
+pub mod files;
 pub mod fsutil;
 pub mod fuse;
 pub mod id;

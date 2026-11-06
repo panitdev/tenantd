@@ -57,7 +57,8 @@ use crate::pb::{self, fuse_request::Op, fuse_response::Result as Res};
 /// The protocol version [`attach`] speaks.
 pub const VERSION: u32 = 1;
 
-/// Linux errno values a server commonly answers with.
+/// Linux errno values a server commonly answers with, and file calls
+/// commonly fail with.
 pub mod errno {
     pub const EPERM: i32 = libc::EPERM;
     pub const ENOENT: i32 = libc::ENOENT;
@@ -71,6 +72,9 @@ pub mod errno {
     pub const EROFS: i32 = libc::EROFS;
     pub const ENOTEMPTY: i32 = libc::ENOTEMPTY;
     pub const ENOSYS: i32 = libc::ENOSYS;
+    pub const EBUSY: i32 = libc::EBUSY;
+    pub const EXDEV: i32 = libc::EXDEV;
+    pub const ENAMETOOLONG: i32 = libc::ENAMETOOLONG;
 }
 
 /// A failed operation: a Linux errno, for the container to see.

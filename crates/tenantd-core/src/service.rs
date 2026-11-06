@@ -91,6 +91,8 @@ pub struct Tenantd {
     /// Containers whose FUSE connection was handed to a server since it
     /// was mounted. A FUSE container starts only once it is here.
     pub(crate) fuse_attached: Mutex<HashSet<ContainerKey>>,
+    /// File helpers running, per sandbox; see [`crate::files::HELPERS_PER_SANDBOX`].
+    pub(crate) file_helpers: Mutex<HashMap<SandboxKey, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Tenantd {
@@ -121,6 +123,7 @@ impl Tenantd {
             blocked: Mutex::new(HashMap::new()),
             reserved_projects: Mutex::new(HashSet::new()),
             fuse_attached: Mutex::new(HashSet::new()),
+            file_helpers: Mutex::new(HashMap::new()),
         }))
     }
 

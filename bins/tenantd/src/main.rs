@@ -5,6 +5,8 @@
 
 mod api;
 mod cli;
+mod files_api;
+mod files_helper;
 mod fuse_api;
 mod metrics;
 mod serve;
@@ -44,8 +46,16 @@ enum ConfigCmd {
     Check(serve::ConfigPath),
 }
 
+fn main() -> ExitCode {
+    // Exec'd in a container as the file helper: serve one call, no runtime.
+    if files_helper::is_helper() {
+        return files_helper::main();
+    }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn run() -> ExitCode {
     let res = match Cli::parse().cmd {
         Cmd::Serve(args) => return serve::main(args).await,
         Cmd::Config(ConfigCmd::Check(c)) => {

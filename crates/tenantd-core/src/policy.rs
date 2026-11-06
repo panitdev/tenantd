@@ -313,23 +313,7 @@ pub fn plan_process(
     let name = &sandbox.profile;
     let exec = &cfg.profile(name)?.exec;
     let rule = |f: &str| format!("profiles.{name}.exec{f}");
-    if !exec.enabled {
-        return Err(Error::denied(
-            rule(""),
-            "exec is not enabled for this profile",
-        ));
-    }
-    let user = p
-        .user
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .unwrap_or("image");
-    if !exec.users.iter().any(|u| u == user) {
-        return Err(Error::denied(
-            rule(".users"),
-            format!("user {user:?} is not allowed"),
-        ));
-    }
+    let user = exec_user(cfg, sandbox, p.user.as_deref())?;
     if p.tty && !exec.tty {
         return Err(Error::denied(rule(".tty"), "tty is not allowed"));
     }
@@ -355,10 +339,7 @@ pub fn plan_process(
             .clone()
             .or_else(|| img.working_dir.clone().filter(|d| !d.is_empty()))
             .unwrap_or_else(|| "/".into()),
-        user: match user {
-            "image" => img.user.clone().filter(|u| !u.is_empty()),
-            u => Some(u.to_string()),
-        },
+        user,
         capabilities: sandbox.spec.capabilities.clone(),
         image_layers: sandbox.spec.image.layers.clone(),
     };
@@ -368,6 +349,42 @@ pub fn plan_process(
         tombstone_secs: exec.tombstone_secs,
     };
     Ok((resolved, limits))
+}
+
+/// Who a caller acts as in the sandbox, by the exec policy of its profile
+/// in the *current* config: exec must be enabled and `user` (`None` or
+/// empty: the image's user) one of `exec.users`. Returns the user as the
+/// runtime takes it, `None` for the image's default (root).
+pub fn exec_user(
+    cfg: &Config,
+    sandbox: &SandboxRecord,
+    user: Option<&str>,
+) -> Result<Option<String>> {
+    let name = &sandbox.profile;
+    let exec = &cfg.profile(name)?.exec;
+    if !exec.enabled {
+        return Err(Error::denied(
+            format!("profiles.{name}.exec"),
+            "exec is not enabled for this profile",
+        ));
+    }
+    let user = user.filter(|u| !u.is_empty()).unwrap_or("image");
+    if !exec.users.iter().any(|u| u == user) {
+        return Err(Error::denied(
+            format!("profiles.{name}.exec.users"),
+            format!("user {user:?} is not allowed"),
+        ));
+    }
+    Ok(match user {
+        "image" => sandbox
+            .spec
+            .image
+            .config
+            .user
+            .clone()
+            .filter(|u| !u.is_empty()),
+        u => Some(u.to_string()),
+    })
 }
 
 /// Normalise a reference the way registries resolve it:

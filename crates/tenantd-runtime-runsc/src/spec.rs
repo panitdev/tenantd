@@ -199,6 +199,27 @@ pub fn exec_process(p: &ResolvedProcess) -> Result<Process> {
     )
 }
 
+/// Where [`build`] or runsc mounts something of the runtime's own over the
+/// root, so what is there on the host is not what the container sees. `/tmp` always: [`build`] mounts a tmpfs
+/// there on a read-only root, and runsc mounts its own over an image's
+/// empty `/tmp` otherwise.
+pub fn runtime_mounts(s: &ResolvedSandbox) -> Vec<&'static str> {
+    let mut m = vec![
+        "/proc",
+        "/dev",
+        "/dev/pts",
+        "/dev/shm",
+        "/dev/mqueue",
+        "/sys",
+        "/etc/hosts",
+        "/tmp",
+    ];
+    if s.network == NetworkMode::Egress {
+        m.push("/etc/resolv.conf");
+    }
+    m
+}
+
 pub fn build(
     s: &ResolvedSandbox,
     root: &RootfsSpec,
@@ -500,6 +521,7 @@ mod tests {
             .map(|m| m["destination"].as_str().unwrap())
             .collect();
         assert!(dests.contains(&"/tmp") && dests.contains(&"/etc/resolv.conf"));
+        assert_eq!(dests, runtime_mounts(&s), "runtime_mounts is out of date");
         assert!(v.get("hooks").is_none() || v["hooks"].is_null());
     }
 

@@ -2,6 +2,7 @@
 //! listener with `--endpoint`. These never read the daemon config, open the
 //! state DB or need root; only API access.
 
+mod files;
 mod passthrough;
 
 use std::path::PathBuf;
@@ -94,6 +95,13 @@ pub enum ClientCmd {
         conn: Conn,
         #[command(subcommand)]
         cmd: ContainerCmd,
+    },
+    /// Read and write files in a running container's root.
+    File {
+        #[command(flatten)]
+        conn: Conn,
+        #[command(flatten)]
+        args: files::FileArgs,
     },
     /// Manage tenants' volumes.
     Volume {
@@ -230,6 +238,10 @@ pub enum ContainerCmd {
         /// "created" for its server; see serve-fuse.
         #[arg(long)]
         fuse: bool,
+        /// Serve `tenantd file` calls on it from the host: much faster per
+        /// call, but every file lookup in the container gets slower.
+        #[arg(long)]
+        host_file_access: bool,
         /// Its init and arguments; default: the image's entrypoint and cmd.
         #[arg(last = true)]
         args: Vec<String>,
@@ -719,6 +731,9 @@ fn print_container(c: &pb::Container) {
     if !c.fuse_path.is_empty() {
         mounts.push(format!("{}=fuse", c.fuse_path));
     }
+    if c.host_file_access {
+        mounts.push("host-file-access".into());
+    }
     let mounts = if mounts.is_empty() {
         String::new()
     } else {
@@ -821,6 +836,7 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
         | ClientCmd::Sandbox { conn, .. }
         | ClientCmd::Container { conn, .. }
         | ClientCmd::Volume { conn, .. }
+        | ClientCmd::File { conn, .. }
         | ClientCmd::Exec { conn, .. }
         | ClientCmd::Process { conn, .. }
         | ClientCmd::Health { conn }
@@ -934,6 +950,7 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                     id,
                     volumes,
                     fuse,
+                    host_file_access,
                     args,
                 } => {
                     let req = pb::CreateContainerRequest {
@@ -943,6 +960,7 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                         args,
                         volumes: volumes.into_iter().collect(),
                         fuse,
+                        host_file_access,
                     };
                     print_container(&k.create_container(req).await?.into_inner())
                 }
@@ -997,6 +1015,7 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
                 }
             }
         }
+        ClientCmd::File { args, .. } => files::run(ch, args).await?,
         ClientCmd::Volume { cmd: c, .. } => {
             let mut v = VolumesClient::new(ch);
             let r = |tenant, id| pb::VolumeRef { tenant, id };

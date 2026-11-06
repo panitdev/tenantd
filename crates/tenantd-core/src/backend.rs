@@ -3,11 +3,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::RuntimeKind;
 use crate::fuse::{FuseLimits, FuseLink};
@@ -76,6 +79,9 @@ pub struct LayerTraits {
     pub survives_stop: bool,
     /// The core refuses a profile without a size cap.
     pub needs_size_cap: bool,
+    /// Container roots are host directories, which Files host access
+    /// serves ([`WritableLayer::container_files_root`]).
+    pub host_root: bool,
     pub runtimes: &'static [RuntimeKind],
 }
 
@@ -130,6 +136,16 @@ pub trait WritableLayer: Send + Sync {
         c: &ContainerId,
         tenant_dir: &Path,
     ) -> Result<RootfsSpec>;
+    /// Where container `c`'s root, as the container sees it, is on the
+    /// host, for serving file access to it; `None` when the layer keeps
+    /// what the container writes out of the host's sight (in memory inside
+    /// the sandbox). Fails when the root should be there but isn't mounted.
+    async fn container_files_root(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<Option<PathBuf>>;
     /// Unmount and remove everything the container owns. Idempotent; the
     /// sandbox's own teardown removes its containers' too.
     async fn teardown_container(
@@ -220,20 +236,20 @@ pub trait RuntimeBackend: Send + Sync {
         root: &RootfsSpec,
         net: &NetAttachment,
     ) -> Result<RuntimeHandle>;
-    /// Create container `c` in the running sandbox `s`: the sandbox's image
-    /// on `root`, running `args` (empty: the image's entrypoint and cmd),
-    /// sharing the sandbox's kernel, network and limits. The handle works
-    /// with every other call here.
-    /// `mounts` are bound in after the runtime's own mounts, in order.
+    /// Create container `c` in the running sandbox `s`, sharing the
+    /// sandbox's kernel, network and limits. The handle works with every
+    /// other call here. Every container gets tenantd's file helper at
+    /// [`crate::files::HELPER_PATH`].
     async fn create_container(
         &self,
         s: &ResolvedSandbox,
-        c: &ContainerKey,
-        args: &[String],
-        root: &RootfsSpec,
-        mounts: &[BindMount],
+        c: &ContainerRun<'_>,
         net: &NetAttachment,
     ) -> Result<RuntimeHandle>;
+    /// Paths inside a container of `s` where the runtime mounts something
+    /// of its own (proc, devices, generated files), hiding what the root
+    /// has there.
+    fn runtime_mounts(&self, s: &ResolvedSandbox) -> Vec<String>;
     async fn start(&self, h: &RuntimeHandle) -> Result<()>;
     async fn stop(&self, h: &RuntimeHandle, grace: Duration) -> Result<()>;
     /// Remove the container. Idempotent.
@@ -260,6 +276,34 @@ pub trait RuntimeBackend: Send + Sync {
     async fn watch_process(&self, h: &RuntimeHandle, pid: u32) -> Result<()>;
     /// Processes in the container, for reconcile.
     async fn list_processes(&self, h: &RuntimeHandle) -> Result<Vec<ProcInfo>>;
+    /// Run `p` in the running container with its stdin and stdout piped to
+    /// tenantd, for a short task of tenantd's own (the file helper). It is
+    /// not a process of the tenant's: no row, no output files.
+    async fn exec_piped(&self, h: &RuntimeHandle, p: &ResolvedProcess) -> Result<PipedProcess>;
+}
+
+/// What a container is created from; see
+/// [`RuntimeBackend::create_container`].
+#[derive(Clone, Copy, Debug)]
+pub struct ContainerRun<'a> {
+    pub key: &'a ContainerKey,
+    /// Its init; empty runs the image's entrypoint and cmd.
+    pub args: &'a [String],
+    pub root: &'a RootfsSpec,
+    /// Bound in after the runtime's own mounts, in order.
+    pub mounts: &'a [BindMount],
+    /// The host changes the root under the container (Files host access),
+    /// so the runtime must not trust its own cache of it.
+    pub host_file_access: bool,
+}
+
+/// A process from [`RuntimeBackend::exec_piped`]. Dropping it kills the
+/// process, which then sees its stdin end.
+pub struct PipedProcess {
+    pub stdin: Pin<Box<dyn AsyncWrite + Send>>,
+    pub stdout: Pin<Box<dyn AsyncRead + Send>>,
+    /// Its exit: `Ok` with its code, or an error carrying its stderr.
+    pub exit: BoxFuture<'static, Result<()>>,
 }
 
 /// Process output files. The runtime writes them directly; this keeps each

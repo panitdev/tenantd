@@ -167,6 +167,11 @@ pub struct CreateContainerRequest {
     /// Mount the profile's FUSE slot; the container then waits "created".
     #[prost(bool, tag = "6")]
     pub fuse: bool,
+    /// Serve Files calls on it from the host, not through the in-container
+    /// helper; see service Files for the cost. Needs a layer that keeps
+    /// container roots on the host (not memory).
+    #[prost(bool, tag = "7")]
+    pub host_file_access: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContainerRef {
@@ -216,6 +221,8 @@ pub struct Container {
     /// where its FUSE slot is mounted; "" = none
     #[prost(string, tag = "10")]
     pub fuse_path: ::prost::alloc::string::String,
+    #[prost(bool, tag = "11")]
+    pub host_file_access: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FuseServerMessage {
@@ -633,6 +640,171 @@ pub struct StatFsReply {
     pub bsize: u32,
     #[prost(uint32, tag = "7")]
     pub namelen: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileStatRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// stat(2) rather than lstat(2)
+    #[prost(bool, tag = "3")]
+    pub follow: bool,
+    /// "" = image user; otherwise in exec.users
+    #[prost(string, tag = "4")]
+    pub user: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileStatResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub attr: ::core::option::Option<FileAttr>,
+    /// the path stat-ed, symlinks resolved when follow
+    #[prost(string, tag = "4")]
+    pub path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileReadDirRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub user: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FileReadDirResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    /// without "." and ".."
+    #[prost(message, repeated, tag = "3")]
+    pub entries: ::prost::alloc::vec::Vec<DirEntry>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileReadRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    /// symlinks are followed
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    /// 0: to the end of the file
+    #[prost(uint64, tag = "4")]
+    pub length: u64,
+    #[prost(string, tag = "5")]
+    pub user: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileReadResponse {
+    /// set on the last message when the read failed
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    /// first message only
+    #[prost(message, optional, tag = "3")]
+    pub attr: ::core::option::Option<FileAttr>,
+    /// of data
+    #[prost(uint64, tag = "4")]
+    pub offset: u64,
+    #[prost(bytes = "vec", tag = "5")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileWriteRequest {
+    #[prost(oneof = "file_write_request::Msg", tags = "1, 2")]
+    pub msg: ::core::option::Option<file_write_request::Msg>,
+}
+/// Nested message and enum types in `FileWriteRequest`.
+pub mod file_write_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Msg {
+        /// first message, once
+        #[prost(message, tag = "1")]
+        Header(super::FileWriteHeader),
+        #[prost(bytes, tag = "2")]
+        Data(::prost::alloc::vec::Vec<u8>),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileWriteHeader {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// default: the replaced file's, or 0644
+    #[prost(uint32, optional, tag = "3")]
+    pub mode: ::core::option::Option<u32>,
+    /// create missing parent directories (0755)
+    #[prost(bool, tag = "4")]
+    pub parents: bool,
+    /// fail with EEXIST if the path exists
+    #[prost(bool, tag = "5")]
+    pub exclusive: bool,
+    /// The body's length, when known: a body that ends short or long fails
+    /// with EIO, leaving the target as it was.
+    #[prost(uint64, optional, tag = "6")]
+    pub size: ::core::option::Option<u64>,
+    #[prost(string, tag = "7")]
+    pub user: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileWriteResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    /// of the file written
+    #[prost(message, optional, tag = "3")]
+    pub attr: ::core::option::Option<FileAttr>,
+    #[prost(uint64, tag = "4")]
+    pub written: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileRenameRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub from: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub to: ::prost::alloc::string::String,
+    /// renameat2 flags
+    #[prost(uint32, tag = "4")]
+    pub flags: u32,
+    #[prost(string, tag = "5")]
+    pub user: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileRenameResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileRemoveRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// rmdir: the directory must be empty
+    #[prost(bool, tag = "3")]
+    pub directory: bool,
+    #[prost(string, tag = "4")]
+    pub user: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileRemoveResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VolumeMount {
@@ -3075,6 +3247,749 @@ pub mod containers_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "tenantd.v1.Containers";
     impl<T> tonic::server::NamedService for ContainersServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod files_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// File access to a running container's root, as the container sees it: the
+    /// files its own processes read and write, for callers that would otherwise
+    /// have to exec a binary in the image and parse its output.
+    ///
+    /// Paths are absolute within the container ("/" is its root), without "."
+    /// or ".." parts, and resolve as the container's own processes see them:
+    /// its mounts, /tmp, volumes and FUSE slot included.
+    ///
+    /// By default each call runs tenantd's file helper inside the container (a
+    /// `runsc exec` per call, so tens of milliseconds each), which works on every
+    /// layer and costs the container nothing otherwise. A container created with
+    /// host_file_access is served from the host instead, much faster per call;
+    /// the runtime then revalidates every file lookup in that container against
+    /// the host, which slows file-heavy work there. Paths the host can't see
+    /// (mounts) still go through the helper. A container created before file
+    /// access existed has no helper: FAILED_PRECONDITION until it is recreated.
+    ///
+    /// Filesystem errors come back in the reply as Linux errno values with a
+    /// detail for logs, the way ServeFuse takes them; a gRPC error means the
+    /// call itself was refused (NOT_FOUND for an unknown container,
+    /// FAILED_PRECONDITION when it is not running, PERMISSION_DENIED by policy).
+    ///
+    /// What a caller may do is the sandbox profile's exec policy: exec must be
+    /// enabled, and every call acts as `user` ("" = the image user; otherwise
+    /// one of profile exec.users), with that user's permissions, resolved as an
+    /// exec's are. Files it creates are that user's. Writes are in the tenant's
+    /// quota: past it they fail with ENOSPC, as the container's own writes do
+    /// (XFS project quotas report ENOSPC, not EDQUOT).
+    #[derive(Debug, Clone)]
+    pub struct FilesClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl FilesClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> FilesClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> FilesClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            FilesClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// lstat, or stat with follow. Returns the resolved path as well.
+        pub async fn stat(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileStatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileStatResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/Stat");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Stat"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The whole directory, each entry with its lstat attributes.
+        pub async fn read_dir(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileReadDirRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileReadDirResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/ReadDir");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "ReadDir"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// A regular file's bytes from offset, in chunks. The first message
+        /// carries the file's attributes (or the errno that ended the call).
+        pub async fn read(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileReadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::FileReadResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/Read");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Read"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// The first message is `header`, then the body as `data` messages; the
+        /// client closing its side ends the body. The body goes to a temporary
+        /// file beside the target, which replaces it only once the whole body
+        /// arrived: a stream that fails or is cancelled leaves the target as it
+        /// was. A symlink at the path is followed, and its target replaced.
+        /// Replacing means hard links to the old file keep the old body, xattrs
+        /// and ACLs are not carried over, it takes write permission on the
+        /// directory, and both bodies count against the quota until the rename.
+        pub async fn write(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::FileWriteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileWriteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/Write");
+            let mut req = request.into_streaming_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Write"));
+            self.inner.client_streaming(req, path, codec).await
+        }
+        /// renameat2(2), flags RENAME_NOREPLACE (1) or RENAME_EXCHANGE (2).
+        pub async fn rename(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileRenameResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/Rename");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Rename"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// unlink(2), or rmdir(2) with directory.
+        pub async fn remove(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileRemoveRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileRemoveResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/Remove");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Remove"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod files_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with FilesServer.
+    #[async_trait]
+    pub trait Files: std::marker::Send + std::marker::Sync + 'static {
+        /// lstat, or stat with follow. Returns the resolved path as well.
+        async fn stat(
+            &self,
+            request: tonic::Request<super::FileStatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileStatResponse>,
+            tonic::Status,
+        >;
+        /// The whole directory, each entry with its lstat attributes.
+        async fn read_dir(
+            &self,
+            request: tonic::Request<super::FileReadDirRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileReadDirResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the Read method.
+        type ReadStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::FileReadResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// A regular file's bytes from offset, in chunks. The first message
+        /// carries the file's attributes (or the errno that ended the call).
+        async fn read(
+            &self,
+            request: tonic::Request<super::FileReadRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ReadStream>, tonic::Status>;
+        /// The first message is `header`, then the body as `data` messages; the
+        /// client closing its side ends the body. The body goes to a temporary
+        /// file beside the target, which replaces it only once the whole body
+        /// arrived: a stream that fails or is cancelled leaves the target as it
+        /// was. A symlink at the path is followed, and its target replaced.
+        /// Replacing means hard links to the old file keep the old body, xattrs
+        /// and ACLs are not carried over, it takes write permission on the
+        /// directory, and both bodies count against the quota until the rename.
+        async fn write(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::FileWriteRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileWriteResponse>,
+            tonic::Status,
+        >;
+        /// renameat2(2), flags RENAME_NOREPLACE (1) or RENAME_EXCHANGE (2).
+        async fn rename(
+            &self,
+            request: tonic::Request<super::FileRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileRenameResponse>,
+            tonic::Status,
+        >;
+        /// unlink(2), or rmdir(2) with directory.
+        async fn remove(
+            &self,
+            request: tonic::Request<super::FileRemoveRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileRemoveResponse>,
+            tonic::Status,
+        >;
+    }
+    /// File access to a running container's root, as the container sees it: the
+    /// files its own processes read and write, for callers that would otherwise
+    /// have to exec a binary in the image and parse its output.
+    ///
+    /// Paths are absolute within the container ("/" is its root), without "."
+    /// or ".." parts, and resolve as the container's own processes see them:
+    /// its mounts, /tmp, volumes and FUSE slot included.
+    ///
+    /// By default each call runs tenantd's file helper inside the container (a
+    /// `runsc exec` per call, so tens of milliseconds each), which works on every
+    /// layer and costs the container nothing otherwise. A container created with
+    /// host_file_access is served from the host instead, much faster per call;
+    /// the runtime then revalidates every file lookup in that container against
+    /// the host, which slows file-heavy work there. Paths the host can't see
+    /// (mounts) still go through the helper. A container created before file
+    /// access existed has no helper: FAILED_PRECONDITION until it is recreated.
+    ///
+    /// Filesystem errors come back in the reply as Linux errno values with a
+    /// detail for logs, the way ServeFuse takes them; a gRPC error means the
+    /// call itself was refused (NOT_FOUND for an unknown container,
+    /// FAILED_PRECONDITION when it is not running, PERMISSION_DENIED by policy).
+    ///
+    /// What a caller may do is the sandbox profile's exec policy: exec must be
+    /// enabled, and every call acts as `user` ("" = the image user; otherwise
+    /// one of profile exec.users), with that user's permissions, resolved as an
+    /// exec's are. Files it creates are that user's. Writes are in the tenant's
+    /// quota: past it they fail with ENOSPC, as the container's own writes do
+    /// (XFS project quotas report ENOSPC, not EDQUOT).
+    #[derive(Debug)]
+    pub struct FilesServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> FilesServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for FilesServer<T>
+    where
+        T: Files,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/tenantd.v1.Files/Stat" => {
+                    #[allow(non_camel_case_types)]
+                    struct StatSvc<T: Files>(pub Arc<T>);
+                    impl<T: Files> tonic::server::UnaryService<super::FileStatRequest>
+                    for StatSvc<T> {
+                        type Response = super::FileStatResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileStatRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::stat(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StatSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/ReadDir" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadDirSvc<T: Files>(pub Arc<T>);
+                    impl<T: Files> tonic::server::UnaryService<super::FileReadDirRequest>
+                    for ReadDirSvc<T> {
+                        type Response = super::FileReadDirResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileReadDirRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::read_dir(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadDirSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/Read" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadSvc<T: Files>(pub Arc<T>);
+                    impl<
+                        T: Files,
+                    > tonic::server::ServerStreamingService<super::FileReadRequest>
+                    for ReadSvc<T> {
+                        type Response = super::FileReadResponse;
+                        type ResponseStream = T::ReadStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileReadRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::read(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/Write" => {
+                    #[allow(non_camel_case_types)]
+                    struct WriteSvc<T: Files>(pub Arc<T>);
+                    impl<
+                        T: Files,
+                    > tonic::server::ClientStreamingService<super::FileWriteRequest>
+                    for WriteSvc<T> {
+                        type Response = super::FileWriteResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::FileWriteRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::write(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WriteSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/Rename" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenameSvc<T: Files>(pub Arc<T>);
+                    impl<T: Files> tonic::server::UnaryService<super::FileRenameRequest>
+                    for RenameSvc<T> {
+                        type Response = super::FileRenameResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileRenameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::rename(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RenameSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/Remove" => {
+                    #[allow(non_camel_case_types)]
+                    struct RemoveSvc<T: Files>(pub Arc<T>);
+                    impl<T: Files> tonic::server::UnaryService<super::FileRemoveRequest>
+                    for RemoveSvc<T> {
+                        type Response = super::FileRemoveResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileRemoveRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::remove(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RemoveSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for FilesServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "tenantd.v1.Files";
+    impl<T> tonic::server::NamedService for FilesServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

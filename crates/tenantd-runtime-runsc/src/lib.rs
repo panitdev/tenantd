@@ -23,17 +23,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use tenantd_core::backend::{
-    BindMount, NetAttachment, ProcInfo, RootfsSpec, RuntimeBackend, RuntimeEvent, RuntimeHandle,
-    RuntimeState,
+    BindMount, ContainerRun, NetAttachment, PipedProcess, ProcInfo, RootfsSpec, RuntimeBackend,
+    RuntimeEvent, RuntimeHandle, RuntimeState,
 };
 use tenantd_core::config::{RuntimeConfig, RuntimeKind};
 use tenantd_core::error::Context;
 use tenantd_core::model::{NetworkMode, ProcessIo, ResolvedProcess, ResolvedSandbox, Signal};
-use tenantd_core::{ContainerKey, Error, Result};
+use tenantd_core::{Error, Result};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -51,8 +52,13 @@ const START_FLAGS: &str = "runsc.flags";
 /// The raw exit code of a `runsc exec` child, once it exits.
 type ExecExit = oneshot::Receiver<Option<i32>>;
 
+/// The most of a piped process's stderr kept for its error.
+const PIPED_STDERR_MAX: usize = 4 << 10;
+
 pub struct RunscRuntime {
     cfg: RuntimeConfig,
+    /// tenantd's own binary, bound into every container as the file helper.
+    helper: Option<PathBuf>,
     watched: Arc<Mutex<HashSet<String>>>,
     watched_processes: Arc<Mutex<HashSet<(String, u32)>>>,
     /// Exit codes of the `runsc exec` children, until `watch_process`
@@ -147,8 +153,12 @@ fn version_key(v: &str) -> Vec<u64> {
 impl RunscRuntime {
     pub fn new(cfg: RuntimeConfig) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        // Looked up now: once a package upgrade replaces the binary, the
+        // running one's path reads "... (deleted)".
+        let helper = std::env::current_exe().ok();
         Self {
             cfg,
+            helper,
             watched: Arc::default(),
             watched_processes: Arc::default(),
             exec_children: Arc::default(),
@@ -274,6 +284,7 @@ impl RunscRuntime {
         bundle: &Path,
         oci: &oci_spec::runtime::Spec,
         root: &RootfsSpec,
+        extra_flags: &[String],
     ) -> Result<()> {
         let id = h.0.as_str();
         let json = serde_json::to_vec_pretty(oci).context("encoding config.json")?;
@@ -288,10 +299,11 @@ impl RunscRuntime {
         // root, and without them it uses runsc's default overlay, a
         // filestore in the upper dir that the host never sees. Kept in the
         // bundle so a start after a daemon restart still has them.
-        let runtime_flags = [
+        let mut runtime_flags = vec![
             format!("--overlay2={}", spec::overlay_flag(root)),
             "--network=sandbox".to_string(),
         ];
+        runtime_flags.extend(extra_flags.iter().cloned());
         tokio::fs::write(bundle.join(START_FLAGS), runtime_flags.join("\n")).await?;
         let mut flags: Vec<OsString> = runtime_flags.iter().map(OsString::from).collect();
         flags.push(flag_path("--log=", &runsc_log));
@@ -346,6 +358,13 @@ impl RuntimeBackend for RunscRuntime {
         RuntimeKind::RunscDirect
     }
 
+    fn runtime_mounts(&self, s: &ResolvedSandbox) -> Vec<String> {
+        spec::runtime_mounts(s)
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
     async fn verify(&self) -> Result<()> {
         let out = tokio::process::Command::new(&self.cfg.runsc)
             .arg("--version")
@@ -397,7 +416,7 @@ impl RuntimeBackend for RunscRuntime {
         let bundle = self.make_bundle(&h)?;
         let files = self.write_bundle_files(s, &bundle).await?;
         let oci = spec::build(s, root, net, &files)?;
-        self.create_from(&h, &bundle, &oci, root).await?;
+        self.create_from(&h, &bundle, &oci, root, &[]).await?;
         info!(sandbox = h.0, "runsc container created");
         Ok(h)
     }
@@ -405,18 +424,34 @@ impl RuntimeBackend for RunscRuntime {
     async fn create_container(
         &self,
         s: &ResolvedSandbox,
-        c: &ContainerKey,
-        args: &[String],
-        root: &RootfsSpec,
-        mounts: &[BindMount],
+        c: &ContainerRun<'_>,
         net: &NetAttachment,
     ) -> Result<RuntimeHandle> {
-        let h = RuntimeHandle::for_container(c);
+        let h = RuntimeHandle::for_container(c.key);
         let sandbox = RuntimeHandle::for_key(&s.key);
         let bundle = self.make_bundle(&h)?;
         let files = self.write_bundle_files(s, &bundle).await?;
-        let oci = spec::build_container(s, &sandbox.0, args, root, mounts, net, &files)?;
-        self.create_from(&h, &bundle, &oci, root).await?;
+        let helper = self
+            .helper
+            .clone()
+            .ok_or_else(|| Error::Internal("can't find tenantd's own binary".into()))?;
+        let mut mounts = c.mounts.to_vec();
+        mounts.push(BindMount {
+            source: helper,
+            destination: tenantd_core::files::HELPER_PATH.into(),
+            read_only: true,
+        });
+        let oci = spec::build_container(s, &sandbox.0, c.args, c.root, &mounts, net, &files)?;
+        let mut extra = Vec::new();
+        // The Files service changes this root from the host. runsc's default
+        // for a root, `exclusive`, trusts its own cache and would keep
+        // serving a replaced file's old inode; `shared` revalidates each
+        // lookup, at a cost to every file operation in the container. A
+        // read-only root never changes.
+        if c.host_file_access && matches!(c.root, RootfsSpec::Path(_)) {
+            extra.push("--file-access=shared".to_string());
+        }
+        self.create_from(&h, &bundle, &oci, c.root, &extra).await?;
         info!(container = h.0, "runsc container created in its sandbox");
         Ok(h)
     }
@@ -712,6 +747,69 @@ impl RuntimeBackend for RunscRuntime {
             .into_iter()
             .map(|pid| ProcInfo { pid })
             .collect())
+    }
+
+    async fn exec_piped(&self, h: &RuntimeHandle, p: &ResolvedProcess) -> Result<PipedProcess> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        use tokio::io::AsyncReadExt;
+
+        let id = h.0.clone();
+        let process = spec::exec_process(p)?;
+        let json = serde_json::to_vec_pretty(&process).context("encoding process.json")?;
+        // One file per distinct process (a user's calls share one), in the
+        // bundle, which goes with the container.
+        let mut hasher = DefaultHasher::new();
+        json.hash(&mut hasher);
+        let path = self
+            .bundle_dir(&id)
+            .join(format!("piped-{:016x}.json", hasher.finish()));
+        if !tokio::fs::try_exists(&path).await? {
+            let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+            tokio::fs::write(&tmp, &json).await?;
+            tokio::fs::rename(&tmp, &path).await?;
+        }
+        let mut child = self
+            .command(&[], &["exec", "--process", &path.to_string_lossy(), &id])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running runsc exec")?;
+        let (Some(stdin), Some(stdout), Some(mut stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            return Err(Error::Internal("runsc exec without its pipes".into()));
+        };
+        let exit = async move {
+            // Read to the end, so a chatty failure can't block on a full
+            // pipe, keeping the tail.
+            let mut tail = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stderr.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > PIPED_STDERR_MAX {
+                    tail.drain(..tail.len() - PIPED_STDERR_MAX);
+                }
+            }
+            let status = child.wait().await.context("waiting for runsc exec")?;
+            if status.success() {
+                return Ok(());
+            }
+            Err(Error::Internal(format!(
+                "{} in {id} failed ({status}): {}",
+                tenantd_core::files::HELPER_PATH,
+                String::from_utf8_lossy(&tail).trim()
+            )))
+        }
+        .boxed();
+        Ok(PipedProcess {
+            stdin: Box::pin(stdin),
+            stdout: Box::pin(stdout),
+            exit,
+        })
     }
 }
 

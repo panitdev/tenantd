@@ -14,6 +14,7 @@
 //! The crate also holds the other host directories tenantd manages:
 //! volumes ([`HostVolumes`]) and containers' FUSE mounts ([`HostFuse`]).
 
+pub mod files;
 mod fuse;
 mod mount;
 mod volume;
@@ -215,6 +216,27 @@ async fn readonly_view(cache: PathBuf, layers: Vec<PathBuf>, dir: PathBuf) -> Re
     .await
 }
 
+/// Container `c`'s `rootfs/`, which must be a mount root: a plain
+/// directory there means the root isn't mounted, and writes to it would
+/// never reach the container.
+async fn mounted_root(
+    s: &SandboxId,
+    c: &ContainerId,
+    tenant_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    let root = container_dir(tenant_dir, s, c).join("rootfs");
+    blocking(move || {
+        if !files::is_mount_root(&root).context(format!("checking {}", root.display()))? {
+            return Err(Error::FailedPrecondition(format!(
+                "container root {} is not mounted",
+                root.display()
+            )));
+        }
+        Ok(Some(root))
+    })
+    .await
+}
+
 async fn teardown_container(s: &SandboxId, c: &ContainerId, tenant_dir: &Path) -> Result<()> {
     let dir = container_dir(tenant_dir, s, c);
     blocking(move || teardown_dir(&dir)).await
@@ -244,6 +266,7 @@ impl WritableLayer for HostOverlay {
             reclaim: Reclaim::Immediate,
             survives_stop: true,
             needs_size_cap: false,
+            host_root: true,
             runtimes: RUNSC,
         }
     }
@@ -273,6 +296,15 @@ impl WritableLayer for HostOverlay {
     ) -> Result<RootfsSpec> {
         let dir = container_dir(tenant_dir, &s.key.sandbox, c);
         host_overlay(self.image_cache.clone(), s.image.layers.clone(), dir).await
+    }
+
+    async fn container_files_root(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<Option<PathBuf>> {
+        mounted_root(s, c, tenant_dir).await
     }
 
     async fn teardown_container(
@@ -309,6 +341,7 @@ impl WritableLayer for MemoryLayer {
             reclaim: Reclaim::Immediate,
             survives_stop: false,
             needs_size_cap: false,
+            host_root: false,
             runtimes: RUNSC,
         }
     }
@@ -342,6 +375,16 @@ impl WritableLayer for MemoryLayer {
         readonly_view(self.image_cache.clone(), s.image.layers.clone(), dir)
             .await
             .map(RootfsSpec::Memory)
+    }
+
+    async fn container_files_root(
+        &self,
+        _s: &SandboxId,
+        _c: &ContainerId,
+        _tenant_dir: &Path,
+    ) -> Result<Option<PathBuf>> {
+        // The view on the host is the image; runsc keeps the writes.
+        Ok(None)
     }
 
     async fn teardown_container(
@@ -378,6 +421,7 @@ impl WritableLayer for ReadOnlyLayer {
             reclaim: Reclaim::Immediate,
             survives_stop: false,
             needs_size_cap: false,
+            host_root: true,
             runtimes: RUNSC,
         }
     }
@@ -411,6 +455,15 @@ impl WritableLayer for ReadOnlyLayer {
         readonly_view(self.image_cache.clone(), s.image.layers.clone(), dir)
             .await
             .map(RootfsSpec::ReadOnly)
+    }
+
+    async fn container_files_root(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<Option<PathBuf>> {
+        mounted_root(s, c, tenant_dir).await
     }
 
     async fn teardown_container(

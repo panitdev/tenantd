@@ -158,6 +158,9 @@ pub struct FakeLayer {
     pub dirs: Arc<Mutex<HashMap<(PathBuf, SandboxId), bool>>>,
     /// Container roots, (tenant dir, sandbox, container).
     pub container_dirs: Arc<Mutex<HashSet<(PathBuf, SandboxId, ContainerId)>>>,
+    /// Where container roots are real directories, for file access; unset,
+    /// they are only paths under the fake storage root.
+    pub files_dir: Arc<Mutex<Option<PathBuf>>>,
     pub faults: Arc<Faults>,
 }
 
@@ -177,6 +180,7 @@ impl WritableLayer for FakeLayer {
             reclaim: Reclaim::Immediate,
             survives_stop: self.survives_stop,
             needs_size_cap: false,
+            host_root: self.kind != LayerKind::Memory,
             runtimes: &[RuntimeKind::RunscDirect],
         }
     }
@@ -241,6 +245,38 @@ impl WritableLayer for FakeLayer {
         })
     }
 
+    async fn container_files_root(
+        &self,
+        s: &SandboxId,
+        c: &ContainerId,
+        tenant_dir: &Path,
+    ) -> Result<Option<PathBuf>> {
+        self.faults.check("layer.container_files_root")?;
+        if self.kind == LayerKind::Memory {
+            return Ok(None);
+        }
+        let key = (tenant_dir.to_path_buf(), s.clone(), c.clone());
+        if !self.container_dirs.lock().unwrap().contains(&key) {
+            return Err(Error::FailedPrecondition(format!(
+                "container root of {s}.{c} is not mounted"
+            )));
+        }
+        let base = self.files_dir.lock().unwrap().clone();
+        Ok(Some(match base {
+            Some(b) => {
+                let root = b.join(s.as_str()).join(c.as_str());
+                std::fs::create_dir_all(&root)?;
+                root
+            }
+            None => tenant_dir
+                .join("sandboxes")
+                .join(s.as_str())
+                .join("containers")
+                .join(c.as_str())
+                .join("rootfs"),
+        }))
+    }
+
     async fn teardown_container(
         &self,
         s: &SandboxId,
@@ -271,6 +307,11 @@ impl WritableLayer for FakeLayer {
 /// A container the runtime was asked to create: key, init, root, binds.
 pub type CreatedContainer = (ContainerKey, Vec<String>, RootfsSpec, Vec<BindMount>);
 
+/// Stands in for the file helper exec'd in a container; see
+/// [`FakeRuntime::helper`].
+pub type HelperFn =
+    Arc<dyn Fn(&RuntimeHandle, &ResolvedProcess) -> Result<PipedProcess> + Send + Sync>;
+
 pub struct FakeRuntime {
     pub containers: Mutex<HashMap<RuntimeHandle, RuntimeState>>,
     pub watched: Mutex<HashSet<RuntimeHandle>>,
@@ -287,6 +328,12 @@ pub struct FakeRuntime {
     pub signals: Mutex<Vec<(RuntimeHandle, u32, Signal)>>,
     /// PID files written by exec, as runsc's `--internal-pid-file` would.
     pub pid_files: Mutex<HashMap<PathBuf, u32>>,
+    /// Containers created with host file access.
+    pub host_file_access: Mutex<HashSet<ContainerKey>>,
+    /// What `exec_piped` runs; unset, it fails.
+    pub helper: Mutex<Option<HelperFn>>,
+    /// What each `exec_piped` was asked to run.
+    pub piped: Mutex<Vec<ResolvedProcess>>,
     next_pid: AtomicU32,
     tx: mpsc::UnboundedSender<RuntimeEvent>,
     rx: Mutex<Option<mpsc::UnboundedReceiver<RuntimeEvent>>>,
@@ -307,6 +354,9 @@ impl FakeRuntime {
             execs: Mutex::default(),
             signals: Mutex::default(),
             pid_files: Mutex::default(),
+            host_file_access: Mutex::default(),
+            helper: Mutex::default(),
+            piped: Mutex::default(),
             next_pid: AtomicU32::new(100),
             tx,
             rx: Mutex::new(Some(rx)),
@@ -436,6 +486,10 @@ impl RuntimeBackend for FakeRuntime {
         RuntimeKind::RunscDirect
     }
 
+    fn runtime_mounts(&self, _s: &ResolvedSandbox) -> Vec<String> {
+        vec!["/proc".into(), "/dev".into()]
+    }
+
     async fn verify(&self) -> Result<()> {
         if self.verified.load(Ordering::SeqCst) {
             Ok(())
@@ -467,13 +521,17 @@ impl RuntimeBackend for FakeRuntime {
     async fn create_container(
         &self,
         s: &ResolvedSandbox,
-        c: &ContainerKey,
-        args: &[String],
-        root: &RootfsSpec,
-        mounts: &[BindMount],
+        run: &ContainerRun<'_>,
         _net: &NetAttachment,
     ) -> Result<RuntimeHandle> {
         self.faults.check("runtime.create_container")?;
+        let ContainerRun {
+            key: c,
+            args,
+            root,
+            mounts,
+            host_file_access,
+        } = *run;
         let sandbox = RuntimeHandle::for_key(&s.key);
         let h = RuntimeHandle::for_container(c);
         let mut m = self.containers.lock().unwrap();
@@ -487,6 +545,9 @@ impl RuntimeBackend for FakeRuntime {
             return Err(Error::AlreadyExists(h.0));
         }
         m.insert(h.clone(), RuntimeState::Created);
+        if host_file_access {
+            self.host_file_access.lock().unwrap().insert(c.clone());
+        }
         self.created_containers.lock().unwrap().push((
             c.clone(),
             args.to_vec(),
@@ -610,6 +671,19 @@ impl RuntimeBackend for FakeRuntime {
             .filter(|(c, _)| c == h)
             .map(|&(_, pid)| ProcInfo { pid })
             .collect())
+    }
+
+    async fn exec_piped(&self, h: &RuntimeHandle, p: &ResolvedProcess) -> Result<PipedProcess> {
+        self.faults.check("runtime.exec_piped")?;
+        if self.containers.lock().unwrap().get(h) != Some(&RuntimeState::Running) {
+            return Err(Error::FailedPrecondition(format!("{} is not running", h.0)));
+        }
+        self.piped.lock().unwrap().push(p.clone());
+        let helper = self.helper.lock().unwrap().clone();
+        match helper {
+            Some(f) => f(h, p),
+            None => Err(Error::Unavailable("no file helper in the fake".into())),
+        }
     }
 }
 
@@ -1142,6 +1216,8 @@ pub struct Host {
     pub storage: Arc<FakeStorage>,
     pub layer_dirs: Arc<Mutex<HashMap<(PathBuf, SandboxId), bool>>>,
     pub container_dirs: Arc<Mutex<HashSet<(PathBuf, SandboxId, ContainerId)>>>,
+    /// See [`FakeLayer::files_dir`].
+    pub files_dir: Arc<Mutex<Option<PathBuf>>>,
     pub runtime: Arc<FakeRuntime>,
     pub images: Arc<FakeImages>,
     pub network: Arc<FakeNetwork>,
@@ -1165,6 +1241,7 @@ impl Host {
             }),
             layer_dirs: Arc::default(),
             container_dirs: Arc::default(),
+            files_dir: Arc::default(),
             runtime: Arc::new(FakeRuntime::new(faults.clone())),
             images: Arc::new(FakeImages {
                 faults: faults.clone(),
@@ -1198,6 +1275,7 @@ impl Host {
                 survives_stop,
                 dirs: self.layer_dirs.clone(),
                 container_dirs: self.container_dirs.clone(),
+                files_dir: self.files_dir.clone(),
                 faults: self.faults.clone(),
             })
         };

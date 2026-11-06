@@ -2,6 +2,7 @@
 # Boot a distro cloud image in KVM and run the real install path against it:
 #   install package -> XFS data disk -> enable + start -> tenant + sandbox ->
 #   restart tenantd (sandbox must survive) -> processes -> containers ->
+#   files ->
 #   volumes and FUSE ->
 #   reboot (reconcile) -> upgrade from the previous release (if one was
 #   downloaded).
@@ -58,10 +59,11 @@ common=(-i "$work/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/nu
 # Each one gets VM_TIMEOUT seconds: a hung step fails here, with pcheck's
 # diagnostics, instead of eating the job's timeout and showing "cancelled".
 vm() {
-  local rc=0
+  local rc=0 start=$SECONDS
   timeout "${VM_TIMEOUT:-300}" ssh "${common[@]}" -p 2222 ci@127.0.0.1 \
     'sudo bash -euxo pipefail' <<<"$*" || rc=$?
-  if [ "$rc" = 124 ]; then
+  # 124 is also what a command inside can exit with (process wait does).
+  if [ "$rc" = 124 ] && [ $((SECONDS - start)) -ge "${VM_TIMEOUT:-300}" ]; then
     echo "vm: timed out after ${VM_TIMEOUT:-300}s: $*" >&2
   fi
   return "$rc"
@@ -232,6 +234,96 @@ pcheck 'tenantd container create t1 s1 c1 -- sleep infinity
 pcheck 'tenantd container rm t1 s1 c2
         ! test -e /data/tenants/t1/sandboxes/s1/containers/c2
         tenantd container get t1 s1 c1 | grep -q " running"'
+
+# --- Files: the container's files over the API, seen at once inside -----
+# c1 has the default: each call execs tenantd's helper inside, and runsc
+# keeps its own file-access default. c3 opted into host access, the only one
+# with --file-access=shared.
+bundles=/var/lib/tenantd/runtime/bundles
+pcheck 'tenantd container create --host-file-access t1 s1 c3 -- sleep infinity
+        tenantd container get t1 s1 c3 | grep -q host-file-access
+        grep -qx -- --file-access=shared '"$bundles"'/t1.s1.c3+/runsc.flags
+        ! grep -q -- --file-access '"$bundles"'/t1.s1.c1+/runsc.flags
+        tenantd exec --container c1 t1 s1 -- test -x /dev/.tenantd-files'
+# Bigger than output_limit (4k) both ways.
+for c in c1 c3; do
+pcheck 'head -c 1000000 /dev/urandom > /tmp/big
+        tenantd file put --parents t1 s1 '$c' /in/big < /tmp/big
+        tenantd file cat t1 s1 '$c' /in/big | cmp - /tmp/big
+        test "$(tenantd exec --container '$c' t1 s1 -- sha256sum /in/big | cut -d" " -f1)" = \
+             "$(sha256sum /tmp/big | cut -d" " -f1)"
+        tenantd exec --container '$c' t1 s1 -- sh -c "head -c 100000 /dev/zero > /in/out"
+        test "$(tenantd file cat t1 s1 '$c' /in/out | wc -c)" = 100000
+        tenantd file stat t1 s1 '$c' /in/big | grep -q " 1000000 0:0 /in/big"
+        tenantd file ls t1 s1 '$c' /in | grep -q " out$"'
+# A process inside keeps reading the file while it is replaced from outside.
+pcheck 'echo first | tenantd file put t1 s1 '$c' /w/f --parents
+        tenantd exec -d --id watcher-'$c' --container '$c' t1 s1 -- \
+          sh -c "until grep -qx second /w/f; do sleep 0.1; done"
+        sleep 1
+        tenantd process get t1 s1 watcher-'$c' | grep -q running
+        echo second | tenantd file put t1 s1 '$c' /w/f
+        tenantd process wait t1 s1 watcher-'$c' --timeout 10'
+# /tmp is runsc'"'"'s tmpfs over the image'"'"'s empty /tmp: the host never sees
+# it, so host access serves it through the helper too.
+pcheck 'echo x | tenantd file put t1 s1 '$c' /tmp/x
+        test "$(tenantd exec --container '$c' t1 s1 -- cat /tmp/x)" = x
+        ! test -e /data/tenants/t1/sandboxes/s1/containers/'$c'/upper/tmp/x'
+done
+# Renames across directories show inside, and so does a removal.
+pcheck 'tenantd file put --parents t1 s1 c1 /other/keep </dev/null
+        tenantd file mv t1 s1 c1 /w/f /other/f
+        test "$(tenantd exec --container c1 t1 s1 -- cat /other/f)" = second
+        ! tenantd exec --container c1 t1 s1 -- test -e /w/f
+        ! tenantd file mv --no-replace t1 s1 c1 /other/f /other/keep
+        tenantd file rm t1 s1 c1 /other/keep
+        ! tenantd exec --container c1 t1 s1 -- test -e /other/keep
+        ! tenantd file rm --dir t1 s1 c1 /other'
+# An absolute symlink resolves in the container (alpine has a redis user,
+# the host does not), and a put through a symlink replaces its target.
+for c in c1 c3; do
+pcheck 'tenantd exec --container '$c' t1 s1 -- ln -s /etc/passwd /w/pw
+        tenantd file cat t1 s1 '$c' /w/pw | grep -q ^redis:
+        ! grep -q ^redis: /etc/passwd
+        tenantd file stat -L t1 s1 '$c' /w/pw | grep -q " /etc/passwd$"
+        tenantd exec --container '$c' t1 s1 -- ln -s /w/f /w/link
+        echo via-link | tenantd file put t1 s1 '$c' /w/link
+        test "$(tenantd exec --container '$c' t1 s1 -- cat /w/f)" = via-link
+        tenantd exec --container '$c' t1 s1 -- test -L /w/link'
+done
+# A put killed mid-body leaves the file as it was, and no temporary file.
+pcheck '(echo partial; sleep 30) | timeout -s KILL 3 tenantd file put t1 s1 c1 /other/f || true
+        sleep 1
+        test "$(tenantd file cat t1 s1 c1 /other/f)" = second
+        ! ls -a /data/tenants/t1/sandboxes/s1/containers/c1/upper/other | grep -q tenantd-write'
+# Past the tenant quota (256Mi): ENOSPC (an XFS project quota's errno, as the
+# container's own writes get), the target untouched, space back.
+pcheck 'rc=0
+        head -c 300M /dev/zero | tenantd file put t1 s1 c1 /huge 2>/tmp/q || rc=$?
+        cat /tmp/q
+        test $rc != 0 && grep -q "os error 28" /tmp/q  # ENOSPC
+        ! tenantd file stat t1 s1 c1 /huge
+        ! ls -a /data/tenants/t1/sandboxes/s1/containers/c1/upper | grep -q tenantd-write'
+# As another user of exec.users: its permissions, its files.
+vm 'sed -i "s/^output_limit = \"4k\"\$/&\nusers = [\"image\", \"redis\"]/" /etc/tenantd/tenantd.toml'
+vm tenantd config check
+vm systemctl reload tenantd
+for c in c1 c3; do
+pcheck 'for _ in $(seq 10); do
+          if echo r | tenantd file put --user redis t1 s1 '$c' /data/r; then break; fi
+          sleep 1
+        done
+        test "$(tenantd exec --container '$c' t1 s1 -- stat -c %U /data/r)" = redis
+        ! echo x | tenantd file put --user redis t1 s1 '$c' /etc/nope
+        ! tenantd file stat t1 s1 '$c' /etc/nope'
+done
+# A rough cost per call either way, for the log.
+vm 'for c in c1 c3; do
+      s=$(date +%s%N)
+      for _ in $(seq 20); do tenantd file stat t1 s1 $c / >/dev/null; done
+      echo "file stat on $c: $(( ($(date +%s%N) - s) / 20000000 ))ms per call"
+    done'
+pcheck 'tenantd container rm t1 s1 c3'
 
 # --- Volumes and FUSE: a workspace shared by containers and the host, and a
 # FUSE mount served from the host through ServeFuse ------------------------

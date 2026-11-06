@@ -55,7 +55,7 @@ pub struct Api {
 }
 
 impl Api {
-    async fn timed<T, F>(&self, op: &'static str, f: F) -> Result<Response<T>, Status>
+    pub(crate) async fn timed<T, F>(&self, op: &'static str, f: F) -> Result<Response<T>, Status>
     where
         F: Future<Output = tenantd_core::Result<T>>,
     {
@@ -85,7 +85,7 @@ fn process_key(t: &str, s: &str, p: &str) -> tenantd_core::Result<ProcessKey> {
     ))
 }
 
-fn container_key(t: &str, s: &str, c: &str) -> tenantd_core::Result<ContainerKey> {
+pub(crate) fn container_key(t: &str, s: &str, c: &str) -> tenantd_core::Result<ContainerKey> {
     Ok(ContainerKey::new(
         SandboxKey::new(tenant_id(t)?, sandbox_id(s)?),
         ContainerId::new(c)?,
@@ -113,6 +113,7 @@ fn pb_container(r: ContainerRecord) -> pb::Container {
             })
             .collect(),
         fuse_path: r.fuse.unwrap_or_default(),
+        host_file_access: r.host_file_access,
     }
 }
 
@@ -519,6 +520,7 @@ impl Containers for Api {
                     .map(|(slot, v)| Ok((SlotName::new(slot)?, VolumeId::new(v)?)))
                     .collect::<tenantd_core::Result<_>>()?,
                 fuse: r.fuse,
+                host_file_access: r.host_file_access,
             };
             Ok(pb_container(
                 self.tenantd.create_container(key, spec).await?,

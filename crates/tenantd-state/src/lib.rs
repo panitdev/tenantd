@@ -98,6 +98,8 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE containers ADD COLUMN volumes TEXT NOT NULL DEFAULT '[]';
     ALTER TABLE containers ADD COLUMN fuse TEXT;",
+    // 5
+    "ALTER TABLE containers ADD COLUMN host_file_access INTEGER NOT NULL DEFAULT 0;",
 ];
 
 #[derive(Clone)]
@@ -252,8 +254,8 @@ fn process_row(r: &Row) -> rusqlite::Result<ProcessRecord> {
     })
 }
 
-const CONTAINER_COLS: &str =
-    "tenant_id, sandbox_id, id, args, state, exit_code, created_at, updated_at, volumes, fuse";
+const CONTAINER_COLS: &str = "tenant_id, sandbox_id, id, args, state, exit_code, created_at, updated_at, volumes, fuse, \
+     host_file_access";
 
 fn container_row(r: &Row) -> rusqlite::Result<ContainerRecord> {
     let state: ContainerState =
@@ -269,6 +271,7 @@ fn container_row(r: &Row) -> rusqlite::Result<ContainerRecord> {
         updated_at: r.get(7)?,
         volumes: decode(&r.get::<_, String>(8)?)?,
         fuse: r.get(9)?,
+        host_file_access: r.get(10)?,
     })
 }
 
@@ -561,7 +564,7 @@ impl StateStore for SqliteState {
             c.execute(
                 &format!(
                     "INSERT INTO containers ({CONTAINER_COLS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
                 ),
                 params![
                     rec.tenant.as_str(),
@@ -573,7 +576,8 @@ impl StateStore for SqliteState {
                     rec.created_at,
                     rec.updated_at,
                     volumes,
-                    rec.fuse
+                    rec.fuse,
+                    rec.host_file_access
                 ],
             )
             .map_err(|e| {
@@ -1169,6 +1173,7 @@ mod tests {
                 read_only: false,
             }],
             fuse: Some("/mnt".into()),
+            host_file_access: true,
             state: ContainerState::Creating,
             exit_code: None,
             created_at: 1,

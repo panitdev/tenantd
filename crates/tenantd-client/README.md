@@ -23,6 +23,10 @@ let tls = ClientTls::from_pem_files("ca.pem", "client.pem", "client.key")?;
 let ch = tenantd_client::tls::connect("tenantd-1.internal:7443", None, &tls).await?;
 ```
 
+`tenantd_client::files` wraps the `Files` service: read, write (from bytes
+or an `AsyncRead`), stat, list, rename and remove files in a running
+container's root, with filesystem errors as errno values.
+
 The client and daemon share one version; use the client release that matches
 your tenantd.
 

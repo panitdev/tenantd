@@ -96,6 +96,8 @@ tenantd exec -d --id build1 acme box1 -- make   # detached
 tenantd container create acme box1 s1 -- sleep infinity  # own root, same sandbox
 tenantd exec --container s1 acme box1 -- make test
 tenantd process logs acme box1 build1 -f
+tenantd file put --parents acme box1 s1 /work/input.json < input.json
+tenantd file cat acme box1 s1 /work/result.json
 
 tenantd volume create acme ws --uid 1000 --gid 1000 --mode 1777
 tenantd container create acme box1 s2 --volume workspace=ws -- sleep infinity
@@ -160,6 +162,20 @@ the `tls` feature of `tenantd-client` and use `tenantd_client::tls::connect`.
   sandbox's gVisor kernel, network and limits, so many of them cost one
   sandbox. runsc adds them to the running sandbox; they are never
   restarted, and stopping the sandbox ends them.
+- **Files.** Callers read and write a running container's files through
+  the `Files` service (stat, list, read, write, rename, remove) rather than
+  by exec'ing a binary from the image and parsing its output. By default
+  each call execs tenantd's own small helper in the container (tenantd's
+  binary, bound read-only at `/dev/.tenantd-files` in every container), as
+  the image user or another of the profile's `exec.users`. So it sees just
+  what the container sees, `/tmp`, volumes and FUSE included, on any
+  layer, and costs one `runsc exec` per call. A container created with
+  `--host-file-access` is served from the host instead (`openat2` with
+  `RESOLVE_IN_ROOT`, so symlinks and `..` still mean what they mean to the
+  container), much faster per call. The price is runsc's
+  `--file-access=shared` for that container, which revalidates every file
+  lookup in it. A write goes to a temporary file that replaces the target
+  only once the whole body has arrived. It needs the profile's exec rights.
 - **Volumes.** A volume is a directory in the tenant's project, so it
   counts against the same quota, and the only state that outlives a
   container. A container mounts volumes only through the slots its profile

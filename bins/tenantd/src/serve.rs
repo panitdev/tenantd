@@ -12,9 +12,9 @@ use anyhow::{Context, bail};
 use clap::Args;
 use futures::Stream;
 use tenantd_client::pb::{
-    containers_server::ContainersServer, processes_server::ProcessesServer,
-    sandboxes_server::SandboxesServer, system_server::SystemServer, tenants_server::TenantsServer,
-    volumes_server::VolumesServer,
+    containers_server::ContainersServer, files_server::FilesServer,
+    processes_server::ProcessesServer, sandboxes_server::SandboxesServer,
+    system_server::SystemServer, tenants_server::TenantsServer, volumes_server::VolumesServer,
 };
 use tenantd_core::config::{Config, RuntimeKind, StorageKind};
 use tenantd_core::state::StateStore;
@@ -191,6 +191,7 @@ async fn serve_api(
         .add_service(ContainersServer::new(api.clone()))
         .add_service(VolumesServer::new(api.clone()))
         .add_service(ProcessesServer::new(api.clone()))
+        .add_service(FilesServer::new(api.clone()))
         .add_service(SystemServer::new(api))
         .serve_with_incoming_shutdown(authorized(l, allowed, net), shutdown)
         .await?;
@@ -355,6 +356,307 @@ mod tests {
     fn me() -> u32 {
         // SAFETY: no preconditions.
         unsafe { libc::geteuid() }
+    }
+
+    /// Serve `exec_piped` with the real helper on the container's fake root.
+    fn fake_helper(host: &Host, roots: PathBuf) {
+        use tenantd_core::backend::PipedProcess;
+        use tokio::net::unix::pipe;
+        let f: tenantd_testkit::HelperFn = Arc::new(move |h, _p| {
+            let c = h.container().expect("a container");
+            let root = roots.join(c.sandbox.as_str()).join(c.id.as_str());
+            let (in_r, in_w) = std::io::pipe().unwrap();
+            let (out_r, out_w) = std::io::pipe().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                std::fs::create_dir_all(&root).unwrap();
+                let root = tenantd_layer::files::Root::open(
+                    &root,
+                    tenantd_layer::files::Ident::current(),
+                    &[],
+                )
+                .unwrap();
+                let mut input = std::io::BufReader::new(in_r);
+                let mut output = std::io::BufWriter::new(out_w);
+                let r = crate::files_helper::serve(&root, &mut input, &mut output)
+                    .and_then(|_| std::io::Write::flush(&mut output));
+                let _ = tx.send(r.map_err(|e| e.to_string()));
+            });
+            Ok(PipedProcess {
+                stdin: Box::pin(pipe::Sender::from_owned_fd(in_w.into()).unwrap()),
+                stdout: Box::pin(pipe::Receiver::from_owned_fd(out_r.into()).unwrap()),
+                exit: Box::pin(async move {
+                    match rx.await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(tenantd_core::Error::Internal(e)),
+                        Err(_) => Err(tenantd_core::Error::Internal("helper panicked".into())),
+                    }
+                }),
+            })
+        });
+        *host.runtime.helper.lock().unwrap() = Some(f);
+    }
+
+    /// Every Files call on container `id` of acme.box, whose root is `root`.
+    async fn exercise_files(ch: &tonic::transport::Channel, id: &str, user: &str, root: &Path) {
+        use tenantd_client::files::{self, Files, WriteOptions, errno};
+        let c = pb::ContainerRef {
+            tenant: "acme".into(),
+            sandbox: "box".into(),
+            id: id.into(),
+        };
+        let user = user.to_string();
+        let mut f = Files::new(ch.clone(), c.clone()).as_user(&user);
+
+        // Bigger than a read chunk, a write chunk and the output limit.
+        let body: Vec<u8> = (0..(600u32 << 10)).map(|i| (i % 251) as u8).collect();
+        let opts = WriteOptions {
+            parents: true,
+            ..Default::default()
+        };
+        let a = f.write("/work/big", body.clone(), &opts).await.unwrap();
+        assert_eq!((a.size, a.mode), (body.len() as u64, 0o644));
+        assert_eq!(f.read("/work/big").await.unwrap(), body);
+        let mut r = f.read_range("/work/big", 300 << 10, 1000).await.unwrap();
+        assert_eq!(r.attr().size, body.len() as u64);
+        let (off, chunk) = r.chunk().await.unwrap().unwrap();
+        assert_eq!(
+            (off, &chunk[..]),
+            (300 << 10, &body[300 << 10..(300 << 10) + 1000])
+        );
+        assert!(r.chunk().await.unwrap().is_none());
+
+        // An absolute symlink is the container's view, not the host's.
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/passwd"), "inside\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("work/pw")).unwrap();
+        let st = f.stat("/work/pw", true).await.unwrap();
+        assert_eq!((st.path.as_str(), st.attr.size), ("/etc/passwd", 7));
+        assert_eq!(f.read("/work/pw").await.unwrap(), b"inside\n");
+        let st = f.stat("/work/pw", false).await.unwrap();
+        assert_eq!(st.attr.kind(), pb::FileKind::Symlink);
+        let names: Vec<String> = f
+            .read_dir("/work")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["big", "pw"]);
+
+        // A body that fails midway leaves the target as it was.
+        f.write("/work/small", b"old".to_vec(), &opts)
+            .await
+            .unwrap();
+        struct Broken(bool);
+        impl tokio::io::AsyncRead for Broken {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if std::mem::replace(&mut self.0, true) {
+                    return std::task::Poll::Ready(Err(std::io::Error::other("disk gone")));
+                }
+                buf.put_slice(b"partial");
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let e = f
+            .write_from("/work/small", Broken(false), &opts)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, files::Error::Io(_)), "{e}");
+        f.write_from("/work/streamed", &b"from a reader"[..], &opts)
+            .await
+            .unwrap();
+        assert_eq!(f.read("/work/streamed").await.unwrap(), b"from a reader");
+        let sized = WriteOptions {
+            size: Some(100),
+            ..Default::default()
+        };
+        let e = f
+            .write_from("/work/streamed", &b"cut off"[..], &sized)
+            .await
+            .unwrap_err();
+        assert_eq!(e.errno(), Some(tenantd_client::files::errno::EIO), "{e}");
+        assert_eq!(f.read("/work/streamed").await.unwrap(), b"from a reader");
+        // A body shorter than its declared size is refused too.
+        let mut raw = tenantd_client::FilesClient::new(ch.clone());
+        let msgs = vec![
+            pb::FileWriteRequest {
+                msg: Some(pb::file_write_request::Msg::Header(pb::FileWriteHeader {
+                    container: Some(c.clone()),
+                    path: "/work/small".into(),
+                    size: Some(10),
+                    user: user.clone(),
+                    ..Default::default()
+                })),
+            },
+            pb::FileWriteRequest {
+                msg: Some(pb::file_write_request::Msg::Data(b"short".to_vec())),
+            },
+        ];
+        let r = raw
+            .write(tokio_stream::iter(msgs))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(r.errno, errno::EIO);
+        // The server drops a cancelled write's temporary file a moment later.
+        for _ in 0..100 {
+            let left: Vec<_> = std::fs::read_dir(root.join("work"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|n| n.to_string_lossy().starts_with(".tenantd-write-"))
+                .collect();
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(f.read("/work/small").await.unwrap(), b"old");
+        let names: Vec<String> = f
+            .read_dir("/work")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["big", "pw", "small", "streamed"]);
+
+        let e = f
+            .write(
+                "/work/small",
+                b"x".to_vec(),
+                &WriteOptions {
+                    exclusive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.errno(), Some(errno::EEXIST));
+        f.write("/other/x", b"x".to_vec(), &opts).await.unwrap();
+        f.rename("/work/small", "/other/x", files::RENAME_NOREPLACE)
+            .await
+            .unwrap_err();
+        f.rename("/work/small", "/other/moved", 0).await.unwrap();
+        assert!(
+            f.stat("/work/small", false)
+                .await
+                .unwrap_err()
+                .is_not_found()
+        );
+        assert_eq!(f.read("/other/moved").await.unwrap(), b"old");
+        let e = f.remove_dir("/other").await.unwrap_err();
+        assert_eq!(e.errno(), Some(errno::ENOTEMPTY));
+        f.remove("/other/moved").await.unwrap();
+        f.remove("/other/x").await.unwrap();
+        f.remove_dir("/other").await.unwrap();
+        assert!(f.read_dir("/other").await.unwrap_err().is_not_found());
+        assert_eq!(
+            f.read("/work").await.unwrap_err().errno(),
+            Some(errno::EISDIR)
+        );
+    }
+
+    /// The Files service end to end over the socket, through the client's
+    /// wrappers, on a real directory standing in for the container's root.
+    /// It acts as this test's own user: switching identity needs root.
+    #[tokio::test]
+    async fn files_over_unix_socket() {
+        use tenantd_client::files::{self, Files, WriteOptions};
+
+        let (d, sock, host, tenantd) = start(HashSet::from([me()])).await;
+        *host.files_dir.lock().unwrap() = Some(d.path().join("roots"));
+        // SAFETY: no preconditions.
+        let user = format!("{}:{}", me(), unsafe { libc::getegid() });
+        let mut cfg = Config::from_toml(TEST_CONFIG).unwrap();
+        cfg.profiles.get_mut("default").unwrap().exec.users = vec![user.clone()];
+        tenantd.reload_config(cfg).unwrap();
+
+        let ch = tenantd_client::connect(&sock).await.unwrap();
+        tenantd_client::TenantsClient::new(ch.clone())
+            .create_tenant(pb::CreateTenantRequest {
+                id: "acme".into(),
+                limits: Some(pb::TenantLimits {
+                    storage_bytes: 1 << 30,
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        tenantd_client::SandboxesClient::new(ch.clone())
+            .create_sandbox(pb::CreateSandboxRequest {
+                tenant: "acme".into(),
+                id: "box".into(),
+                profile: "default".into(),
+                image: "alpine".into(),
+                overrides: None,
+            })
+            .await
+            .unwrap();
+        let roots = d.path().join("roots");
+        fake_helper(&host, roots.clone());
+        for (id, host_access) in [("s1", false), ("s2", true)] {
+            tenantd_client::ContainersClient::new(ch.clone())
+                .create_container(pb::CreateContainerRequest {
+                    tenant: "acme".into(),
+                    sandbox: "box".into(),
+                    id: id.into(),
+                    host_file_access: host_access,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let before = host.runtime.piped.lock().unwrap().len();
+            exercise_files(&ch, id, &user, &roots.join("box").join(id)).await;
+            let piped = host.runtime.piped.lock().unwrap().clone();
+            if host_access {
+                assert_eq!(piped.len(), before, "served from the host");
+            } else {
+                assert!(piped.len() > before + 20, "served by the helper");
+                assert_eq!(piped[before].args, [tenantd_core::files::HELPER_PATH]);
+                assert_eq!(piped[before].user.as_deref(), Some(user.as_str()));
+            }
+        }
+        // On the host, a path under a mount goes through the helper.
+        let root = roots.join("box/s2");
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        std::fs::write(root.join("proc/cpus"), "4").unwrap();
+        let c = pb::ContainerRef {
+            tenant: "acme".into(),
+            sandbox: "box".into(),
+            id: "s2".into(),
+        };
+        let mut f = Files::new(ch.clone(), c.clone()).as_user(&user);
+        let before = host.runtime.piped.lock().unwrap().len();
+        assert_eq!(f.read("/proc/cpus").await.unwrap(), b"4");
+        f.write("/proc/cpus", b"8".to_vec(), &WriteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(host.runtime.piped.lock().unwrap().len(), before + 2);
+        assert_eq!(std::fs::read(root.join("proc/cpus")).unwrap(), b"8");
+
+        // Refusals are gRPC errors, not errnos.
+        let mut other = Files::new(
+            ch.clone(),
+            pb::ContainerRef {
+                id: "nope".into(),
+                ..c.clone()
+            },
+        )
+        .as_user(&user);
+        match other.stat("/", false).await.unwrap_err() {
+            files::Error::Status(s) => assert_eq!(s.code(), tonic::Code::NotFound),
+            e => panic!("{e}"),
+        }
+        let mut root_user = Files::new(ch, c).as_user("0");
+        match root_user.stat("/", false).await.unwrap_err() {
+            files::Error::Status(s) => assert_eq!(s.code(), tonic::Code::PermissionDenied),
+            e => panic!("{e}"),
+        }
     }
 
     #[tokio::test]

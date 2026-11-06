@@ -454,6 +454,7 @@ async fn reconcile_keeps_finishes_and_ends_containers() {
             args: vec![],
             volumes: vec![],
             fuse: None,
+            host_file_access: false,
             state: ContainerState::Creating,
             exit_code: None,
             created_at: 1,

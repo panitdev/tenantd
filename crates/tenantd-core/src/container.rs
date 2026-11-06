@@ -20,7 +20,7 @@
 use tracing::{info, warn};
 
 use crate::Tenantd;
-use crate::backend::{BindMount, RootfsSpec, RuntimeHandle, RuntimeState};
+use crate::backend::{BindMount, ContainerRun, RootfsSpec, RuntimeHandle, RuntimeState};
 use crate::events::EventKind;
 use crate::fuse::{FuseLimits, FuseLink};
 use crate::model::{
@@ -34,7 +34,7 @@ fn same_container(r: ContainerRecord, spec: &ContainerSpec) -> Result<ContainerR
         Ok(r)
     } else {
         Err(Error::AlreadyExists(format!(
-            "container {} exists with a different command, volumes or FUSE slot",
+            "container {} exists with a different command, volumes, FUSE slot or file access",
             r.key()
         )))
     }
@@ -67,6 +67,13 @@ impl Tenantd {
         }
         let cfg = self.config();
         policy::check_container_args(&cfg, &sandbox, &spec.args)?;
+        if spec.host_file_access && !self.layer(sandbox.spec.rootfs)?.traits().host_root {
+            return Err(Error::FailedPrecondition(format!(
+                "sandbox {sk} is on a {} layer, which keeps container roots inside the \
+                 sandbox: host file access needs one on the host",
+                sandbox.spec.rootfs.as_str()
+            )));
+        }
         let (volumes, fuse) = policy::plan_container_mounts(&cfg, &sandbox, &spec)?;
         // Held until the row exists, so none of them is deleted meanwhile.
         let mut volume_locks = Vec::with_capacity(volumes.len());
@@ -97,6 +104,7 @@ impl Tenantd {
             args: spec.args,
             volumes,
             fuse,
+            host_file_access: spec.host_file_access,
             state: ContainerState::Creating,
             exit_code: None,
             created_at: ts,
@@ -363,8 +371,15 @@ impl Tenantd {
                 if state == RuntimeState::Stopped {
                     self.runtime.destroy(&h).await?;
                 }
+                let c = ContainerRun {
+                    key: &key,
+                    args: &rec.args,
+                    root,
+                    mounts,
+                    host_file_access: rec.host_file_access,
+                };
                 self.runtime
-                    .create_container(&sandbox.spec, &key, &rec.args, root, mounts, &net)
+                    .create_container(&sandbox.spec, &c, &net)
                     .await?;
                 self.runtime.start(&h).await?;
             }

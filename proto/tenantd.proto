@@ -72,6 +72,57 @@ service Containers {
   rpc ServeFuse(stream FuseServerMessage) returns (stream FuseServerEvent);
 }
 
+// File access to a running container's root, as the container sees it: the
+// files its own processes read and write, for callers that would otherwise
+// have to exec a binary in the image and parse its output.
+//
+// Paths are absolute within the container ("/" is its root), without "."
+// or ".." parts, and resolve as the container's own processes see them:
+// its mounts, /tmp, volumes and FUSE slot included.
+//
+// By default each call runs tenantd's file helper inside the container (a
+// `runsc exec` per call, so tens of milliseconds each), which works on every
+// layer and costs the container nothing otherwise. A container created with
+// host_file_access is served from the host instead, much faster per call;
+// the runtime then revalidates every file lookup in that container against
+// the host, which slows file-heavy work there. Paths the host can't see
+// (mounts) still go through the helper. A container created before file
+// access existed has no helper: FAILED_PRECONDITION until it is recreated.
+//
+// Filesystem errors come back in the reply as Linux errno values with a
+// detail for logs, the way ServeFuse takes them; a gRPC error means the
+// call itself was refused (NOT_FOUND for an unknown container,
+// FAILED_PRECONDITION when it is not running, PERMISSION_DENIED by policy).
+//
+// What a caller may do is the sandbox profile's exec policy: exec must be
+// enabled, and every call acts as `user` ("" = the image user; otherwise
+// one of profile exec.users), with that user's permissions, resolved as an
+// exec's are. Files it creates are that user's. Writes are in the tenant's
+// quota: past it they fail with ENOSPC, as the container's own writes do
+// (XFS project quotas report ENOSPC, not EDQUOT).
+service Files {
+  // lstat, or stat with follow. Returns the resolved path as well.
+  rpc Stat(FileStatRequest) returns (FileStatResponse);
+  // The whole directory, each entry with its lstat attributes.
+  rpc ReadDir(FileReadDirRequest) returns (FileReadDirResponse);
+  // A regular file's bytes from offset, in chunks. The first message
+  // carries the file's attributes (or the errno that ended the call).
+  rpc Read(FileReadRequest) returns (stream FileReadResponse);
+  // The first message is `header`, then the body as `data` messages; the
+  // client closing its side ends the body. The body goes to a temporary
+  // file beside the target, which replaces it only once the whole body
+  // arrived: a stream that fails or is cancelled leaves the target as it
+  // was. A symlink at the path is followed, and its target replaced.
+  // Replacing means hard links to the old file keep the old body, xattrs
+  // and ACLs are not carried over, it takes write permission on the
+  // directory, and both bodies count against the quota until the rename.
+  rpc Write(stream FileWriteRequest) returns (FileWriteResponse);
+  // renameat2(2), flags RENAME_NOREPLACE (1) or RENAME_EXCHANGE (2).
+  rpc Rename(FileRenameRequest) returns (FileRenameResponse);
+  // unlink(2), or rmdir(2) with directory.
+  rpc Remove(FileRemoveRequest) returns (FileRemoveResponse);
+}
+
 // Processes inside running sandboxes. Only processes tenantd started are
 // visible; the sandbox's init process and anything the image spawns are out
 // of reach. What a caller may run is the sandbox profile's exec policy.
@@ -224,6 +275,10 @@ message CreateContainerRequest {
   map<string, string> volumes = 5;
   // Mount the profile's FUSE slot; the container then waits "created".
   bool fuse = 6;
+  // Serve Files calls on it from the host, not through the in-container
+  // helper; see service Files for the cost. Needs a layer that keeps
+  // container roots on the host (not memory).
+  bool host_file_access = 7;
 }
 
 message ContainerRef {
@@ -254,6 +309,7 @@ message Container {
   repeated string args = 8;     // empty: the image's entrypoint and cmd
   repeated VolumeMount volumes = 9;
   string fuse_path = 10;        // where its FUSE slot is mounted; "" = none
+  bool host_file_access = 11;
 }
 
 // ---- ServeFuse ----------------------------------------------------------
@@ -445,6 +501,101 @@ message StatFsReply {
   uint64 ffree = 5;
   uint32 bsize = 6;
   uint32 namelen = 7;
+}
+
+// ---- Files --------------------------------------------------------------
+
+message FileStatRequest {
+  ContainerRef container = 1;
+  string path = 2;
+  bool follow = 3;              // stat(2) rather than lstat(2)
+  string user = 4;              // "" = image user; otherwise in exec.users
+}
+
+message FileStatResponse {
+  int32 errno = 1;
+  string detail = 2;
+  FileAttr attr = 3;
+  string path = 4;              // the path stat-ed, symlinks resolved when follow
+}
+
+message FileReadDirRequest {
+  ContainerRef container = 1;
+  string path = 2;
+  string user = 3;
+}
+
+message FileReadDirResponse {
+  int32 errno = 1;
+  string detail = 2;
+  repeated DirEntry entries = 3;    // without "." and ".."
+}
+
+message FileReadRequest {
+  ContainerRef container = 1;
+  string path = 2;              // symlinks are followed
+  uint64 offset = 3;
+  uint64 length = 4;            // 0: to the end of the file
+  string user = 5;
+}
+
+message FileReadResponse {
+  int32 errno = 1;              // set on the last message when the read failed
+  string detail = 2;
+  FileAttr attr = 3;            // first message only
+  uint64 offset = 4;            // of data
+  bytes data = 5;
+}
+
+message FileWriteRequest {
+  oneof msg {
+    FileWriteHeader header = 1; // first message, once
+    bytes data = 2;
+  }
+}
+
+message FileWriteHeader {
+  ContainerRef container = 1;
+  string path = 2;
+  optional uint32 mode = 3;     // default: the replaced file's, or 0644
+  bool parents = 4;             // create missing parent directories (0755)
+  bool exclusive = 5;           // fail with EEXIST if the path exists
+  // The body's length, when known: a body that ends short or long fails
+  // with EIO, leaving the target as it was.
+  optional uint64 size = 6;
+  string user = 7;
+}
+
+message FileWriteResponse {
+  int32 errno = 1;
+  string detail = 2;
+  FileAttr attr = 3;            // of the file written
+  uint64 written = 4;
+}
+
+message FileRenameRequest {
+  ContainerRef container = 1;
+  string from = 2;
+  string to = 3;
+  uint32 flags = 4;             // renameat2 flags
+  string user = 5;
+}
+
+message FileRenameResponse {
+  int32 errno = 1;
+  string detail = 2;
+}
+
+message FileRemoveRequest {
+  ContainerRef container = 1;
+  string path = 2;
+  bool directory = 3;           // rmdir: the directory must be empty
+  string user = 4;
+}
+
+message FileRemoveResponse {
+  int32 errno = 1;
+  string detail = 2;
 }
 
 message VolumeMount {

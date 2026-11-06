@@ -255,6 +255,10 @@ pub struct ContainerSpec {
     pub volumes: BTreeMap<SlotName, VolumeId>,
     /// Mount the profile's FUSE slot.
     pub fuse: bool,
+    /// Serve Files from the host rather than through the in-container
+    /// helper. Makes the runtime revalidate every file lookup against the
+    /// host, which slows file-heavy work in the container.
+    pub host_file_access: bool,
 }
 
 impl From<Vec<String>> for ContainerSpec {
@@ -280,6 +284,9 @@ pub struct ContainerRecord {
     pub volumes: Vec<VolumeMount>,
     /// Where its FUSE slot is mounted, when it has one.
     pub fuse: Option<String>,
+    /// See [`ContainerSpec::host_file_access`].
+    #[serde(default)]
+    pub host_file_access: bool,
     pub state: ContainerState,
     pub exit_code: Option<i32>,
     pub created_at: i64,
@@ -305,6 +312,7 @@ impl ContainerRecord {
                 .map(|m| (m.slot.clone(), m.volume.clone()))
                 .collect(),
             fuse: self.fuse.is_some(),
+            host_file_access: self.host_file_access,
         }
     }
 
