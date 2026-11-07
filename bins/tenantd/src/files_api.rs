@@ -1,6 +1,8 @@
-//! `Files`: file access to a running container's root.
+//! `Files`: file access to a running container's root, or to a volume.
 //!
-//! The core admits each call ([`Tenantd::file_access`]). The operations
+//! The core admits each call ([`Tenantd::file_access`], or
+//! [`Tenantd::volume_file_access`] for a volume, which is always served
+//! here on the host). The operations
 //! themselves ([`ops`]) run on a `tenantd_layer::files::Root` in one of two
 //! places: inside the container, in the file helper ([`crate::files_helper`])
 //! that each call execs there, or here on the host for a container with
@@ -9,6 +11,7 @@
 //! was refused.
 //!
 //! [`Tenantd::file_access`]: tenantd_core::Tenantd::file_access
+//! [`Tenantd::volume_file_access`]: tenantd_core::Tenantd::volume_file_access
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +19,7 @@ use std::time::Duration;
 use prost::Message;
 use tenantd_client::pb::{self, file_write_request::Msg, files_server::Files};
 use tenantd_core::backend::PipedProcess;
-use tenantd_core::files::FileAccess;
+use tenantd_core::files::{FileAccess, VolumeAccess};
 use tenantd_core::{Error, Result};
 use tenantd_layer::files::{Ident, Root};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -24,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::api::{Api, container_key, status};
+use crate::api::{Api, container_key, status, volume_key};
 use crate::files_helper::{Call, HelperCall, MAX_MESSAGE};
 
 /// How long an abandoned write's helper gets to clean up before it is
@@ -149,6 +152,42 @@ pub mod ops {
         let res = split(root.remove(&r.path, r.directory))?;
         let (errno, detail) = err_parts(&res);
         Ok(pb::FileRemoveResponse { errno, detail })
+    }
+
+    pub fn mkdir(root: &Root, r: &pb::FileMkdirRequest) -> Served<pb::FileMkdirResponse> {
+        let res = split(root.mkdir(&r.path, r.mode, r.parents))?;
+        let (errno, detail) = err_parts(&res);
+        Ok(pb::FileMkdirResponse {
+            errno,
+            detail,
+            attr: res.ok().map(pb_attr),
+        })
+    }
+
+    pub fn symlink(root: &Root, r: &pb::FileSymlinkRequest) -> Served<pb::FileSymlinkResponse> {
+        let res = split(root.symlink(&r.path, r.target.as_bytes()))?;
+        let (errno, detail) = err_parts(&res);
+        Ok(pb::FileSymlinkResponse { errno, detail })
+    }
+
+    pub fn read_link(root: &Root, r: &pb::FileReadLinkRequest) -> Served<pb::FileReadLinkResponse> {
+        let res = split(root.read_link(&r.path))?;
+        let (errno, detail) = err_parts(&res);
+        Ok(pb::FileReadLinkResponse {
+            errno,
+            detail,
+            target: res.unwrap_or_default(),
+        })
+    }
+
+    pub fn set_attr(root: &Root, r: &pb::FileSetAttrRequest) -> Served<pb::FileSetAttrResponse> {
+        let res = split(root.set_attr(&r.path, r.mode, r.mtime_ns))?;
+        let (errno, detail) = err_parts(&res);
+        Ok(pb::FileSetAttrResponse {
+            errno,
+            detail,
+            attr: res.ok().map(pb_attr),
+        })
     }
 
     pub type Opened = FsResult<(Reader, Attr)>;
@@ -299,6 +338,28 @@ async fn host_root(a: &FileAccess) -> Result<Option<Arc<Root>>> {
     .await?
 }
 
+/// A volume's directory, opened as its owner.
+async fn volume_root(v: &VolumeAccess) -> Result<Arc<Root>> {
+    let v = v.clone();
+    blocking(move || {
+        let ident = Ident {
+            uid: v.uid,
+            gid: v.gid,
+            groups: Vec::new(),
+        };
+        Root::open(&v.root, ident, &[])
+            .map(Arc::new)
+            .map_err(|e| Error::Internal(format!("opening the volume: {e}")))
+    })
+    .await?
+}
+
+/// What a call was admitted on.
+enum Admitted {
+    Container(Box<FileAccess>),
+    Volume(VolumeAccess),
+}
+
 /// `f` on the host root, when there is one and it can serve the call.
 async fn on_host<T: Send + 'static>(
     root: Option<Arc<Root>>,
@@ -396,25 +457,55 @@ impl Api {
     async fn admit(
         &self,
         c: Option<pb::ContainerRef>,
+        v: Option<pb::VolumeRef>,
         user: &str,
         write: bool,
-    ) -> Result<FileAccess> {
-        let c = c.ok_or_else(|| Error::invalid("container is required"))?;
-        let key = container_key(&c.tenant, &c.sandbox, &c.id)?;
-        self.tenantd.file_access(&key, Some(user), write).await
+    ) -> Result<Admitted> {
+        match (c, v) {
+            (Some(c), None) => {
+                let key = container_key(&c.tenant, &c.sandbox, &c.id)?;
+                Ok(Admitted::Container(Box::new(
+                    self.tenantd.file_access(&key, Some(user), write).await?,
+                )))
+            }
+            (None, Some(v)) => {
+                if !user.is_empty() {
+                    return Err(Error::invalid(
+                        "a volume's files are its owner's; user must be empty",
+                    ));
+                }
+                let key = volume_key(&v.tenant, &v.id)?;
+                Ok(Admitted::Volume(
+                    self.tenantd.volume_file_access(&key, write).await?,
+                ))
+            }
+            (Some(_), Some(_)) => Err(Error::invalid("name a container or a volume, not both")),
+            (None, None) => Err(Error::invalid("a container or a volume is required")),
+        }
+    }
+
+    /// The host root a call runs on, when it runs on the host.
+    async fn root_of(&self, a: &Admitted) -> Result<Option<Arc<Root>>> {
+        match a {
+            Admitted::Container(a) => host_root(a).await,
+            Admitted::Volume(v) => volume_root(v).await.map(Some),
+        }
     }
 
     /// A one-message call: on the host when it can, else through the
     /// helper.
     async fn unary<M: Message + Default + Send + 'static>(
         &self,
-        a: FileAccess,
+        a: Admitted,
         call: Call,
         host: impl FnOnce(&Root) -> Served<M> + Send + 'static,
     ) -> Result<M> {
-        if let Some(m) = on_host(host_root(&a).await?, host).await? {
+        if let Some(m) = on_host(self.root_of(&a).await?, host).await? {
             return Ok(m);
         }
+        let Admitted::Container(a) = a else {
+            return Err(Error::Internal("a volume path the host can't serve".into()));
+        };
         let (p, out) = start_helper(self, &a, call).await?;
         reply(p, out).await
     }
@@ -532,7 +623,9 @@ impl Files for Api {
     ) -> std::result::Result<Response<pb::FileStatResponse>, Status> {
         let r = req.into_inner();
         self.timed("FileStat", async {
-            let a = self.admit(r.container.clone(), &r.user, false).await?;
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, false)
+                .await?;
             let r2 = r.clone();
             self.unary(a, Call::Stat(r), move |root| ops::stat(root, &r2))
                 .await
@@ -546,7 +639,9 @@ impl Files for Api {
     ) -> std::result::Result<Response<pb::FileReadDirResponse>, Status> {
         let r = req.into_inner();
         self.timed("FileReadDir", async {
-            let a = self.admit(r.container.clone(), &r.user, false).await?;
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, false)
+                .await?;
             let r2 = r.clone();
             self.unary(a, Call::ReadDir(r), move |root| ops::read_dir(root, &r2))
                 .await
@@ -563,9 +658,11 @@ impl Files for Api {
         let r = req.into_inner();
         let (tx, rx) = mpsc::channel(4);
         self.timed("FileRead", async {
-            let a = self.admit(r.container.clone(), &r.user, false).await?;
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, false)
+                .await?;
             let path = r.path.clone();
-            let opened = on_host(host_root(&a).await?, move |root| {
+            let opened = on_host(self.root_of(&a).await?, move |root| {
                 ops::open_read(root, &path)
             })
             .await?;
@@ -578,6 +675,9 @@ impl Files for Api {
                     });
                 }
                 None => {
+                    let Admitted::Container(a) = a else {
+                        return Err(Error::Internal("a volume path the host can't serve".into()));
+                    };
                     let (p, out) = start_helper(self, &a, Call::Read(r)).await?;
                     tokio::spawn(pump_helper(p, out, tx.clone()));
                 }
@@ -597,11 +697,16 @@ impl Files for Api {
             return Err(Status::invalid_argument("expected the header first"));
         };
         self.timed("FileWrite", async {
-            let a = self.admit(h.container.clone(), &h.user, true).await?;
-            let root = host_root(&a).await?;
+            let a = self
+                .admit(h.container.clone(), h.volume.clone(), &h.user, true)
+                .await?;
+            let root = self.root_of(&a).await?;
             if let Some(r) = self.write_on_host(root, &h, &mut inbound).await? {
                 return Ok(r);
             }
+            let Admitted::Container(a) = a else {
+                return Err(Error::Internal("a volume path the host can't serve".into()));
+            };
             self.write_in_helper(&a, h, &mut inbound).await
         })
         .await
@@ -613,7 +718,9 @@ impl Files for Api {
     ) -> std::result::Result<Response<pb::FileRenameResponse>, Status> {
         let r = req.into_inner();
         self.timed("FileRename", async {
-            let a = self.admit(r.container.clone(), &r.user, false).await?;
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, false)
+                .await?;
             let r2 = r.clone();
             self.unary(a, Call::Rename(r), move |root| ops::rename(root, &r2))
                 .await
@@ -627,9 +734,75 @@ impl Files for Api {
     ) -> std::result::Result<Response<pb::FileRemoveResponse>, Status> {
         let r = req.into_inner();
         self.timed("FileRemove", async {
-            let a = self.admit(r.container.clone(), &r.user, false).await?;
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, false)
+                .await?;
             let r2 = r.clone();
             self.unary(a, Call::Remove(r), move |root| ops::remove(root, &r2))
+                .await
+        })
+        .await
+    }
+
+    async fn mkdir(
+        &self,
+        req: Request<pb::FileMkdirRequest>,
+    ) -> std::result::Result<Response<pb::FileMkdirResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("FileMkdir", async {
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, true)
+                .await?;
+            let r2 = r.clone();
+            self.unary(a, Call::Mkdir(r), move |root| ops::mkdir(root, &r2))
+                .await
+        })
+        .await
+    }
+
+    async fn symlink(
+        &self,
+        req: Request<pb::FileSymlinkRequest>,
+    ) -> std::result::Result<Response<pb::FileSymlinkResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("FileSymlink", async {
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, true)
+                .await?;
+            let r2 = r.clone();
+            self.unary(a, Call::Symlink(r), move |root| ops::symlink(root, &r2))
+                .await
+        })
+        .await
+    }
+
+    async fn read_link(
+        &self,
+        req: Request<pb::FileReadLinkRequest>,
+    ) -> std::result::Result<Response<pb::FileReadLinkResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("FileReadLink", async {
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, false)
+                .await?;
+            let r2 = r.clone();
+            self.unary(a, Call::ReadLink(r), move |root| ops::read_link(root, &r2))
+                .await
+        })
+        .await
+    }
+
+    async fn set_attr(
+        &self,
+        req: Request<pb::FileSetAttrRequest>,
+    ) -> std::result::Result<Response<pb::FileSetAttrResponse>, Status> {
+        let r = req.into_inner();
+        self.timed("FileSetAttr", async {
+            let a = self
+                .admit(r.container.clone(), r.volume.clone(), &r.user, false)
+                .await?;
+            let r2 = r.clone();
+            self.unary(a, Call::SetAttr(r), move |root| ops::set_attr(root, &r2))
                 .await
         })
         .await

@@ -100,6 +100,16 @@ service Containers {
 // exec's are. Files it creates are that user's. Writes are in the tenant's
 // quota: past it they fail with ENOSPC, as the container's own writes do
 // (XFS project quotas report ENOSPC, not EDQUOT).
+//
+// A call may name a volume instead of a container: then paths are absolute
+// within the volume ("/" is its top), it is served on the host whether or
+// not a container binds it, and it acts as the volume's owner (its uid and
+// gid at create), so `user` must be empty. Symlinks resolve inside the
+// volume; one pointing out of it (an absolute one, say) resolves as if the
+// volume were the whole filesystem, which is not what a container that
+// binds it elsewhere sees. Callers that care resolve links themselves with
+// ReadLink and stat without follow. NOT_FOUND for an unknown volume,
+// FAILED_PRECONDITION when it is not ready.
 service Files {
   // lstat, or stat with follow. Returns the resolved path as well.
   rpc Stat(FileStatRequest) returns (FileStatResponse);
@@ -121,6 +131,15 @@ service Files {
   rpc Rename(FileRenameRequest) returns (FileRenameResponse);
   // unlink(2), or rmdir(2) with directory.
   rpc Remove(FileRemoveRequest) returns (FileRemoveResponse);
+  // mkdir(2), or `mkdir -p` with parents.
+  rpc Mkdir(FileMkdirRequest) returns (FileMkdirResponse);
+  // symlink(2): a link at path whose target is taken as given.
+  rpc Symlink(FileSymlinkRequest) returns (FileSymlinkResponse);
+  // readlink(2).
+  rpc ReadLink(FileReadLinkRequest) returns (FileReadLinkResponse);
+  // chmod(2) and utimensat(2) on what is at path, following a symlink
+  // there. Fields left unset are left as they are.
+  rpc SetAttr(FileSetAttrRequest) returns (FileSetAttrResponse);
 }
 
 // Processes inside running sandboxes. Only processes tenantd started are
@@ -510,6 +529,8 @@ message FileStatRequest {
   string path = 2;
   bool follow = 3;              // stat(2) rather than lstat(2)
   string user = 4;              // "" = image user; otherwise in exec.users
+  // Instead of container: a volume, served on the host as its owner.
+  VolumeRef volume = 5;
 }
 
 message FileStatResponse {
@@ -523,6 +544,8 @@ message FileReadDirRequest {
   ContainerRef container = 1;
   string path = 2;
   string user = 3;
+  // Instead of container: a volume, served on the host as its owner.
+  VolumeRef volume = 4;
 }
 
 message FileReadDirResponse {
@@ -537,6 +560,8 @@ message FileReadRequest {
   uint64 offset = 3;
   uint64 length = 4;            // 0: to the end of the file
   string user = 5;
+  // Instead of container: a volume, served on the host as its owner.
+  VolumeRef volume = 6;
 }
 
 message FileReadResponse {
@@ -564,6 +589,8 @@ message FileWriteHeader {
   // with EIO, leaving the target as it was.
   optional uint64 size = 6;
   string user = 7;
+  // Instead of container: a volume, served on the host as its owner.
+  VolumeRef volume = 8;
 }
 
 message FileWriteResponse {
@@ -579,6 +606,8 @@ message FileRenameRequest {
   string to = 3;
   uint32 flags = 4;             // renameat2 flags
   string user = 5;
+  // Instead of container: a volume, served on the host as its owner.
+  VolumeRef volume = 6;
 }
 
 message FileRenameResponse {
@@ -591,11 +620,69 @@ message FileRemoveRequest {
   string path = 2;
   bool directory = 3;           // rmdir: the directory must be empty
   string user = 4;
+  // Instead of container: a volume, served on the host as its owner.
+  VolumeRef volume = 5;
 }
 
 message FileRemoveResponse {
   int32 errno = 1;
   string detail = 2;
+}
+
+message FileMkdirRequest {
+  ContainerRef container = 1;
+  string path = 2;
+  optional uint32 mode = 3;     // default 0755
+  bool parents = 4;             // create missing parents, and succeed if it exists
+  string user = 5;
+  VolumeRef volume = 6;
+}
+
+message FileMkdirResponse {
+  int32 errno = 1;
+  string detail = 2;
+  FileAttr attr = 3;            // of the directory
+}
+
+message FileSymlinkRequest {
+  ContainerRef container = 1;
+  string path = 2;              // where the link goes
+  string target = 3;            // what it points at, stored as given
+  string user = 4;
+  VolumeRef volume = 5;
+}
+
+message FileSymlinkResponse {
+  int32 errno = 1;
+  string detail = 2;
+}
+
+message FileReadLinkRequest {
+  ContainerRef container = 1;
+  string path = 2;
+  string user = 3;
+  VolumeRef volume = 4;
+}
+
+message FileReadLinkResponse {
+  int32 errno = 1;
+  string detail = 2;
+  bytes target = 3;
+}
+
+message FileSetAttrRequest {
+  ContainerRef container = 1;
+  string path = 2;
+  optional uint32 mode = 3;     // permission, setuid/setgid and sticky bits
+  optional int64 mtime_ns = 4;
+  string user = 5;
+  VolumeRef volume = 6;
+}
+
+message FileSetAttrResponse {
+  int32 errno = 1;
+  string detail = 2;
+  FileAttr attr = 3;
 }
 
 message VolumeMount {

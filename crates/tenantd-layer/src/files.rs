@@ -889,6 +889,141 @@ impl Root {
             Ok(())
         })
     }
+
+    /// `mkdir(2)` with `mode` (0755 when `None`), set exactly, not cut by
+    /// the umask. With `parents`, missing parents are made (0755) and an
+    /// existing directory is no error.
+    pub fn mkdir(&self, path: &str, mode: Option<u32>, parents: bool) -> FsResult<Attr> {
+        let parts = components(path)?;
+        let mode = mode.unwrap_or(0o755);
+        if mode & !0o7777 != 0 {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "mode takes permission bits only",
+            ));
+        }
+        self.ident.run(|| {
+            if parts.is_empty() {
+                if parents {
+                    let fd = self.open_dir(&[])?;
+                    let st = fstat(fd.as_fd()).map_err(|e| FsError::io(e, path))?;
+                    return Ok(Attr::from_stat(&st));
+                }
+                return Err(FsError::new(libc::EEXIST, "the root itself"));
+            }
+            let e = self.entry(&parts, parents)?;
+            // SAFETY: valid fd and NUL-terminated name.
+            let r = unsafe { libc::mkdirat(e.dir.as_raw_fd(), e.name.as_ptr(), 0o700) };
+            if r < 0 {
+                let err = last_err();
+                if parents && err.raw_os_error() == Some(libc::EEXIST) {
+                    let st =
+                        fstatat(e.dir.as_fd(), &e.name, 0).map_err(|err| FsError::io(err, path))?;
+                    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                        return Ok(Attr::from_stat(&st));
+                    }
+                }
+                return Err(FsError::io(err, path));
+            }
+            // SAFETY: valid fd and NUL-terminated name.
+            let d = unsafe {
+                libc::openat(
+                    e.dir.as_raw_fd(),
+                    e.name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if d < 0 {
+                return Err(FsError::io(last_err(), path));
+            }
+            // SAFETY: a fresh descriptor we now own.
+            let d = unsafe { OwnedFd::from_raw_fd(d) };
+            // SAFETY: valid fd.
+            if unsafe { libc::fchmod(d.as_raw_fd(), mode) } < 0 {
+                return Err(FsError::io(last_err(), format!("chmod {path}")));
+            }
+            let st = fstat(d.as_fd()).map_err(|err| FsError::io(err, path))?;
+            Ok(Attr::from_stat(&st))
+        })
+    }
+
+    /// `symlink(2)`: a link at `path` to `target`, which is stored as
+    /// given and need not exist.
+    pub fn symlink(&self, path: &str, target: &[u8]) -> FsResult<()> {
+        let parts = components(path)?;
+        if target.is_empty() || target.len() > PATH_MAX {
+            return Err(FsError::new(libc::EINVAL, "symlink target length"));
+        }
+        let target = cstring(target)?;
+        self.ident.run(|| {
+            let e = self.entry(&parts, false)?;
+            // SAFETY: NUL-terminated strings and a valid fd.
+            check(
+                unsafe { libc::symlinkat(target.as_ptr(), e.dir.as_raw_fd(), e.name.as_ptr()) }
+                    as _,
+            )
+            .map_err(|err| FsError::io(err, path))?;
+            Ok(())
+        })
+    }
+
+    /// `readlink(2)`: the target of the symlink at `path`, as stored.
+    pub fn read_link(&self, path: &str) -> FsResult<Vec<u8>> {
+        let parts = components(path)?;
+        self.ident.run(|| {
+            if parts.is_empty() {
+                return Err(FsError::new(libc::EINVAL, "the root is no symlink"));
+            }
+            let e = self.entry(&parts, false)?;
+            readlinkat(e.dir.as_fd(), &e.name).map_err(|err| FsError::io(err, path))
+        })
+    }
+
+    /// `chmod(2)` and the modification time of what is at `path`,
+    /// following a symlink there. `None` leaves that one as it is.
+    pub fn set_attr(&self, path: &str, mode: Option<u32>, mtime_ns: Option<i64>) -> FsResult<Attr> {
+        let parts = components(path)?;
+        if mode.is_some_and(|m| m & !0o7777 != 0) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "mode takes permission bits only",
+            ));
+        }
+        self.ident.run(|| {
+            let fd = self
+                .open_path(&rel(&parts)?, libc::O_PATH)
+                .map_err(|e| FsError::io(e, path))?;
+            self.resolved(fd.as_fd())?;
+            // The descriptor's magic link names the file itself, whatever
+            // happens to the path meanwhile.
+            let proc = cstring(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
+            if let Some(mode) = mode {
+                // SAFETY: NUL-terminated path.
+                check(unsafe { libc::chmod(proc.as_ptr(), mode) } as _)
+                    .map_err(|e| FsError::io(e, format!("chmod {path}")))?;
+            }
+            if let Some(t) = mtime_ns {
+                let times = [
+                    libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: libc::UTIME_OMIT,
+                    },
+                    libc::timespec {
+                        tv_sec: t.div_euclid(1_000_000_000),
+                        tv_nsec: t.rem_euclid(1_000_000_000),
+                    },
+                ];
+                // SAFETY: NUL-terminated path and two timespecs.
+                check(
+                    unsafe { libc::utimensat(libc::AT_FDCWD, proc.as_ptr(), times.as_ptr(), 0) }
+                        as _,
+                )
+                .map_err(|e| FsError::io(e, format!("touch {path}")))?;
+            }
+            let st = fstat(fd.as_fd()).map_err(|e| FsError::io(e, path))?;
+            Ok(Attr::from_stat(&st))
+        })
+    }
 }
 
 fn readlinkat(dir: BorrowedFd, name: &CStr) -> io::Result<Vec<u8>> {
@@ -1325,5 +1460,83 @@ mod tests {
         // Not just a prefix: /database is not /data.
         fs::write(r.join("database"), "").unwrap();
         root.stat("/database", false).unwrap();
+    }
+
+    #[test]
+    fn mkdir_sets_the_mode_and_takes_parents() {
+        let (_d, r, root) = root(&[]);
+        let a = root.mkdir("/data/x", Some(0o750), false).unwrap();
+        assert_eq!(a.kind, Kind::Directory);
+        assert_eq!(
+            fs::metadata(r.join("data/x")).unwrap().permissions().mode() & 0o7777,
+            0o750
+        );
+        assert_eq!(
+            root.mkdir("/data/x", None, false).unwrap_err().errno,
+            libc::EEXIST
+        );
+        root.mkdir("/data/x", None, true).unwrap();
+        root.mkdir("/data/a/b/c", None, true).unwrap();
+        assert!(r.join("data/a/b/c").is_dir());
+        assert_eq!(
+            root.mkdir("/data/q/r", None, false).unwrap_err().errno,
+            libc::ENOENT
+        );
+        assert_eq!(
+            root.mkdir("/etc/passwd", None, true).unwrap_err().errno,
+            libc::EEXIST
+        );
+        root.mkdir("/", None, true).unwrap();
+    }
+
+    #[test]
+    fn symlinks_are_made_and_read_as_given() {
+        let (_d, r, root) = root(&[]);
+        root.symlink("/data/l", b"/etc/passwd").unwrap();
+        assert_eq!(
+            fs::read_link(r.join("data/l")).unwrap(),
+            Path::new("/etc/passwd")
+        );
+        assert_eq!(root.read_link("/data/l").unwrap(), b"/etc/passwd");
+        assert_eq!(
+            root.read_link("/etc/passwd").unwrap_err().errno,
+            libc::EINVAL
+        );
+        assert_eq!(
+            root.symlink("/data/l", b"x").unwrap_err().errno,
+            libc::EEXIST
+        );
+        assert_eq!(
+            root.read_link("/data/none").unwrap_err().errno,
+            libc::ENOENT
+        );
+    }
+
+    #[test]
+    fn set_attr_changes_mode_and_mtime_through_a_link() {
+        let (_d, r, root) = root(&[]);
+        symlink("/etc/hostname", r.join("data/h")).unwrap();
+        let a = root
+            .set_attr("/data/h", Some(0o600), Some(1_000_000_123))
+            .unwrap();
+        assert_eq!(a.kind, Kind::File);
+        assert_eq!(a.mode, 0o600);
+        assert_eq!(a.mtime_ns, 1_000_000_123);
+        let m = fs::metadata(r.join("etc/hostname")).unwrap();
+        assert_eq!(m.permissions().mode() & 0o7777, 0o600);
+        let a = root.set_attr("/etc/hostname", None, None).unwrap();
+        assert_eq!(a.mode, 0o600);
+        assert_eq!(
+            root.set_attr("/etc/x", Some(0o644), None)
+                .unwrap_err()
+                .errno,
+            libc::ENOENT
+        );
+        assert_eq!(
+            root.set_attr("/etc/hostname", Some(0o10000), None)
+                .unwrap_err()
+                .errno,
+            libc::EINVAL
+        );
     }
 }

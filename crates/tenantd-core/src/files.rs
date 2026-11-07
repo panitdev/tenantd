@@ -13,6 +13,10 @@
 //! - For a container created with host file access, on the host against
 //!   its root, which is faster per call. Paths under a mount the host can't
 //!   see through still go through the helper.
+//!
+//! A call may name a volume instead ([`Tenantd::volume_file_access`]). It
+//! is served on the host, on the volume's directory, as the volume's owner,
+//! whether or not a container binds it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,8 +25,9 @@ use futures::FutureExt;
 
 use crate::Tenantd;
 use crate::backend::{PipedProcess, RuntimeHandle};
+use crate::model::VolumeState;
 use crate::model::{ContainerState, ResolvedProcess};
-use crate::{ContainerKey, Error, ProcessId, ProcessKey, Result, policy};
+use crate::{ContainerKey, Error, ProcessId, ProcessKey, Result, VolumeKey, policy};
 
 /// Where every container has tenantd's file helper: tenantd's own binary,
 /// which serves one call over stdin and stdout when run under this name.
@@ -56,7 +61,38 @@ pub struct HostRoot {
     pub mounts: Vec<String>,
 }
 
+/// A volume a file call works on, on the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeAccess {
+    /// The volume's directory.
+    pub root: PathBuf,
+    /// Who the call acts as: the volume's owner.
+    pub uid: u32,
+    pub gid: u32,
+}
+
 impl Tenantd {
+    /// Admit a file call on volume `key`. `write` calls also need
+    /// enforcement to be healthy and the tenant not blocked.
+    pub async fn volume_file_access(&self, key: &VolumeKey, write: bool) -> Result<VolumeAccess> {
+        if write {
+            self.require_enforcement()?;
+            self.require_unblocked(&key.tenant)?;
+        }
+        let rec = self.get_volume(key).await?;
+        if rec.state != VolumeState::Ready {
+            return Err(Error::FailedPrecondition(format!(
+                "volume {key} is {}",
+                rec.state.as_str()
+            )));
+        }
+        Ok(VolumeAccess {
+            root: self.volume_path(&rec),
+            uid: rec.owner.uid,
+            gid: rec.owner.gid,
+        })
+    }
+
     /// Admit a file call on `key`'s root, acting as `user` (`None` or
     /// empty: the image's user). `write` calls also need enforcement to be
     /// healthy and the tenant not blocked, as every other write does.

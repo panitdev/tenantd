@@ -27,7 +27,7 @@ pub const MAX_MESSAGE: usize = 8 << 20;
 /// One Files call, the helper's first message.
 #[derive(Clone, PartialEq, Message)]
 pub struct HelperCall {
-    #[prost(oneof = "Call", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "Call", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub call: Option<Call>,
 }
 
@@ -45,6 +45,14 @@ pub enum Call {
     Rename(pb::FileRenameRequest),
     #[prost(message, tag = "6")]
     Remove(pb::FileRemoveRequest),
+    #[prost(message, tag = "7")]
+    Mkdir(pb::FileMkdirRequest),
+    #[prost(message, tag = "8")]
+    Symlink(pb::FileSymlinkRequest),
+    #[prost(message, tag = "9")]
+    ReadLink(pb::FileReadLinkRequest),
+    #[prost(message, tag = "10")]
+    SetAttr(pb::FileSetAttrRequest),
 }
 
 /// Whether this process was started as the helper.
@@ -97,6 +105,10 @@ pub fn serve(root: &Root, input: &mut impl Read, output: &mut impl Write) -> io:
         Call::ReadDir(r) => write_msg(output, &ops::served(ops::read_dir(root, &r))?),
         Call::Rename(r) => write_msg(output, &ops::served(ops::rename(root, &r))?),
         Call::Remove(r) => write_msg(output, &ops::served(ops::remove(root, &r))?),
+        Call::Mkdir(r) => write_msg(output, &ops::served(ops::mkdir(root, &r))?),
+        Call::Symlink(r) => write_msg(output, &ops::served(ops::symlink(root, &r))?),
+        Call::ReadLink(r) => write_msg(output, &ops::served(ops::read_link(root, &r))?),
+        Call::SetAttr(r) => write_msg(output, &ops::served(ops::set_attr(root, &r))?),
         Call::Read(r) => {
             let mut res = Ok(());
             let opened = ops::served(ops::open_read(root, &r.path))?;

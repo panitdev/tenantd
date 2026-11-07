@@ -653,6 +653,9 @@ pub struct FileStatRequest {
     /// "" = image user; otherwise in exec.users
     #[prost(string, tag = "4")]
     pub user: ::prost::alloc::string::String,
+    /// Instead of container: a volume, served on the host as its owner.
+    #[prost(message, optional, tag = "5")]
+    pub volume: ::core::option::Option<VolumeRef>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileStatResponse {
@@ -674,6 +677,9 @@ pub struct FileReadDirRequest {
     pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub user: ::prost::alloc::string::String,
+    /// Instead of container: a volume, served on the host as its owner.
+    #[prost(message, optional, tag = "4")]
+    pub volume: ::core::option::Option<VolumeRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FileReadDirResponse {
@@ -699,6 +705,9 @@ pub struct FileReadRequest {
     pub length: u64,
     #[prost(string, tag = "5")]
     pub user: ::prost::alloc::string::String,
+    /// Instead of container: a volume, served on the host as its owner.
+    #[prost(message, optional, tag = "6")]
+    pub volume: ::core::option::Option<VolumeRef>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileReadResponse {
@@ -753,6 +762,9 @@ pub struct FileWriteHeader {
     pub size: ::core::option::Option<u64>,
     #[prost(string, tag = "7")]
     pub user: ::prost::alloc::string::String,
+    /// Instead of container: a volume, served on the host as its owner.
+    #[prost(message, optional, tag = "8")]
+    pub volume: ::core::option::Option<VolumeRef>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileWriteResponse {
@@ -779,6 +791,9 @@ pub struct FileRenameRequest {
     pub flags: u32,
     #[prost(string, tag = "5")]
     pub user: ::prost::alloc::string::String,
+    /// Instead of container: a volume, served on the host as its owner.
+    #[prost(message, optional, tag = "6")]
+    pub volume: ::core::option::Option<VolumeRef>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileRenameResponse {
@@ -798,6 +813,9 @@ pub struct FileRemoveRequest {
     pub directory: bool,
     #[prost(string, tag = "4")]
     pub user: ::prost::alloc::string::String,
+    /// Instead of container: a volume, served on the host as its owner.
+    #[prost(message, optional, tag = "5")]
+    pub volume: ::core::option::Option<VolumeRef>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileRemoveResponse {
@@ -805,6 +823,100 @@ pub struct FileRemoveResponse {
     pub errno: i32,
     #[prost(string, tag = "2")]
     pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileMkdirRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// default 0755
+    #[prost(uint32, optional, tag = "3")]
+    pub mode: ::core::option::Option<u32>,
+    /// create missing parents, and succeed if it exists
+    #[prost(bool, tag = "4")]
+    pub parents: bool,
+    #[prost(string, tag = "5")]
+    pub user: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub volume: ::core::option::Option<VolumeRef>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileMkdirResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    /// of the directory
+    #[prost(message, optional, tag = "3")]
+    pub attr: ::core::option::Option<FileAttr>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileSymlinkRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    /// where the link goes
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// what it points at, stored as given
+    #[prost(string, tag = "3")]
+    pub target: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub user: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub volume: ::core::option::Option<VolumeRef>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileSymlinkResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileReadLinkRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub user: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub volume: ::core::option::Option<VolumeRef>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileReadLinkResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub target: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileSetAttrRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: ::core::option::Option<ContainerRef>,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// permission, setuid/setgid and sticky bits
+    #[prost(uint32, optional, tag = "3")]
+    pub mode: ::core::option::Option<u32>,
+    #[prost(int64, optional, tag = "4")]
+    pub mtime_ns: ::core::option::Option<i64>,
+    #[prost(string, tag = "5")]
+    pub user: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub volume: ::core::option::Option<VolumeRef>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileSetAttrResponse {
+    #[prost(int32, tag = "1")]
+    pub errno: i32,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub attr: ::core::option::Option<FileAttr>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VolumeMount {
@@ -3289,6 +3401,16 @@ pub mod files_client {
     /// exec's are. Files it creates are that user's. Writes are in the tenant's
     /// quota: past it they fail with ENOSPC, as the container's own writes do
     /// (XFS project quotas report ENOSPC, not EDQUOT).
+    ///
+    /// A call may name a volume instead of a container: then paths are absolute
+    /// within the volume ("/" is its top), it is served on the host whether or
+    /// not a container binds it, and it acts as the volume's owner (its uid and
+    /// gid at create), so `user` must be empty. Symlinks resolve inside the
+    /// volume; one pointing out of it (an absolute one, say) resolves as if the
+    /// volume were the whole filesystem, which is not what a container that
+    /// binds it elsewhere sees. Callers that care resolve links themselves with
+    /// ReadLink and stat without follow. NOT_FOUND for an unknown volume,
+    /// FAILED_PRECONDITION when it is not ready.
     #[derive(Debug, Clone)]
     pub struct FilesClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -3509,6 +3631,97 @@ pub mod files_client {
             req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Remove"));
             self.inner.unary(req, path, codec).await
         }
+        /// mkdir(2), or `mkdir -p` with parents.
+        pub async fn mkdir(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileMkdirRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileMkdirResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/Mkdir");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Mkdir"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// symlink(2): a link at path whose target is taken as given.
+        pub async fn symlink(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileSymlinkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileSymlinkResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/Symlink");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "Symlink"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// readlink(2).
+        pub async fn read_link(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileReadLinkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileReadLinkResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tenantd.v1.Files/ReadLink",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "ReadLink"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// chmod(2) and utimensat(2) on what is at path, following a symlink
+        /// there. Fields left unset are left as they are.
+        pub async fn set_attr(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FileSetAttrRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileSetAttrResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/tenantd.v1.Files/SetAttr");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("tenantd.v1.Files", "SetAttr"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -3583,6 +3796,39 @@ pub mod files_server {
             tonic::Response<super::FileRemoveResponse>,
             tonic::Status,
         >;
+        /// mkdir(2), or `mkdir -p` with parents.
+        async fn mkdir(
+            &self,
+            request: tonic::Request<super::FileMkdirRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileMkdirResponse>,
+            tonic::Status,
+        >;
+        /// symlink(2): a link at path whose target is taken as given.
+        async fn symlink(
+            &self,
+            request: tonic::Request<super::FileSymlinkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileSymlinkResponse>,
+            tonic::Status,
+        >;
+        /// readlink(2).
+        async fn read_link(
+            &self,
+            request: tonic::Request<super::FileReadLinkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileReadLinkResponse>,
+            tonic::Status,
+        >;
+        /// chmod(2) and utimensat(2) on what is at path, following a symlink
+        /// there. Fields left unset are left as they are.
+        async fn set_attr(
+            &self,
+            request: tonic::Request<super::FileSetAttrRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FileSetAttrResponse>,
+            tonic::Status,
+        >;
     }
     /// File access to a running container's root, as the container sees it: the
     /// files its own processes read and write, for callers that would otherwise
@@ -3612,6 +3858,16 @@ pub mod files_server {
     /// exec's are. Files it creates are that user's. Writes are in the tenant's
     /// quota: past it they fail with ENOSPC, as the container's own writes do
     /// (XFS project quotas report ENOSPC, not EDQUOT).
+    ///
+    /// A call may name a volume instead of a container: then paths are absolute
+    /// within the volume ("/" is its top), it is served on the host whether or
+    /// not a container binds it, and it acts as the volume's owner (its uid and
+    /// gid at create), so `user` must be empty. Symlinks resolve inside the
+    /// volume; one pointing out of it (an absolute one, say) resolves as if the
+    /// volume were the whole filesystem, which is not what a container that
+    /// binds it elsewhere sees. Callers that care resolve links themselves with
+    /// ReadLink and stat without follow. NOT_FOUND for an unknown volume,
+    /// FAILED_PRECONDITION when it is not ready.
     #[derive(Debug)]
     pub struct FilesServer<T> {
         inner: Arc<T>,
@@ -3938,6 +4194,180 @@ pub mod files_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RemoveSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/Mkdir" => {
+                    #[allow(non_camel_case_types)]
+                    struct MkdirSvc<T: Files>(pub Arc<T>);
+                    impl<T: Files> tonic::server::UnaryService<super::FileMkdirRequest>
+                    for MkdirSvc<T> {
+                        type Response = super::FileMkdirResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileMkdirRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::mkdir(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = MkdirSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/Symlink" => {
+                    #[allow(non_camel_case_types)]
+                    struct SymlinkSvc<T: Files>(pub Arc<T>);
+                    impl<T: Files> tonic::server::UnaryService<super::FileSymlinkRequest>
+                    for SymlinkSvc<T> {
+                        type Response = super::FileSymlinkResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileSymlinkRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::symlink(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SymlinkSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/ReadLink" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadLinkSvc<T: Files>(pub Arc<T>);
+                    impl<
+                        T: Files,
+                    > tonic::server::UnaryService<super::FileReadLinkRequest>
+                    for ReadLinkSvc<T> {
+                        type Response = super::FileReadLinkResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileReadLinkRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::read_link(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadLinkSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/tenantd.v1.Files/SetAttr" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetAttrSvc<T: Files>(pub Arc<T>);
+                    impl<T: Files> tonic::server::UnaryService<super::FileSetAttrRequest>
+                    for SetAttrSvc<T> {
+                        type Response = super::FileSetAttrResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FileSetAttrRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Files>::set_attr(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetAttrSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

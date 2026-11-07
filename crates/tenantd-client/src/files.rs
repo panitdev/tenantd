@@ -17,6 +17,9 @@
 //! # Ok(()) }
 //! ```
 //!
+//! [`Files::volume`] works on a volume instead: paths are absolute within
+//! it, it needs no container, and every call acts as the volume's owner.
+//!
 //! Paths are absolute within the container's root and resolve as the
 //! container sees them. A call acts as the image's user unless
 //! [`Files::as_user`] names another one of the profile's `exec.users`.
@@ -172,11 +175,18 @@ impl FileReader {
     }
 }
 
-/// File calls on one container, as one user.
+/// What file calls work on.
+#[derive(Clone, Debug)]
+enum Target {
+    Container(pb::ContainerRef),
+    Volume(pb::VolumeRef),
+}
+
+/// File calls on one container as one user, or on one volume.
 #[derive(Clone)]
 pub struct Files {
     inner: FilesClient<Channel>,
-    container: pb::ContainerRef,
+    target: Target,
     user: String,
 }
 
@@ -184,20 +194,41 @@ impl Files {
     pub fn new(ch: Channel, container: pb::ContainerRef) -> Self {
         Self {
             inner: FilesClient::new(ch),
-            container,
+            target: Target::Container(container),
+            user: String::new(),
+        }
+    }
+
+    /// File calls on a volume, served on the host as its owner whether or
+    /// not a container binds it. Symlinks resolve inside the volume.
+    pub fn volume(ch: Channel, volume: pb::VolumeRef) -> Self {
+        Self {
+            inner: FilesClient::new(ch),
+            target: Target::Volume(volume),
             user: String::new(),
         }
     }
 
     /// Act as `user`, one of the profile's `exec.users` (`""` or
-    /// `"image"`: the image's user).
+    /// `"image"`: the image's user). Not for a volume, whose calls are
+    /// always its owner's.
     pub fn as_user(mut self, user: impl Into<String>) -> Self {
         self.user = user.into();
         self
     }
 
     fn container(&self) -> Option<pb::ContainerRef> {
-        Some(self.container.clone())
+        match &self.target {
+            Target::Container(c) => Some(c.clone()),
+            Target::Volume(_) => None,
+        }
+    }
+
+    fn vol(&self) -> Option<pb::VolumeRef> {
+        match &self.target {
+            Target::Volume(v) => Some(v.clone()),
+            Target::Container(_) => None,
+        }
     }
 
     /// `lstat`, or `stat` with `follow`.
@@ -206,6 +237,7 @@ impl Files {
             .inner
             .stat(pb::FileStatRequest {
                 container: self.container(),
+                volume: self.vol(),
                 path: path.into(),
                 follow,
                 user: self.user.clone(),
@@ -225,6 +257,7 @@ impl Files {
             .inner
             .read_dir(pb::FileReadDirRequest {
                 container: self.container(),
+                volume: self.vol(),
                 path: path.into(),
                 user: self.user.clone(),
             })
@@ -245,6 +278,7 @@ impl Files {
             .inner
             .read(pb::FileReadRequest {
                 container: self.container(),
+                volume: self.vol(),
                 path: path.into(),
                 offset,
                 length,
@@ -342,6 +376,7 @@ impl Files {
         pb::FileWriteRequest {
             msg: Some(Msg::Header(pb::FileWriteHeader {
                 container: self.container(),
+                volume: self.vol(),
                 path,
                 mode: opts.mode,
                 parents: opts.parents,
@@ -364,6 +399,7 @@ impl Files {
             .inner
             .rename(pb::FileRenameRequest {
                 container: self.container(),
+                volume: self.vol(),
                 from: from.into(),
                 to: to.into(),
                 flags,
@@ -384,11 +420,97 @@ impl Files {
         self.remove_any(path.into(), true).await
     }
 
+    /// `mkdir(2)` with `mode` (0755 when `None`), exactly, whatever the
+    /// umask. With `parents`, `mkdir -p`: missing parents are made and an
+    /// existing directory is no error.
+    pub async fn mkdir(
+        &mut self,
+        path: impl Into<String>,
+        mode: Option<u32>,
+        parents: bool,
+    ) -> Result<pb::FileAttr> {
+        let r = self
+            .inner
+            .mkdir(pb::FileMkdirRequest {
+                container: self.container(),
+                volume: self.vol(),
+                path: path.into(),
+                mode,
+                parents,
+                user: self.user.clone(),
+            })
+            .await?
+            .into_inner();
+        check(r.errno, r.detail)?;
+        attr(r.attr)
+    }
+
+    /// `symlink(2)`: a link at `path` to `target`, stored as given.
+    pub async fn symlink(
+        &mut self,
+        path: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Result<()> {
+        let r = self
+            .inner
+            .symlink(pb::FileSymlinkRequest {
+                container: self.container(),
+                volume: self.vol(),
+                path: path.into(),
+                target: target.into(),
+                user: self.user.clone(),
+            })
+            .await?
+            .into_inner();
+        check(r.errno, r.detail)
+    }
+
+    /// `readlink(2)`: the link's target as stored.
+    pub async fn read_link(&mut self, path: impl Into<String>) -> Result<Vec<u8>> {
+        let r = self
+            .inner
+            .read_link(pb::FileReadLinkRequest {
+                container: self.container(),
+                volume: self.vol(),
+                path: path.into(),
+                user: self.user.clone(),
+            })
+            .await?
+            .into_inner();
+        check(r.errno, r.detail)?;
+        Ok(r.target)
+    }
+
+    /// Set the mode and/or modification time (nanoseconds since the epoch)
+    /// of what is at `path`, following a symlink there.
+    pub async fn set_attr(
+        &mut self,
+        path: impl Into<String>,
+        mode: Option<u32>,
+        mtime_ns: Option<i64>,
+    ) -> Result<pb::FileAttr> {
+        let r = self
+            .inner
+            .set_attr(pb::FileSetAttrRequest {
+                container: self.container(),
+                volume: self.vol(),
+                path: path.into(),
+                mode,
+                mtime_ns,
+                user: self.user.clone(),
+            })
+            .await?
+            .into_inner();
+        check(r.errno, r.detail)?;
+        attr(r.attr)
+    }
+
     async fn remove_any(&mut self, path: String, directory: bool) -> Result<()> {
         let r = self
             .inner
             .remove(pb::FileRemoveRequest {
                 container: self.container(),
+                volume: self.vol(),
                 path,
                 directory,
                 user: self.user.clone(),

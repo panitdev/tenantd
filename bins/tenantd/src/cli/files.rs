@@ -1,4 +1,5 @@
-//! `tenantd file`: file access to a running container's root.
+//! `tenantd file`: file access to a running container's root; and
+//! `tenantd volume file`, the same commands on a volume.
 
 use std::path::PathBuf;
 
@@ -17,23 +18,61 @@ pub struct FileArgs {
     #[arg(long, short, global = true, default_value = "")]
     user: String,
     #[command(subcommand)]
-    cmd: FileCmd,
+    cmd: FileCmd<Target>,
 }
 
 /// The container a file command works in.
 #[derive(Args)]
-struct Target {
+pub struct Target {
     tenant: String,
     sandbox: String,
     container: String,
 }
 
+/// The volume a `tenantd volume file` command works in, as its owner.
+#[derive(Args)]
+pub struct VolumeTarget {
+    tenant: String,
+    volume: String,
+}
+
+/// Where a file command works.
+pub trait Place: Args {
+    fn files(self, ch: Channel, user: &str) -> Files;
+}
+
+impl Place for Target {
+    fn files(self, ch: Channel, user: &str) -> Files {
+        Files::new(
+            ch,
+            pb::ContainerRef {
+                tenant: self.tenant,
+                sandbox: self.sandbox,
+                id: self.container,
+            },
+        )
+        .as_user(user)
+    }
+}
+
+impl Place for VolumeTarget {
+    fn files(self, ch: Channel, _user: &str) -> Files {
+        Files::volume(
+            ch,
+            pb::VolumeRef {
+                tenant: self.tenant,
+                id: self.volume,
+            },
+        )
+    }
+}
+
 #[derive(Subcommand)]
-enum FileCmd {
+pub enum FileCmd<T: Place> {
     /// Kind, mode, size, owner and path of a file (lstat; --follow: stat).
     Stat {
         #[command(flatten)]
-        at: Target,
+        at: T,
         path: String,
         /// Follow a final symlink; prints the resolved path.
         #[arg(long, short = 'L')]
@@ -42,13 +81,13 @@ enum FileCmd {
     /// A directory's entries.
     Ls {
         #[command(flatten)]
-        at: Target,
+        at: T,
         path: String,
     },
     /// Write a file's bytes to stdout.
     Cat {
         #[command(flatten)]
-        at: Target,
+        at: T,
         path: String,
         #[arg(long, default_value_t = 0)]
         offset: u64,
@@ -60,7 +99,7 @@ enum FileCmd {
     /// interrupted put leaves the file as it was.
     Put {
         #[command(flatten)]
-        at: Target,
+        at: T,
         path: String,
         /// Read the body from this host file instead of stdin.
         #[arg(long)]
@@ -78,7 +117,7 @@ enum FileCmd {
     /// Rename a file or directory.
     Mv {
         #[command(flatten)]
-        at: Target,
+        at: T,
         from: String,
         to: String,
         /// Fail if the target exists.
@@ -88,10 +127,46 @@ enum FileCmd {
         #[arg(long)]
         exchange: bool,
     },
+    /// Make a directory.
+    Mkdir {
+        #[command(flatten)]
+        at: T,
+        path: String,
+        /// Octal mode; default 0755.
+        #[arg(long, value_parser = octal)]
+        mode: Option<u32>,
+        /// Make missing parents; an existing directory is no error.
+        #[arg(long, short)]
+        parents: bool,
+    },
+    /// Make a symlink at PATH to TARGET.
+    Ln {
+        #[command(flatten)]
+        at: T,
+        target: String,
+        path: String,
+    },
+    /// Print a symlink's target.
+    Readlink {
+        #[command(flatten)]
+        at: T,
+        path: String,
+    },
+    /// Set a file's mode (octal) and/or modification time (seconds since
+    /// the epoch), following a symlink.
+    Chattr {
+        #[command(flatten)]
+        at: T,
+        path: String,
+        #[arg(long, value_parser = octal)]
+        mode: Option<u32>,
+        #[arg(long)]
+        mtime: Option<i64>,
+    },
     /// Remove a file, or an empty directory with --dir.
     Rm {
         #[command(flatten)]
-        at: Target,
+        at: T,
         path: String,
         #[arg(long, short)]
         dir: bool,
@@ -122,23 +197,12 @@ fn print_attr(a: &pb::FileAttr, name: &str) {
     );
 }
 
-impl Target {
-    fn files(self, ch: Channel, user: &str) -> Files {
-        Files::new(
-            ch,
-            pb::ContainerRef {
-                tenant: self.tenant,
-                sandbox: self.sandbox,
-                id: self.container,
-            },
-        )
-        .as_user(user)
-    }
+pub async fn run(ch: Channel, args: FileArgs) -> anyhow::Result<()> {
+    run_cmd(ch, args.user, args.cmd).await
 }
 
-pub async fn run(ch: Channel, args: FileArgs) -> anyhow::Result<()> {
-    let user = args.user;
-    match args.cmd {
+pub async fn run_cmd<T: Place>(ch: Channel, user: String, cmd: FileCmd<T>) -> anyhow::Result<()> {
+    match cmd {
         FileCmd::Stat { at, path, follow } => {
             let st = at.files(ch, &user).stat(path, follow).await?;
             print_attr(&st.attr, &st.path);
@@ -203,6 +267,31 @@ pub async fn run(ch: Channel, args: FileArgs) -> anyhow::Result<()> {
                 0
             };
             at.files(ch, &user).rename(from, to, flags).await?;
+        }
+        FileCmd::Mkdir {
+            at,
+            path,
+            mode,
+            parents,
+        } => {
+            at.files(ch, &user).mkdir(path, mode, parents).await?;
+        }
+        FileCmd::Ln { at, target, path } => {
+            at.files(ch, &user).symlink(path, target).await?;
+        }
+        FileCmd::Readlink { at, path } => {
+            let t = at.files(ch, &user).read_link(path).await?;
+            println!("{}", String::from_utf8_lossy(&t));
+        }
+        FileCmd::Chattr {
+            at,
+            path,
+            mode,
+            mtime,
+        } => {
+            let ns = mtime.map(|s| s.saturating_mul(1_000_000_000));
+            let a = at.files(ch, &user).set_attr(path.clone(), mode, ns).await?;
+            print_attr(&a, &path);
         }
         FileCmd::Rm { at, path, dir } => {
             let mut f = at.files(ch, &user);

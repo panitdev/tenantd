@@ -353,6 +353,25 @@ pcheck 'tenantd volume create t1 ws --mode 1777
         tenantd volume prune t1 ws --prefix note | grep -q "removed 1 entries"
         ! test -e /data/tenants/t1/volumes/ws/note
         ! tenantd exec --container v2 t1 s1 -- cat /workspace/note'
+# A volume's files over the API, with or without a container: as its owner
+# (root here), seen at once by the containers that bind it. A symlink
+# resolves inside the volume, never on the host.
+pcheck 'echo via-api | tenantd volume file put --parents t1 ws /d/f
+        test "$(tenantd exec --container v1 t1 s1 -- cat /workspace/d/f)" = via-api
+        tenantd volume file stat t1 ws /d/f | grep -q "^file .* 0:0 /d/f$"
+        tenantd volume file mkdir --mode 750 t1 ws /d/sub
+        tenantd volume file stat t1 ws /d/sub | grep -q "^dir    0750 "
+        tenantd volume file mkdir -p t1 ws /d/sub/a/b
+        tenantd volume file ln t1 ws /etc/passwd /d/pw
+        test "$(tenantd volume file readlink t1 ws /d/pw)" = /etc/passwd
+        ! tenantd volume file cat t1 ws /d/pw
+        tenantd volume file chattr --mode 600 --mtime 1000000000 t1 ws /d/f
+        test "$(stat -c "%a %Y" /data/tenants/t1/volumes/ws/d/f)" = "600 1000000000"
+        tenantd volume file ls t1 ws /d | grep -q " pw$"
+        tenantd volume file mv t1 ws /d/f /d/g
+        tenantd volume file rm t1 ws /d/g
+        ! test -e /data/tenants/t1/volumes/ws/d/g
+        ! tenantd volume file stat t1 nope /'
 pcheck 'mkdir /tmp/fsrc && echo "hello from the host" > /tmp/fsrc/hello
         tenantd container create t1 s1 f1 --fuse -- sleep infinity | grep -q " created"
         nohup tenantd container serve-fuse t1 s1 f1 --dir /tmp/fsrc --start \

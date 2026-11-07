@@ -117,7 +117,7 @@ fn pb_container(r: ContainerRecord) -> pb::Container {
     }
 }
 
-fn volume_key(t: &str, v: &str) -> tenantd_core::Result<VolumeKey> {
+pub(crate) fn volume_key(t: &str, v: &str) -> tenantd_core::Result<VolumeKey> {
     Ok(VolumeKey::new(tenant_id(t)?, VolumeId::new(v)?))
 }
 

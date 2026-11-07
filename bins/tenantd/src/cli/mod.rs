@@ -293,6 +293,9 @@ pub enum ContainerCmd {
 
 #[derive(Subcommand)]
 pub enum VolumeCmd {
+    /// The file commands of `tenantd file`, on a volume and as its owner.
+    #[command(subcommand)]
+    File(files::FileCmd<files::VolumeTarget>),
     /// Create a volume in the tenant's quota.
     Create {
         tenant: String,
@@ -1017,9 +1020,10 @@ pub async fn run(cmd: ClientCmd) -> anyhow::Result<()> {
         }
         ClientCmd::File { args, .. } => files::run(ch, args).await?,
         ClientCmd::Volume { cmd: c, .. } => {
-            let mut v = VolumesClient::new(ch);
+            let mut v = VolumesClient::new(ch.clone());
             let r = |tenant, id| pb::VolumeRef { tenant, id };
             match c {
+                VolumeCmd::File(cmd) => files::run_cmd(ch, String::new(), cmd).await?,
                 VolumeCmd::Create {
                     tenant,
                     id,
