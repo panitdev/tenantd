@@ -17,8 +17,16 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+/// The package version and the commit it was built from.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("TENANTD_GIT_SHA"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(version, about, arg_required_else_help = true)]
+#[command(version = VERSION, about, arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -65,7 +73,7 @@ async fn run() -> ExitCode {
         Cmd::Client(c) => cli::run(c).await,
         Cmd::Service(c) => service::run(c),
         Cmd::Version => {
-            println!("tenantd {}", env!("CARGO_PKG_VERSION"));
+            println!("tenantd {VERSION}");
             Ok(())
         }
     };
