@@ -400,9 +400,14 @@ impl Tenantd {
         }
     }
 
-    /// End the container's processes, stop and remove it from the sandbox,
-    /// unmount its FUSE session, and remove its root when
-    /// `remove_root`. Tries every step and returns the first error.
+    /// End the container's processes, unmount its FUSE session, stop and
+    /// remove it from the sandbox, and remove its root when `remove_root`.
+    /// Tries every step and returns the first error.
+    ///
+    /// The FUSE session goes first. Stopping a container can send a request
+    /// through its mount, and with no server attached that request waits for
+    /// one; the whole sandbox then stops answering, runsc with it, and only
+    /// releasing the session would free them.
     pub(crate) async fn tear_down_container(
         &self,
         sandbox: &SandboxRecord,
@@ -418,11 +423,11 @@ impl Tenantd {
             }
         };
         keep(self.end_container_processes(&key).await);
-        keep(self.remove_runtime_container(&key).await);
         if rec.fuse.is_some() {
             self.fuse_attached.lock().unwrap().remove(&key);
             keep(self.fuse.unmount(&key).await);
         }
+        keep(self.remove_runtime_container(&key).await);
         if remove_root {
             let layer = self
                 .layers

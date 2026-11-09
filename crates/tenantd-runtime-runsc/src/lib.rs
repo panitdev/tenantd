@@ -46,6 +46,10 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `runsc start` may take.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a short runsc command may take. An unresponsive sandbox holds
+/// runsc forever, and its callers hold locks and teardown steps behind it.
+const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// In a bundle: the runsc flags `create` used, one per line, for `start`.
 const START_FLAGS: &str = "runsc.flags";
 
@@ -135,6 +139,28 @@ fn not_found(stderr: &str) -> bool {
     s.contains("does not exist") || s.contains("not found") || s.contains("no such")
 }
 
+/// Runs `command` for its stdout, giving up after `limit`: dropping the child
+/// kills it. `args` name the command in the error.
+async fn output_within(
+    mut command: tokio::process::Command,
+    limit: Duration,
+    args: &[&str],
+) -> std::result::Result<String, String> {
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let out = tokio::time::timeout(limit, output)
+        .await
+        .map_err(|_| format!("runsc {} timed out after {limit:?}", args.join(" ")))?
+        .map_err(|e| format!("running runsc: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// `runsc version release-20261005.0` -> `20261005.0`.
 pub fn parse_version(out: &str) -> Option<String> {
     let first = out.lines().next()?;
@@ -193,18 +219,7 @@ impl RunscRuntime {
 
     /// Run a short runsc command, returning stdout. Errors carry stderr.
     async fn run(&self, args: &[&str]) -> std::result::Result<String, String> {
-        let out = self
-            .command(&[], args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| format!("running runsc: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+        output_within(self.command(&[], args), RUN_TIMEOUT, args).await
     }
 
     async fn state(&self, id: &str) -> Result<RuntimeState> {
@@ -825,6 +840,19 @@ mod tests {
         );
         assert!(version_key("20261005.0") > version_key("release-20250101.3"));
         assert!(version_key("20261005.1") > version_key("20261005.0"));
+    }
+
+    #[tokio::test]
+    async fn a_command_that_never_returns_fails_and_is_killed() {
+        let mut hung = tokio::process::Command::new("sleep");
+        hung.arg("30").stdin(Stdio::null()).kill_on_drop(true);
+        let started = std::time::Instant::now();
+        let error = output_within(hung, Duration::from_millis(100), &["state", "box"])
+            .await
+            .unwrap_err();
+        assert!(error.contains("runsc state box timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!not_found(&error), "a timeout must not read as gone");
     }
 
     #[test]

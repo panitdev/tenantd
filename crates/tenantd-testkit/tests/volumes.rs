@@ -524,6 +524,26 @@ async fn fuse_needs_a_slot_and_a_failed_start_can_be_retried() {
 }
 
 #[tokio::test]
+async fn a_deleted_container_loses_its_fuse_session_before_it_is_stopped() {
+    let env = env().await;
+    let t = &env.tenantd;
+    let k = ck("box", "s1");
+    t.create_container(k.clone(), with_fuse()).await.unwrap();
+    t.attach_fuse(&k, FuseLimits::ANY).await.unwrap();
+    t.start_container(&k).await.unwrap();
+
+    let at_stop = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (fuse, seen, container) = (env.host.fuse.clone(), at_stop.clone(), k.clone());
+    *env.host.runtime.on_stop.lock().unwrap() = Some(Box::new(move |_| {
+        seen.lock().unwrap().push(fuse.is_mounted(&container));
+    }));
+
+    t.delete_container(&k).await.unwrap();
+    assert_eq!(*at_stop.lock().unwrap(), vec![false]);
+    assert!(!env.host.fuse.is_mounted(&k));
+}
+
+#[tokio::test]
 async fn stopping_the_sandbox_ends_waiting_fuse_containers() {
     let env = env().await;
     let t = &env.tenantd;

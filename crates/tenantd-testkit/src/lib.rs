@@ -312,7 +312,12 @@ pub type CreatedContainer = (ContainerKey, Vec<String>, RootfsSpec, Vec<BindMoun
 pub type HelperFn =
     Arc<dyn Fn(&RuntimeHandle, &ResolvedProcess) -> Result<PipedProcess> + Send + Sync>;
 
+/// See [`FakeRuntime::on_stop`].
+pub type StopHook = Box<dyn Fn(&RuntimeHandle) + Send + Sync>;
+
 pub struct FakeRuntime {
+    /// Called as each `stop` begins, to see what state it finds.
+    pub on_stop: Mutex<Option<StopHook>>,
     pub containers: Mutex<HashMap<RuntimeHandle, RuntimeState>>,
     pub watched: Mutex<HashSet<RuntimeHandle>>,
     pub created_specs: Mutex<Vec<(ResolvedSandbox, RootfsSpec, NetAttachment)>>,
@@ -343,6 +348,7 @@ impl FakeRuntime {
     fn new(faults: Arc<Faults>) -> Self {
         let (tx, rx) = mpsc::unbounded();
         Self {
+            on_stop: Mutex::default(),
             containers: Mutex::default(),
             watched: Mutex::default(),
             created_specs: Mutex::default(),
@@ -572,6 +578,9 @@ impl RuntimeBackend for FakeRuntime {
     }
 
     async fn stop(&self, h: &RuntimeHandle, _grace: Duration) -> Result<()> {
+        if let Some(hook) = &*self.on_stop.lock().unwrap() {
+            hook(h);
+        }
         self.faults.check("runtime.stop")?;
         if let Some(s) = self.containers.lock().unwrap().get_mut(h) {
             *s = RuntimeState::Stopped;
